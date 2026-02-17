@@ -1,4 +1,26 @@
-"""Configuration models for LLM agent behavior."""
+"""Configuration models for LLM provider settings.
+
+This module provides Pydantic models for configuring LLM providers,
+usage limits, and agent execution settings.
+
+Examples:
+    Basic model configuration:
+
+    >>> from akgentic.llm import ModelConfig
+    >>> config = ModelConfig(
+    ...     provider="openai",
+    ...     model="gpt-4o",
+    ...     temperature=0.7
+    ... )
+
+    Configuration with usage limits:
+
+    >>> from akgentic.llm import ModelConfig, UsageLimits, ReactAgentConfig
+    >>> config = ReactAgentConfig(
+    ...     model=ModelConfig(provider="openai", model="gpt-4o"),
+    ...     usage_limits=UsageLimits(request_limit=10, total_tokens_limit=5000)
+    ... )
+"""
 
 from typing import Literal
 
@@ -6,17 +28,24 @@ from pydantic import BaseModel, Field
 
 
 class ModelConfig(BaseModel):
-    """Model selection and parameters.
+    """Configuration for LLM model settings.
 
-    Renamed from LLMConfig for clarity - configures MODEL selection,
-    not the entire LLM layer.
+    Supports multiple providers with provider-agnostic configuration.
+
+    Attributes:
+        provider: LLM provider name (openai, azure, anthropic, google-gla, mistral, nvidia)
+        model: Model identifier (e.g., 'gpt-4o', 'claude-3-5-sonnet-20241022')
+        temperature: Sampling temperature between 0.0-2.0 (default: None = provider default)
+        seed: Random seed for reproducibility (default: None = non-deterministic)
+        max_tokens: Maximum tokens to generate (default: None = provider default)
+        reasoning_effort: Reasoning effort level for supported models (e.g., 'low', 'medium', 'high')
 
     Example:
         >>> config = ModelConfig(
         ...     provider="openai",
-        ...     model="gpt-4.1",
+        ...     model="gpt-4o",
         ...     temperature=0.7,
-        ...     seed=42
+        ...     max_tokens=1000
         ... )
     """
 
@@ -41,15 +70,22 @@ class ModelConfig(BaseModel):
 
 
 class UsageLimits(BaseModel):
-    """Token and request limits for cost control.
+    """Usage limits for LLM requests.
 
-    Limits are checked by pydantic-ai during agent runs.
-    Set to None to disable specific limits.
+    All limits are optional (None = unlimited). Limits are enforced
+    during agent execution.
+
+    Attributes:
+        request_limit: Maximum number of LLM requests
+        tool_calls_limit: Maximum tool calls per request
+        input_tokens_limit: Maximum input tokens (cumulative)
+        output_tokens_limit: Maximum output tokens (cumulative)
+        total_tokens_limit: Maximum total tokens (input + output, cumulative)
 
     Example:
         >>> limits = UsageLimits(
-        ...     request_limit=50,
-        ...     total_tokens_limit=10000
+        ...     request_limit=10,
+        ...     total_tokens_limit=5000
         ... )
     """
 
@@ -94,20 +130,30 @@ class AgentRuntimeConfig(BaseModel):
 
 
 class ReactAgentConfig(BaseModel):
-    """Complete configuration for REACT-based LLM agents.
+    """Configuration for REACT pattern agent.
+
+    Combines model configuration, usage limits, and execution settings.
+
+    Attributes:
+        model: LLM model configuration
+        usage_limits: Optional resource limits
+        runtime: Runtime behavior configuration
+        system_prompts: List of system prompt components
 
     Example:
         >>> config = ReactAgentConfig(
-        ...     model=ModelConfig(provider="openai", model="gpt-4.1"),
-        ...     usage_limits=UsageLimits(request_limit=30),
-        ...     runtime=AgentRuntimeConfig(retries=5)
+        ...     model=ModelConfig(provider="openai", model="gpt-4o"),
+        ...     usage_limits=UsageLimits(request_limit=10),
+        ...     system_prompts=["You are a helpful assistant."]
         ... )
     """
 
     model: ModelConfig = Field(default_factory=ModelConfig, description="Model configuration")
 
-    usage_limits: UsageLimits = Field(default_factory=UsageLimits, description="Usage limits for cost control")
+    usage_limits: UsageLimits | None = Field(default=None, description="Usage limits for cost control")
 
     runtime: AgentRuntimeConfig = Field(
         default_factory=AgentRuntimeConfig, description="Runtime behavior configuration"
     )
+
+    system_prompts: list[str] = Field(default_factory=list, description="System prompt components")
