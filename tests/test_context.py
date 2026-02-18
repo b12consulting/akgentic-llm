@@ -187,6 +187,7 @@ class TestContextManager:
         manager.rewind("checkpoint-1")
 
         assert len(manager.messages) == 1
+        assert manager.messages[0] == snapshot.messages[0]
         assert manager.messages[0].parts[0].content == "Message 1"  # type: ignore[attr-defined]
 
     def test_rewind_invalid_id_raises_keyerror(self) -> None:

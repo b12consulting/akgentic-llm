@@ -85,7 +85,12 @@ class ContextSnapshot(BaseModel):
 
     checkpoint_id: str = Field(..., description="Unique checkpoint identifier")
     timestamp: datetime = Field(..., description="When checkpoint was created")
-    messages: list[ModelMessage] = Field(..., description="Deep copy of messages")
+    # FIXME: Using Any instead of list[ModelMessage] due to pydantic-ai 1.60.0 bug
+    # pydantic-ai's ModelMessage dataclasses contain forward refs with AliasChoices
+    # that cause Pydantic schema generation to fail. Should either:
+    # 1. Convert ContextSnapshot to @dataclass(frozen=True) to avoid Pydantic validation
+    # 2. Wait for pydantic-ai fix and restore proper type: list[ModelMessage]
+    messages: Any = Field(..., description="Deep copy of messages (list[ModelMessage])")
     metadata: dict[str, Any] = Field(default_factory=dict, description="Custom metadata")
 
 

@@ -2,9 +2,23 @@
 
 Clean abstraction for LLM providers with REACT pattern support,
 context management, and comprehensive configuration.
+
+Quick Start:
+    >>> from akgentic.llm import ModelConfig, ReactAgentConfig, ReactAgent
+    >>> config = ReactAgentConfig(
+    ...     model=ModelConfig(provider="openai", model="gpt-4o"),
+    ... )
+    >>> agent = ReactAgent(config=config)
+    >>> result = await agent.run("Hello!")
+
+Key Concepts:
+    - REACT pattern: Iterative agent execution with tool calls
+    - UsageLimits: Token/request budgets to control costs
+    - ContextManager: Message history with checkpoint/rewind
+    - SystemPromptRegistry: Composable dynamic system prompts
 """
 
-from .agent import ReactAgent
+from .agent import ReactAgent, UsageLimitError
 from .config import AgentRuntimeConfig, ModelConfig, ReactAgentConfig, UsageLimits
 from .context import ContextManager, ContextObserver, ContextSnapshot
 from .prompts import (
@@ -23,6 +37,7 @@ __all__ = [
     "ReactAgentConfig",
     # Agent
     "ReactAgent",
+    "UsageLimitError",
     # Context
     "ContextManager",
     "ContextObserver",

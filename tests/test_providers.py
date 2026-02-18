@@ -244,8 +244,8 @@ class TestCreateModel:
     # OpenAI
     # ------------------------------------------------------------------
 
-    @patch("akgentic.llm.providers.OpenAIProvider")
-    @patch("akgentic.llm.providers.OpenAIChatModel")
+    @patch("pydantic_ai.providers.openai.OpenAIProvider")
+    @patch("pydantic_ai.models.openai.OpenAIChatModel")
     def test_create_openai_model(self, mock_model_cls, mock_provider_cls) -> None:
         """create_model returns an OpenAIChatModel for provider='openai'."""
         mock_client = MagicMock(spec=httpx.AsyncClient)
@@ -258,8 +258,8 @@ class TestCreateModel:
         assert call_kwargs["model_name"] == "gpt-4o"
         assert result is mock_model_cls.return_value
 
-    @patch("akgentic.llm.providers.OpenAIProvider")
-    @patch("akgentic.llm.providers.OpenAIChatModel")
+    @patch("pydantic_ai.providers.openai.OpenAIProvider")
+    @patch("pydantic_ai.models.openai.OpenAIChatModel")
     def test_openai_model_settings_temperature(self, mock_model_cls, mock_provider_cls) -> None:
         """Temperature is passed via OpenAIChatModelSettings for OpenAI."""
         mock_client = MagicMock(spec=httpx.AsyncClient)
@@ -271,8 +271,8 @@ class TestCreateModel:
         assert settings is not None
         assert settings["temperature"] == 0.5
 
-    @patch("akgentic.llm.providers.OpenAIProvider")
-    @patch("akgentic.llm.providers.OpenAIChatModel")
+    @patch("pydantic_ai.providers.openai.OpenAIProvider")
+    @patch("pydantic_ai.models.openai.OpenAIChatModel")
     def test_openai_reasoning_effort(self, mock_model_cls, mock_provider_cls) -> None:
         """reasoning_effort maps to openai_reasoning_effort in settings."""
         mock_client = MagicMock(spec=httpx.AsyncClient)
@@ -284,8 +284,8 @@ class TestCreateModel:
         assert settings is not None
         assert settings["openai_reasoning_effort"] == "high"
 
-    @patch("akgentic.llm.providers.OpenAIProvider")
-    @patch("akgentic.llm.providers.OpenAIChatModel")
+    @patch("pydantic_ai.providers.openai.OpenAIProvider")
+    @patch("pydantic_ai.models.openai.OpenAIChatModel")
     def test_openai_seed_passed_in_settings(self, mock_model_cls, mock_provider_cls) -> None:
         """seed is included in OpenAIChatModelSettings when set."""
         mock_client = MagicMock(spec=httpx.AsyncClient)
@@ -297,8 +297,8 @@ class TestCreateModel:
         assert settings is not None
         assert settings["seed"] == 42
 
-    @patch("akgentic.llm.providers.OpenAIProvider")
-    @patch("akgentic.llm.providers.OpenAIChatModel")
+    @patch("pydantic_ai.providers.openai.OpenAIProvider")
+    @patch("pydantic_ai.models.openai.OpenAIChatModel")
     def test_openai_http_client_passed_to_provider(self, mock_model_cls, mock_provider_cls) -> None:
         """http_client is passed to OpenAIProvider."""
         mock_client = MagicMock(spec=httpx.AsyncClient)
@@ -313,8 +313,8 @@ class TestCreateModel:
     # ------------------------------------------------------------------
 
     @patch.dict("os.environ", {"AZURE_OPENAI_ENDPOINT": "https://my-azure.openai.azure.com"})
-    @patch("akgentic.llm.providers.OpenAIProvider")
-    @patch("akgentic.llm.providers.OpenAIChatModel")
+    @patch("pydantic_ai.providers.openai.OpenAIProvider")
+    @patch("pydantic_ai.models.openai.OpenAIChatModel")
     def test_create_azure_model(self, mock_model_cls, mock_provider_cls) -> None:
         """create_model returns an OpenAIChatModel for provider='azure'."""
         mock_client = MagicMock(spec=httpx.AsyncClient)
@@ -327,8 +327,8 @@ class TestCreateModel:
         assert result is mock_model_cls.return_value
 
     @patch.dict("os.environ", {"AZURE_OPENAI_ENDPOINT": "https://my-azure.openai.azure.com"})
-    @patch("akgentic.llm.providers.OpenAIProvider")
-    @patch("akgentic.llm.providers.OpenAIChatModel")
+    @patch("pydantic_ai.providers.openai.OpenAIProvider")
+    @patch("pydantic_ai.models.openai.OpenAIChatModel")
     def test_azure_uses_endpoint_from_env(self, mock_model_cls, mock_provider_cls) -> None:
         """Azure provider uses AZURE_OPENAI_ENDPOINT environment variable."""
         mock_client = MagicMock(spec=httpx.AsyncClient)
@@ -357,8 +357,8 @@ class TestCreateModel:
     # Anthropic
     # ------------------------------------------------------------------
 
-    @patch("akgentic.llm.providers.AnthropicProvider")
-    @patch("akgentic.llm.providers.AnthropicModel")
+    @patch("pydantic_ai.providers.anthropic.AnthropicProvider")
+    @patch("pydantic_ai.models.anthropic.AnthropicModel")
     def test_create_anthropic_model(self, mock_model_cls, mock_provider_cls) -> None:
         """create_model returns an AnthropicModel for provider='anthropic'."""
         mock_client = MagicMock(spec=httpx.AsyncClient)
@@ -374,8 +374,8 @@ class TestCreateModel:
         assert mock_model_cls.call_args.kwargs["model_name"] == "claude-3-5-sonnet-20241022"
         assert result is mock_model_cls.return_value
 
-    @patch("akgentic.llm.providers.AnthropicProvider")
-    @patch("akgentic.llm.providers.AnthropicModel")
+    @patch("pydantic_ai.providers.anthropic.AnthropicProvider")
+    @patch("pydantic_ai.models.anthropic.AnthropicModel")
     def test_anthropic_http_client_passed_to_provider(self, mock_model_cls, mock_provider_cls) -> None:
         """http_client is passed to AnthropicProvider."""
         mock_client = MagicMock(spec=httpx.AsyncClient)
@@ -392,15 +392,19 @@ class TestCreateModel:
     def test_create_google_model(self) -> None:
         """create_model returns a GoogleModel for provider='google-gla'."""
         import sys
+
         mock_google_model = MagicMock()
         mock_google_provider = MagicMock()
         mock_models_google = MagicMock(GoogleModel=mock_google_model)
         mock_providers_google = MagicMock(GoogleProvider=mock_google_provider)
 
-        with patch.dict(sys.modules, {
-            "pydantic_ai.models.google": mock_models_google,
-            "pydantic_ai.providers.google": mock_providers_google,
-        }):
+        with patch.dict(
+            sys.modules,
+            {
+                "pydantic_ai.models.google": mock_models_google,
+                "pydantic_ai.providers.google": mock_providers_google,
+            },
+        ):
             mock_client = MagicMock(spec=httpx.AsyncClient)
             config = ModelConfig(provider="google-gla", model="gemini-2.0-flash")
 
@@ -413,15 +417,19 @@ class TestCreateModel:
     def test_google_http_client_passed_to_provider(self) -> None:
         """http_client is passed to GoogleProvider."""
         import sys
+
         mock_google_model = MagicMock()
         mock_google_provider = MagicMock()
         mock_models_google = MagicMock(GoogleModel=mock_google_model)
         mock_providers_google = MagicMock(GoogleProvider=mock_google_provider)
 
-        with patch.dict(sys.modules, {
-            "pydantic_ai.models.google": mock_models_google,
-            "pydantic_ai.providers.google": mock_providers_google,
-        }):
+        with patch.dict(
+            sys.modules,
+            {
+                "pydantic_ai.models.google": mock_models_google,
+                "pydantic_ai.providers.google": mock_providers_google,
+            },
+        ):
             mock_client = MagicMock(spec=httpx.AsyncClient)
             config = ModelConfig(provider="google-gla", model="gemini-2.0-flash")
 
@@ -433,8 +441,8 @@ class TestCreateModel:
     # Mistral
     # ------------------------------------------------------------------
 
-    @patch("akgentic.llm.providers.MistralProvider")
-    @patch("akgentic.llm.providers.MistralModel")
+    @patch("pydantic_ai.providers.mistral.MistralProvider")
+    @patch("pydantic_ai.models.mistral.MistralModel")
     def test_create_mistral_model(self, mock_model_cls, mock_provider_cls) -> None:
         """create_model returns a MistralModel for provider='mistral'."""
         mock_client = MagicMock(spec=httpx.AsyncClient)
@@ -446,8 +454,8 @@ class TestCreateModel:
         assert mock_model_cls.call_args.kwargs["model_name"] == "mistral-large-latest"
         assert result is mock_model_cls.return_value
 
-    @patch("akgentic.llm.providers.MistralProvider")
-    @patch("akgentic.llm.providers.MistralModel")
+    @patch("pydantic_ai.providers.mistral.MistralProvider")
+    @patch("pydantic_ai.models.mistral.MistralModel")
     def test_mistral_http_client_passed_to_provider(self, mock_model_cls, mock_provider_cls) -> None:
         """http_client is passed to MistralProvider."""
         mock_client = MagicMock(spec=httpx.AsyncClient)
@@ -461,8 +469,8 @@ class TestCreateModel:
     # NVIDIA
     # ------------------------------------------------------------------
 
-    @patch("akgentic.llm.providers.OpenAIProvider")
-    @patch("akgentic.llm.providers.OpenAIChatModel")
+    @patch("pydantic_ai.providers.openai.OpenAIProvider")
+    @patch("pydantic_ai.models.openai.OpenAIChatModel")
     def test_create_nvidia_model(self, mock_model_cls, mock_provider_cls) -> None:
         """create_model returns an OpenAIChatModel for provider='nvidia'."""
         mock_client = MagicMock(spec=httpx.AsyncClient)
@@ -475,8 +483,8 @@ class TestCreateModel:
         assert result is mock_model_cls.return_value
 
     @patch.dict("os.environ", {"NVIDIA_BASE_URL": "https://custom.nvidia.com/v1"})
-    @patch("akgentic.llm.providers.OpenAIProvider")
-    @patch("akgentic.llm.providers.OpenAIChatModel")
+    @patch("pydantic_ai.providers.openai.OpenAIProvider")
+    @patch("pydantic_ai.models.openai.OpenAIChatModel")
     def test_nvidia_uses_base_url_from_env(self, mock_model_cls, mock_provider_cls) -> None:
         """NVIDIA provider uses NVIDIA_BASE_URL environment variable."""
         mock_client = MagicMock(spec=httpx.AsyncClient)
@@ -490,11 +498,12 @@ class TestCreateModel:
         )
 
     @patch.dict("os.environ", {}, clear=False)
-    @patch("akgentic.llm.providers.OpenAIProvider")
-    @patch("akgentic.llm.providers.OpenAIChatModel")
+    @patch("pydantic_ai.providers.openai.OpenAIProvider")
+    @patch("pydantic_ai.models.openai.OpenAIChatModel")
     def test_nvidia_default_base_url(self, mock_model_cls, mock_provider_cls) -> None:
         """NVIDIA provider defaults to integrate.api.nvidia.com when env var unset."""
         import os
+
         os.environ.pop("NVIDIA_BASE_URL", None)
         mock_client = MagicMock(spec=httpx.AsyncClient)
         config = ModelConfig(provider="nvidia", model="meta/llama-3.1-70b-instruct")
@@ -526,11 +535,9 @@ class TestCreateModel:
     # ------------------------------------------------------------------
 
     @patch("akgentic.llm.providers.create_http_client")
-    @patch("akgentic.llm.providers.OpenAIProvider")
-    @patch("akgentic.llm.providers.OpenAIChatModel")
-    def test_http_client_created_when_none(
-        self, mock_model_cls, mock_provider_cls, mock_create_client
-    ) -> None:
+    @patch("pydantic_ai.providers.openai.OpenAIProvider")
+    @patch("pydantic_ai.models.openai.OpenAIChatModel")
+    def test_http_client_created_when_none(self, mock_model_cls, mock_provider_cls, mock_create_client) -> None:
         """create_http_client() is called when http_client=None and passed to provider."""
         mock_create_client.return_value = MagicMock(spec=httpx.AsyncClient)
         config = ModelConfig(provider="openai", model="gpt-4o")
@@ -540,8 +547,8 @@ class TestCreateModel:
         mock_create_client.assert_called_once()
         mock_provider_cls.assert_called_once_with(http_client=mock_create_client.return_value)
 
-    @patch("akgentic.llm.providers.OpenAIProvider")
-    @patch("akgentic.llm.providers.OpenAIChatModel")
+    @patch("pydantic_ai.providers.openai.OpenAIProvider")
+    @patch("pydantic_ai.models.openai.OpenAIChatModel")
     def test_provided_http_client_not_replaced(self, mock_model_cls, mock_provider_cls) -> None:
         """Provided http_client is passed through without creating a new one."""
         mock_client = MagicMock(spec=httpx.AsyncClient)
@@ -557,8 +564,8 @@ class TestCreateModel:
     # Optional parameters
     # ------------------------------------------------------------------
 
-    @patch("akgentic.llm.providers.OpenAIProvider")
-    @patch("akgentic.llm.providers.OpenAIChatModel")
+    @patch("pydantic_ai.providers.openai.OpenAIProvider")
+    @patch("pydantic_ai.models.openai.OpenAIChatModel")
     def test_none_optional_params_produce_no_settings(self, mock_model_cls, mock_provider_cls) -> None:
         """When temperature/max_tokens/seed are all None, settings=None is passed."""
         mock_client = MagicMock(spec=httpx.AsyncClient)
@@ -570,8 +577,8 @@ class TestCreateModel:
         settings = mock_model_cls.call_args.kwargs.get("settings")
         assert settings is None
 
-    @patch("akgentic.llm.providers.AnthropicProvider")
-    @patch("akgentic.llm.providers.AnthropicModel")
+    @patch("pydantic_ai.providers.anthropic.AnthropicProvider")
+    @patch("pydantic_ai.models.anthropic.AnthropicModel")
     def test_max_tokens_passed_in_settings(self, mock_model_cls, mock_provider_cls) -> None:
         """max_tokens is included in ModelSettings when set."""
         mock_client = MagicMock(spec=httpx.AsyncClient)
@@ -583,8 +590,8 @@ class TestCreateModel:
         assert settings is not None
         assert settings["max_tokens"] == 512
 
-    @patch("akgentic.llm.providers.MistralProvider")
-    @patch("akgentic.llm.providers.MistralModel")
+    @patch("pydantic_ai.providers.mistral.MistralProvider")
+    @patch("pydantic_ai.models.mistral.MistralModel")
     def test_seed_passed_in_settings(self, mock_model_cls, mock_provider_cls) -> None:
         """seed is included in ModelSettings when set."""
         mock_client = MagicMock(spec=httpx.AsyncClient)

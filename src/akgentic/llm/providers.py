@@ -29,21 +29,20 @@ Example:
 
 import logging
 import os
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import httpx
 from pydantic_ai.models import Model
-from pydantic_ai.models.anthropic import AnthropicModel
-from pydantic_ai.models.mistral import MistralModel
-from pydantic_ai.models.openai import OpenAIChatModel, OpenAIChatModelSettings
-from pydantic_ai.providers.anthropic import AnthropicProvider
-from pydantic_ai.providers.mistral import MistralProvider
-from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.retries import AsyncTenacityTransport, RetryConfig, wait_retry_after
 from pydantic_ai.settings import ModelSettings
 from tenacity import retry_if_exception, stop_after_attempt, wait_random_exponential
 
 from .config import ModelConfig
+
+if TYPE_CHECKING:
+    from pydantic_ai.models.anthropic import AnthropicModel
+    from pydantic_ai.models.mistral import MistralModel
+    from pydantic_ai.models.openai import OpenAIChatModel, OpenAIChatModelSettings
 
 logger = logging.getLogger(__name__)
 
@@ -175,7 +174,7 @@ def _build_settings(config: ModelConfig) -> ModelSettings | None:
     return cast(ModelSettings, kwargs) if kwargs else None
 
 
-def _build_openai_settings(config: ModelConfig) -> OpenAIChatModelSettings | None:
+def _build_openai_settings(config: ModelConfig) -> "OpenAIChatModelSettings | None":
     """Build OpenAIChatModelSettings from ModelConfig, including reasoning_effort.
 
     Delegates shared parameters (temperature, max_tokens, seed) to
@@ -187,6 +186,8 @@ def _build_openai_settings(config: ModelConfig) -> OpenAIChatModelSettings | Non
     Returns:
         OpenAIChatModelSettings instance if any parameters are set, else None.
     """
+    from pydantic_ai.models.openai import OpenAIChatModelSettings  # noqa: PLC0415
+
     kwargs: dict[str, Any] = dict(cast(dict[str, Any], _build_settings(config) or {}))
     if config.reasoning_effort is not None:
         kwargs["openai_reasoning_effort"] = config.reasoning_effort
@@ -196,7 +197,7 @@ def _build_openai_settings(config: ModelConfig) -> OpenAIChatModelSettings | Non
 def _create_openai_model(
     config: ModelConfig,
     http_client: httpx.AsyncClient,
-) -> OpenAIChatModel:
+) -> "OpenAIChatModel":
     """Create OpenAI chat model.
 
     Args:
@@ -206,6 +207,9 @@ def _create_openai_model(
     Returns:
         Configured OpenAIChatModel instance.
     """
+    from pydantic_ai.models.openai import OpenAIChatModel  # noqa: PLC0415
+    from pydantic_ai.providers.openai import OpenAIProvider  # noqa: PLC0415
+
     return OpenAIChatModel(
         model_name=config.model,
         provider=OpenAIProvider(http_client=http_client),
@@ -216,7 +220,7 @@ def _create_openai_model(
 def _create_azure_model(
     config: ModelConfig,
     http_client: httpx.AsyncClient,
-) -> OpenAIChatModel:
+) -> "OpenAIChatModel":
     """Create Azure OpenAI model.
 
     Uses the Azure OpenAI endpoint from ``AZURE_OPENAI_ENDPOINT`` env var.
@@ -231,11 +235,12 @@ def _create_azure_model(
     Raises:
         ValueError: If ``AZURE_OPENAI_ENDPOINT`` environment variable is not set.
     """
+    from pydantic_ai.models.openai import OpenAIChatModel  # noqa: PLC0415
+    from pydantic_ai.providers.openai import OpenAIProvider  # noqa: PLC0415
+
     base_url = os.getenv("AZURE_OPENAI_ENDPOINT")
     if not base_url:
-        raise ValueError(
-            "AZURE_OPENAI_ENDPOINT environment variable is required for Azure provider"
-        )
+        raise ValueError("AZURE_OPENAI_ENDPOINT environment variable is required for Azure provider")
     return OpenAIChatModel(
         model_name=config.model,
         provider=OpenAIProvider(base_url=base_url, http_client=http_client),
@@ -246,7 +251,7 @@ def _create_azure_model(
 def _create_anthropic_model(
     config: ModelConfig,
     http_client: httpx.AsyncClient,
-) -> AnthropicModel:
+) -> "AnthropicModel":
     """Create Anthropic model.
 
     Args:
@@ -256,6 +261,9 @@ def _create_anthropic_model(
     Returns:
         Configured AnthropicModel instance.
     """
+    from pydantic_ai.models.anthropic import AnthropicModel  # noqa: PLC0415
+    from pydantic_ai.providers.anthropic import AnthropicProvider  # noqa: PLC0415
+
     settings = _build_settings(config)
     return AnthropicModel(
         model_name=config.model,
@@ -296,7 +304,7 @@ def _create_google_model(
 def _create_mistral_model(
     config: ModelConfig,
     http_client: httpx.AsyncClient,
-) -> MistralModel:
+) -> "MistralModel":
     """Create Mistral model.
 
     Args:
@@ -306,6 +314,9 @@ def _create_mistral_model(
     Returns:
         Configured MistralModel instance.
     """
+    from pydantic_ai.models.mistral import MistralModel  # noqa: PLC0415
+    from pydantic_ai.providers.mistral import MistralProvider  # noqa: PLC0415
+
     settings = _build_settings(config)
     return MistralModel(
         model_name=config.model,
@@ -317,7 +328,7 @@ def _create_mistral_model(
 def _create_nvidia_model(
     config: ModelConfig,
     http_client: httpx.AsyncClient,
-) -> OpenAIChatModel:
+) -> "OpenAIChatModel":
     """Create NVIDIA NIM model.
 
     Uses NVIDIA's OpenAI-compatible API via the ``NVIDIA_BASE_URL`` env var
@@ -330,6 +341,9 @@ def _create_nvidia_model(
     Returns:
         Configured OpenAIChatModel instance pointing at NVIDIA NIM endpoint.
     """
+    from pydantic_ai.models.openai import OpenAIChatModel  # noqa: PLC0415
+    from pydantic_ai.providers.openai import OpenAIProvider  # noqa: PLC0415
+
     settings = _build_openai_settings(config)
     base_url = os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
     return OpenAIChatModel(
@@ -403,9 +417,6 @@ def create_model(
     factory = _PROVIDER_FACTORIES.get(config.provider)
     if factory is None:
         supported = ", ".join(_PROVIDER_FACTORIES.keys())
-        raise ValueError(
-            f"Unsupported provider: {config.provider}. "
-            f"Supported providers: {supported}"
-        )
+        raise ValueError(f"Unsupported provider: {config.provider}. Supported providers: {supported}")
 
     return factory(config, http_client)
