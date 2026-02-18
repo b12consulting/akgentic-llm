@@ -56,6 +56,7 @@ class ReactAgent:
         toolsets: list[Any] | None = None,
         result_type: type[Any] = str,
         observer: ContextObserver | None = None,
+        event_loop: asyncio.AbstractEventLoop | None = None,
     ) -> None:
         """Initialize REACT agent.
 
@@ -66,10 +67,12 @@ class ReactAgent:
             toolsets: List of toolsets (optional, e.g., MCP servers)
             result_type: Type for agent result validation (default: str)
             observer: Context observer to register automatically (optional)
+            event_loop: Asyncio event loop to use (optional, defaults to current loop)
         """
         self._config = config
         self._deps_type = deps_type
         self._result_type = result_type
+        self._event_loop = event_loop
 
         # Create context manager (no max_messages by default)
         self._context = ContextManager()
@@ -130,7 +133,7 @@ class ReactAgent:
             now = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M")
             return f"The current date and time is {now}."
 
-    async def run(self, user_prompt: str, deps: Any = None) -> Any:
+    async def run(self, user_prompt: str, deps: Any = None, output_type: type[Any] | None = None) -> Any:
         """Execute agent with REACT pattern.
 
         Runs pydantic-ai agent iteratively, updating context after each
@@ -139,39 +142,39 @@ class ReactAgent:
         Args:
             user_prompt: User message to process
             deps: Optional dependency object (must match deps_type)
+            output_type: Optional per-call output type override. When provided,
+                wraps with get_output_type() for provider-aware structured output
+                (NativeOutput for OpenAI/Anthropic, raw type for others).
+                When None, uses result_type set at construction (default: str).
 
         Returns:
-            Agent result output (type matches result_type)
+            Agent result output (type matches output_type if given, else result_type)
 
         Raises:
             UsageLimitError: If usage limits exceeded
         """
-        # Convert usage limits to pydantic-ai format
         pydantic_limits = self._to_pydantic_limits(self._config.usage_limits)
 
         try:
-            # Execute agent with context history
             async with self._pydantic_agent.iter(
                 user_prompt=user_prompt,
                 deps=deps,
                 message_history=self._context.messages,
                 usage_limits=pydantic_limits,
+                output_type=get_output_type(self._config.model, output_type),
             ) as run:
-                # Iterate through agent steps (REACT loop)
                 async for _ in run:
-                    # Add new messages to context
-                    # Note: Observers subscribed via subscribe_context() are automatically
-                    # notified by ContextManager.add_message()
+                    # Observers subscribed via subscribe_context() are notified
+                    # automatically by ContextManager.add_message().
                     for message in run.new_messages():
                         self._context.add_message(message)
 
-                # Return result if available
                 return run.result.output if run.result else None
 
         except UsageLimitExceeded as e:
             raise UsageLimitError(str(e)) from e
 
-    def run_sync(self, user_prompt: str, deps: Any = None) -> Any:
+    def run_sync(self, user_prompt: str, deps: Any = None, output_type: type[Any] | None = None) -> Any:
         """Execute agent synchronously.
 
         Convenience wrapper around run() for synchronous contexts.
@@ -179,6 +182,7 @@ class ReactAgent:
         Args:
             user_prompt: User message to process
             deps: Optional dependency object
+            output_type: Optional per-call output type override (see run()).
 
         Returns:
             Agent result output
@@ -186,7 +190,10 @@ class ReactAgent:
         Raises:
             UsageLimitError: If usage limits exceeded
         """
-        return asyncio.run(self.run(user_prompt, deps))
+        if self._event_loop and self._event_loop.is_running():
+            self._event_loop.run_until_complete(self.run(user_prompt, deps, output_type))
+
+        return asyncio.run(self.run(user_prompt, deps, output_type))
 
     def _to_pydantic_limits(self, limits: UsageLimits | None) -> PydanticUsageLimits | None:
         """Convert config UsageLimits to pydantic-ai UsageLimits.

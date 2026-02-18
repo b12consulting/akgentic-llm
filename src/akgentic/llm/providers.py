@@ -119,7 +119,7 @@ def _supports_native_output(config: ModelConfig) -> bool:
     return False
 
 
-def get_output_type(config: ModelConfig, output_type: type[T]) -> NativeOutput[T] | type[T]:
+def get_output_type(config: ModelConfig, output_type: type[T] | None) -> NativeOutput[T] | type[T] | None:
     """Get the appropriate output type wrapper for structured output based on provider.
 
     For providers with native structured output support (OpenAI, Azure, Anthropic,
@@ -132,9 +132,11 @@ def get_output_type(config: ModelConfig, output_type: type[T]) -> NativeOutput[T
     For ``str`` result types (default case), always returns the raw type since
     structured output wrapping is not needed.
 
+    For ``None`` output types, returns None.
+
     Args:
         config: LLM model configuration.
-        output_type: The desired result type (a Pydantic model or primitive).
+        output_type: The desired result type (a Pydantic model, primitive or None).
 
     Returns:
         ``NativeOutput[output_type]`` for native-capable providers with structured types,
@@ -163,7 +165,7 @@ def get_output_type(config: ModelConfig, output_type: type[T]) -> NativeOutput[T
         in consuming code — always delegate to this function.
     """
     # No wrapping needed for str result types
-    if output_type is str:
+    if output_type is str or output_type is None:
         return output_type
     if _supports_native_output(config):
         return NativeOutput(output_type)
