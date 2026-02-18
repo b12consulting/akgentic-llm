@@ -15,7 +15,7 @@ Key Concepts:
     - REACT pattern: Iterative agent execution with tool calls
     - UsageLimits: Token/request budgets to control costs
     - ContextManager: Message history with checkpoint/rewind
-    - SystemPromptRegistry: Composable dynamic system prompts
+    - PromptTemplate: Template-based prompts with parameter substitution
 """
 
 from .agent import ReactAgent, UsageLimitError
@@ -23,11 +23,12 @@ from .config import AgentRuntimeConfig, ModelConfig, ReactAgentConfig, UsageLimi
 from .context import ContextManager, ContextObserver, ContextSnapshot
 from .prompts import (
     PromptProvider,
-    SystemPromptRegistry,
+    PromptTemplate,
     current_datetime_prompt,
     json_output_reminder_prompt,
+    render_prompt,
 )
-from .providers import create_http_client, create_model
+from .providers import create_http_client, create_model, create_model_settings, get_output_type
 
 __all__ = [
     # Configuration
@@ -43,13 +44,16 @@ __all__ = [
     "ContextObserver",
     "ContextSnapshot",
     # Prompts
-    "SystemPromptRegistry",
+    "PromptTemplate",
     "PromptProvider",
+    "render_prompt",
     "current_datetime_prompt",
     "json_output_reminder_prompt",
     # Providers
     "create_model",
     "create_http_client",
+    "create_model_settings",
+    "get_output_type",
 ]
 
 __version__ = "0.1.0"

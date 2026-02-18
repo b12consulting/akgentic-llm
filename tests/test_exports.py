@@ -38,14 +38,17 @@ def test_key_exports_present():
     assert hasattr(akgentic.llm, "ContextSnapshot")
 
     # Prompts
-    assert hasattr(akgentic.llm, "SystemPromptRegistry")
+    assert hasattr(akgentic.llm, "PromptTemplate")
     assert hasattr(akgentic.llm, "PromptProvider")
+    assert hasattr(akgentic.llm, "render_prompt")
     assert hasattr(akgentic.llm, "current_datetime_prompt")
     assert hasattr(akgentic.llm, "json_output_reminder_prompt")
 
     # Providers
     assert hasattr(akgentic.llm, "create_model")
     assert hasattr(akgentic.llm, "create_http_client")
+    assert hasattr(akgentic.llm, "create_model_settings")
+    assert hasattr(akgentic.llm, "get_output_type")
 
 
 def test_star_import_works():
@@ -76,3 +79,9 @@ def test_module_docstring_exists():
     assert "Quick Start" in akgentic.llm.__doc__
     assert "Key Concepts" in akgentic.llm.__doc__
     assert "REACT pattern" in akgentic.llm.__doc__
+
+
+def test_systempromptregistry_not_exported():
+    """SystemPromptRegistry should NOT be exported (removed in architecture refactor)."""
+    assert "SystemPromptRegistry" not in akgentic.llm.__all__
+    assert not hasattr(akgentic.llm, "SystemPromptRegistry")

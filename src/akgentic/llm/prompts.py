@@ -1,10 +1,9 @@
-"""System prompt registry for dynamic prompt management."""
-
-# TODO: Implementation to be completed by Dev agent
-# This is a skeleton file created by Architect
+"""Prompt templates, rendering, and built-in prompt providers."""
 
 from datetime import UTC, datetime
 from typing import Any, Protocol
+
+from pydantic import BaseModel, Field
 
 
 class PromptProvider(Protocol):
@@ -20,20 +19,56 @@ class PromptProvider(Protocol):
         ...
 
 
-class SystemPromptRegistry:
-    """Registry for dynamic system prompts with priority ordering.
+class PromptTemplate(BaseModel):
+    """Structured prompt with template interpolation.
+
+    Supports {placeholder} syntax for parameter substitution.
+    Parameters are resolved at config time, not at runtime.
 
     Example:
-        >>> registry = SystemPromptRegistry()
-        >>> registry.register("datetime", current_datetime_prompt, priority=10)
-
-    TODO: Complete implementation following architecture.md specifications
+        >>> tpl = PromptTemplate(
+        ...     template="You are {role}.\\n{instructions}",
+        ...     params={"role": "Architect", "instructions": "Design systems."}
+        ... )
+        >>> render_prompt(tpl)
+        'You are Architect.\\nDesign systems.'
     """
 
-    def __init__(self) -> None:
-        """Initialize prompt registry."""
-        # TODO: Implement initialization
-        raise NotImplementedError("SystemPromptRegistry implementation pending")
+    template: str = Field(..., description="Template string with {placeholder} syntax")
+    params: dict[str, str] = Field(
+        default_factory=dict,
+        description="Key-value replacements for template placeholders",
+    )
+
+
+def render_prompt(prompt: str | PromptTemplate) -> str:
+    """Render a prompt to its final string form.
+
+    - str: returned as-is (passthrough)
+    - PromptTemplate: interpolates params into template
+
+    Args:
+        prompt: String prompt or PromptTemplate with params.
+
+    Returns:
+        Rendered prompt string.
+
+    Raises:
+        KeyError: If template references a param not in params dict.
+
+    Example:
+        >>> render_prompt("Simple string")
+        'Simple string'
+        >>> tpl = PromptTemplate(
+        ...     template="You are {role}.",
+        ...     params={"role": "Architect"}
+        ... )
+        >>> render_prompt(tpl)
+        'You are Architect.'
+    """
+    if isinstance(prompt, str):
+        return prompt
+    return prompt.template.format(**prompt.params)
 
 
 # Built-in prompt providers

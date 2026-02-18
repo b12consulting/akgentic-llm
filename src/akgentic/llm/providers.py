@@ -29,15 +29,18 @@ Example:
 
 import logging
 import os
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 import httpx
+from pydantic_ai import NativeOutput
 from pydantic_ai.models import Model
 from pydantic_ai.retries import AsyncTenacityTransport, RetryConfig, wait_retry_after
 from pydantic_ai.settings import ModelSettings
 from tenacity import retry_if_exception, stop_after_attempt, wait_random_exponential
 
 from .config import ModelConfig
+
+T = TypeVar("T")
 
 if TYPE_CHECKING:
     from pydantic_ai.models.anthropic import AnthropicModel
@@ -76,6 +79,137 @@ def _is_retryable_http_error(exc: BaseException) -> bool:
         return False
     status = exc.response.status_code
     return status == 429 or 500 <= status < 600
+
+
+def _supports_native_output(config: ModelConfig) -> bool:
+    """Check if provider supports native structured output via NativeOutput wrapper.
+
+    Providers with native support (via function calling or tool use APIs):
+    - openai: GPT-4o, o1 series, etc.
+    - azure: Azure OpenAI Service
+    - anthropic: Claude 3.5 Sonnet, etc.
+    - nvidia: Only for models with "openai" prefix (e.g., "openai/gpt-4o-mini")
+
+    Providers without native support (use prompt-based extraction):
+    - google-gla: Google Gemini models
+    - mistral: Mistral AI models
+    - nvidia: Non-OpenAI models (e.g., "meta/llama-3.1-70b-instruct")
+
+    Args:
+        config: LLM model configuration.
+
+    Returns:
+        True if the provider supports native structured output, False otherwise.
+
+    Example:
+        >>> config = ModelConfig(provider="openai", model="gpt-4o")
+        >>> _supports_native_output(config)
+        True
+        >>> config = ModelConfig(provider="google-gla", model="gemini-2.0-flash")
+        >>> _supports_native_output(config)
+        False
+        >>> config = ModelConfig(provider="nvidia", model="openai/gpt-4o-mini")
+        >>> _supports_native_output(config)
+        True
+    """
+    if config.provider in ("openai", "azure", "anthropic"):
+        return True
+    if config.provider == "nvidia":
+        return config.model.startswith("openai")
+    return False
+
+
+def get_output_type(config: ModelConfig, output_type: type[T]) -> NativeOutput[T] | type[T]:
+    """Get the appropriate output type wrapper for structured output based on provider.
+
+    For providers with native structured output support (OpenAI, Azure, Anthropic,
+    and NVIDIA OpenAI models), returns ``NativeOutput[T]`` to leverage the provider's
+    native function calling or tool use APIs for schema enforcement.
+
+    For other providers (Google Gemini, Mistral, and non-OpenAI NVIDIA models),
+    returns the raw type to use pydantic-ai's prompt-based extraction fallback.
+
+    For ``str`` result types (default case), always returns the raw type since
+    structured output wrapping is not needed.
+
+    Args:
+        config: LLM model configuration.
+        output_type: The desired result type (a Pydantic model or primitive).
+
+    Returns:
+        ``NativeOutput[output_type]`` for native-capable providers with structured types,
+        or raw ``output_type`` for str types or prompt-based extraction.
+
+    Example:
+        >>> from pydantic import BaseModel
+        >>> class UserInfo(BaseModel):
+        ...     name: str
+        ...     age: int
+        >>> config = ModelConfig(provider="openai", model="gpt-4o")
+        >>> result_type = get_output_type(config, UserInfo)
+        >>> type(result_type).__name__
+        'NativeOutput'
+        >>> config_google = ModelConfig(provider="google-gla", model="gemini-2.0-flash")
+        >>> result_type_google = get_output_type(config_google, UserInfo)
+        >>> result_type_google is UserInfo
+        True
+        >>> result_type_str = get_output_type(config, str)
+        >>> result_type_str is str
+        True
+
+    Note:
+        This function should be used by agent implementations to automatically
+        select the optimal output strategy. Do not hardcode provider checks
+        in consuming code — always delegate to this function.
+    """
+    # No wrapping needed for str result types
+    if output_type is str:
+        return output_type
+    if _supports_native_output(config):
+        return NativeOutput(output_type)
+    return output_type
+
+
+def create_model_settings(config: ModelConfig) -> ModelSettings | None:
+    """Create provider-aware ModelSettings from configuration.
+
+    Builds model settings including temperature, max_tokens, and seed from
+    the provided configuration. For providers without native structured output
+    support, automatically disables parallel_tool_calls to prevent issues with
+    prompt-based extraction.
+
+    Args:
+        config: LLM model configuration.
+
+    Returns:
+        ModelSettings instance with appropriate parameters, or None if no
+        settings are configured.
+
+    Example:
+        >>> config = ModelConfig(
+        ...     provider="google-gla",
+        ...     model="gemini-2.0-flash",
+        ...     temperature=0.7
+        ... )
+        >>> settings = create_model_settings(config)
+        >>> settings["temperature"]
+        0.7
+        >>> settings["parallel_tool_calls"]
+        False
+
+    Note:
+        The parallel_tool_calls parameter is automatically set to False for
+        providers that don't support native structured output (google-gla,
+        mistral, and non-OpenAI NVIDIA models). This ensures correct behavior
+        when using structured output via prompt-based extraction.
+    """
+    kwargs: dict[str, Any] = dict(cast(dict[str, Any], _build_core_settings(config) or {}))
+
+    # Disable parallel tool calls for providers without native output support
+    if not _supports_native_output(config):
+        kwargs["parallel_tool_calls"] = False
+
+    return cast(ModelSettings, kwargs) if kwargs else None
 
 
 def create_http_client(
@@ -155,8 +289,11 @@ def create_http_client(
     )
 
 
-def _build_settings(config: ModelConfig) -> ModelSettings | None:
-    """Build ModelSettings from ModelConfig, omitting None values.
+def _build_core_settings(config: ModelConfig) -> ModelSettings | None:
+    """Build core ModelSettings from ModelConfig, omitting None values.
+
+    Internal helper for temperature, max_tokens, and seed. Used by
+    _build_openai_settings and provider factories.
 
     Args:
         config: LLM model configuration.
@@ -178,7 +315,7 @@ def _build_openai_settings(config: ModelConfig) -> "OpenAIChatModelSettings | No
     """Build OpenAIChatModelSettings from ModelConfig, including reasoning_effort.
 
     Delegates shared parameters (temperature, max_tokens, seed) to
-    ``_build_settings`` and extends with OpenAI-specific fields.
+    ``_build_core_settings`` and extends with OpenAI-specific fields.
 
     Args:
         config: LLM model configuration.
@@ -188,7 +325,7 @@ def _build_openai_settings(config: ModelConfig) -> "OpenAIChatModelSettings | No
     """
     from pydantic_ai.models.openai import OpenAIChatModelSettings  # noqa: PLC0415
 
-    kwargs: dict[str, Any] = dict(cast(dict[str, Any], _build_settings(config) or {}))
+    kwargs: dict[str, Any] = dict(cast(dict[str, Any], _build_core_settings(config) or {}))
     if config.reasoning_effort is not None:
         kwargs["openai_reasoning_effort"] = config.reasoning_effort
     return cast(OpenAIChatModelSettings, kwargs) if kwargs else None
@@ -264,7 +401,7 @@ def _create_anthropic_model(
     from pydantic_ai.models.anthropic import AnthropicModel  # noqa: PLC0415
     from pydantic_ai.providers.anthropic import AnthropicProvider  # noqa: PLC0415
 
-    settings = _build_settings(config)
+    settings = _build_core_settings(config)
     return AnthropicModel(
         model_name=config.model,
         provider=AnthropicProvider(http_client=http_client),
@@ -293,7 +430,7 @@ def _create_google_model(
     from pydantic_ai.models.google import GoogleModel  # noqa: PLC0415
     from pydantic_ai.providers.google import GoogleProvider  # noqa: PLC0415
 
-    settings = _build_settings(config)
+    settings = _build_core_settings(config)
     return GoogleModel(
         model_name=config.model,
         provider=GoogleProvider(http_client=http_client),
@@ -317,7 +454,7 @@ def _create_mistral_model(
     from pydantic_ai.models.mistral import MistralModel  # noqa: PLC0415
     from pydantic_ai.providers.mistral import MistralProvider  # noqa: PLC0415
 
-    settings = _build_settings(config)
+    settings = _build_core_settings(config)
     return MistralModel(
         model_name=config.model,
         provider=MistralProvider(http_client=http_client),

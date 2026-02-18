@@ -4,10 +4,19 @@ from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
+from pydantic import BaseModel
+from pydantic_ai import NativeOutput
 from pydantic_ai.retries import AsyncTenacityTransport
 
 from akgentic.llm.config import ModelConfig
-from akgentic.llm.providers import _is_retryable_http_error, create_http_client, create_model
+from akgentic.llm.providers import (
+    _is_retryable_http_error,
+    _supports_native_output,
+    create_http_client,
+    create_model,
+    create_model_settings,
+    get_output_type,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -20,6 +29,182 @@ def _make_status_error(status_code: int, headers: dict[str, str] | None = None) 
     request = httpx.Request("GET", "https://api.example.com/test")
     response = httpx.Response(status_code=status_code, headers=headers, request=request)
     return httpx.HTTPStatusError(f"HTTP {status_code}", request=request, response=response)
+
+
+class _TestModel(BaseModel):
+    """Test Pydantic model for output type tests."""
+
+    name: str
+    value: int
+
+
+# ---------------------------------------------------------------------------
+# _supports_native_output unit tests
+# ---------------------------------------------------------------------------
+
+
+class TestSupportsNativeOutput:
+    """Unit tests for _supports_native_output predicate (AC: 1)."""
+
+    def test_openai_supports_native_output(self) -> None:
+        """OpenAI provider supports native structured output."""
+        config = ModelConfig(provider="openai", model="gpt-4o")
+        assert _supports_native_output(config) is True
+
+    def test_azure_supports_native_output(self) -> None:
+        """Azure provider supports native structured output."""
+        config = ModelConfig(provider="azure", model="gpt-4o")
+        assert _supports_native_output(config) is True
+
+    def test_anthropic_supports_native_output(self) -> None:
+        """Anthropic provider supports native structured output."""
+        config = ModelConfig(provider="anthropic", model="claude-3-5-sonnet-20241022")
+        assert _supports_native_output(config) is True
+
+    def test_nvidia_openai_model_supports_native_output(self) -> None:
+        """NVIDIA with openai/* prefix supports native output."""
+        config = ModelConfig(provider="nvidia", model="openai/gpt-4o-mini")
+        assert _supports_native_output(config) is True
+
+    def test_nvidia_non_openai_model_no_native_output(self) -> None:
+        """NVIDIA with non-openai models does not support native output."""
+        config = ModelConfig(provider="nvidia", model="meta/llama-3.1-70b-instruct")
+        assert _supports_native_output(config) is False
+
+    def test_google_gla_no_native_output(self) -> None:
+        """Google GLA provider does not support native output."""
+        config = ModelConfig(provider="google-gla", model="gemini-2.0-flash")
+        assert _supports_native_output(config) is False
+
+    def test_mistral_no_native_output(self) -> None:
+        """Mistral provider does not support native output."""
+        config = ModelConfig(provider="mistral", model="mistral-large-latest")
+        assert _supports_native_output(config) is False
+
+
+# ---------------------------------------------------------------------------
+# get_output_type unit tests
+# ---------------------------------------------------------------------------
+
+
+class TestGetOutputType:
+    """Unit tests for get_output_type function (AC: 2)."""
+
+    def test_openai_wraps_with_native_output(self) -> None:
+        """OpenAI returns NativeOutput wrapper."""
+        config = ModelConfig(provider="openai", model="gpt-4o")
+        result = get_output_type(config, _TestModel)
+        assert isinstance(result, NativeOutput)
+
+    def test_azure_wraps_with_native_output(self) -> None:
+        """Azure returns NativeOutput wrapper."""
+        config = ModelConfig(provider="azure", model="gpt-4o")
+        result = get_output_type(config, _TestModel)
+        assert isinstance(result, NativeOutput)
+
+    def test_anthropic_wraps_with_native_output(self) -> None:
+        """Anthropic returns NativeOutput wrapper."""
+        config = ModelConfig(provider="anthropic", model="claude-3-5-sonnet-20241022")
+        result = get_output_type(config, _TestModel)
+        assert isinstance(result, NativeOutput)
+
+    def test_nvidia_openai_wraps_with_native_output(self) -> None:
+        """NVIDIA with openai/* prefix returns NativeOutput wrapper."""
+        config = ModelConfig(provider="nvidia", model="openai/gpt-4o-mini")
+        result = get_output_type(config, _TestModel)
+        assert isinstance(result, NativeOutput)
+
+    def test_google_gla_returns_raw_type(self) -> None:
+        """Google GLA returns raw type without wrapper."""
+        config = ModelConfig(provider="google-gla", model="gemini-2.0-flash")
+        result = get_output_type(config, _TestModel)
+        assert result is _TestModel
+
+    def test_mistral_returns_raw_type(self) -> None:
+        """Mistral returns raw type without wrapper."""
+        config = ModelConfig(provider="mistral", model="mistral-large-latest")
+        result = get_output_type(config, _TestModel)
+        assert result is _TestModel
+
+    def test_nvidia_non_openai_returns_raw_type(self) -> None:
+        """NVIDIA with non-openai models returns raw type."""
+        config = ModelConfig(provider="nvidia", model="meta/llama-3.1-70b-instruct")
+        result = get_output_type(config, _TestModel)
+        assert result is _TestModel
+
+
+# ---------------------------------------------------------------------------
+# create_model_settings unit tests
+# ---------------------------------------------------------------------------
+
+
+class TestCreateModelSettings:
+    """Unit tests for create_model_settings function (AC: 3)."""
+
+    def test_native_provider_no_parallel_tool_calls_override(self) -> None:
+        """Native providers don't get parallel_tool_calls disabled."""
+        config = ModelConfig(provider="openai", model="gpt-4o", temperature=0.7)
+        settings = create_model_settings(config)
+        assert settings is not None
+        assert settings.get("temperature") == 0.7
+        assert "parallel_tool_calls" not in settings
+
+    def test_non_native_provider_disables_parallel_tool_calls(self) -> None:
+        """Non-native providers get parallel_tool_calls=False."""
+        config = ModelConfig(provider="google-gla", model="gemini-2.0-flash", temperature=0.5)
+        settings = create_model_settings(config)
+        assert settings is not None
+        assert settings["parallel_tool_calls"] is False
+        assert settings["temperature"] == 0.5
+
+    def test_mistral_disables_parallel_tool_calls(self) -> None:
+        """Mistral gets parallel_tool_calls=False."""
+        config = ModelConfig(provider="mistral", model="mistral-large-latest")
+        settings = create_model_settings(config)
+        assert settings is not None
+        assert settings["parallel_tool_calls"] is False
+
+    def test_nvidia_non_openai_disables_parallel_tool_calls(self) -> None:
+        """NVIDIA non-openai models get parallel_tool_calls=False."""
+        config = ModelConfig(provider="nvidia", model="meta/llama-3.1-70b-instruct", max_tokens=1000)
+        settings = create_model_settings(config)
+        assert settings is not None
+        assert settings["parallel_tool_calls"] is False
+        assert settings["max_tokens"] == 1000
+
+    def test_preserves_temperature(self) -> None:
+        """Settings preserve temperature from config."""
+        config = ModelConfig(provider="google-gla", model="gemini-2.0-flash", temperature=0.9)
+        settings = create_model_settings(config)
+        assert settings is not None
+        assert settings["temperature"] == 0.9
+
+    def test_preserves_max_tokens(self) -> None:
+        """Settings preserve max_tokens from config."""
+        config = ModelConfig(provider="mistral", model="mistral-large-latest", max_tokens=2048)
+        settings = create_model_settings(config)
+        assert settings is not None
+        assert settings["max_tokens"] == 2048
+
+    def test_preserves_seed(self) -> None:
+        """Settings preserve seed from config."""
+        config = ModelConfig(provider="google-gla", model="gemini-2.0-flash", seed=42)
+        settings = create_model_settings(config)
+        assert settings is not None
+        assert settings["seed"] == 42
+
+    def test_all_params_none_returns_none(self) -> None:
+        """Returns None when no parameters are set for native provider."""
+        config = ModelConfig(provider="openai", model="gpt-4o")
+        settings = create_model_settings(config)
+        assert settings is None
+
+    def test_all_params_none_non_native_returns_settings_with_parallel_false(self) -> None:
+        """Returns settings with parallel_tool_calls=False for non-native even with no other params."""
+        config = ModelConfig(provider="google-gla", model="gemini-2.0-flash")
+        settings = create_model_settings(config)
+        assert settings is not None
+        assert settings["parallel_tool_calls"] is False
 
 
 # ---------------------------------------------------------------------------

@@ -139,9 +139,10 @@ class TestReactAgentInit:
         assert agent is not None
 
     def test_init_with_result_type(self, minimal_config):
-        """Test agent initializes with custom result_type."""
+        """Test agent initializes with custom result_type (Pydantic model)."""
+        from pydantic import BaseModel
 
-        class CustomResult:
+        class CustomResult(BaseModel):
             value: str
 
         agent = ReactAgent(config=minimal_config, result_type=CustomResult)

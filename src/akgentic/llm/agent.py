@@ -9,7 +9,7 @@ from pydantic_ai import UsageLimits as PydanticUsageLimits
 
 from .config import ReactAgentConfig, UsageLimits
 from .context import ContextManager, ContextObserver, ContextSnapshot
-from .providers import create_http_client, create_model
+from .providers import create_http_client, create_model, get_output_type
 
 
 class UsageLimitError(Exception):
@@ -19,7 +19,7 @@ class UsageLimitError(Exception):
 
 
 class ReactAgent:
-    """REACT-based LLM agent extracted from V1 base_agent.py.
+    """REACT-based LLM agent.
 
     Features:
     - REACT pattern support (via pydantic-ai)
@@ -89,8 +89,10 @@ class ReactAgent:
         # Create model from config
         self._model = create_model(config.model, self._http_client)
 
+        # Wrap result_type with provider-aware output strategy for structured output
+        wrapped_result_type: Any = get_output_type(config.model, result_type)
+
         # Create pydantic-ai Agent
-        # Type ignore for deps_type: pydantic-ai expects type[Any], we allow None
         self._pydantic_agent: Agent[Any, Any] = Agent(
             model=self._model,
             tools=tools or [],
@@ -98,6 +100,7 @@ class ReactAgent:
             retries=config.runtime.retries,
             deps_type=deps_type,  # type: ignore[arg-type]
             end_strategy=config.runtime.end_strategy,
+            output_type=wrapped_result_type,
             history_processors=[],  # Empty for MVP (story 2-1-6b deferred)
         )
 
