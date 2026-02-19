@@ -129,6 +129,10 @@ class ReactAgent:
         pydantic_limits = self._to_pydantic_limits(self._config.usage_limits)
 
         try:
+            # Track messages added in THIS run to prevent duplicates
+            # (new_messages() can return same messages across iterations)
+            added_message_ids: set[int] = set()
+
             async with self._pydantic_agent.iter(
                 user_prompt=user_prompt,
                 deps=deps,
@@ -137,10 +141,13 @@ class ReactAgent:
                 output_type=get_output_type(self._config.model_cfg, output_type),
             ) as run:
                 async for _ in run:
-                    # Observers subscribed via subscribe_context() are notified
-                    # automatically by ContextManager.add_message().
+                    # new_messages() may return previously emitted messages
+                    # during tool call iterations - only add each once
                     for message in run.new_messages():
-                        self._context.add_message(message)
+                        msg_id = id(message)
+                        if msg_id not in added_message_ids:
+                            added_message_ids.add(msg_id)
+                            self._context.add_message(message)
 
                 return run.result.output if run.result else None
 
