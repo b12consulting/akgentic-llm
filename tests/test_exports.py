@@ -25,7 +25,7 @@ def test_key_exports_present():
     # Configuration
     assert hasattr(akgentic.llm, "ModelConfig")
     assert hasattr(akgentic.llm, "UsageLimits")
-    assert hasattr(akgentic.llm, "AgentRuntimeConfig")
+    assert hasattr(akgentic.llm, "RuntimeConfig")
     assert hasattr(akgentic.llm, "ReactAgentConfig")
 
     # Agent
@@ -39,8 +39,6 @@ def test_key_exports_present():
 
     # Prompts
     assert hasattr(akgentic.llm, "PromptTemplate")
-    assert hasattr(akgentic.llm, "PromptProvider")
-    assert hasattr(akgentic.llm, "render_prompt")
     assert hasattr(akgentic.llm, "current_datetime_prompt")
     assert hasattr(akgentic.llm, "json_output_reminder_prompt")
 

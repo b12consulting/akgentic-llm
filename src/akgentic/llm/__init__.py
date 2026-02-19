@@ -19,14 +19,12 @@ Key Concepts:
 """
 
 from .agent import ReactAgent, UsageLimitError
-from .config import AgentRuntimeConfig, ModelConfig, ReactAgentConfig, UsageLimits
+from .config import HttpClientConfig, ModelConfig, ReactAgentConfig, RuntimeConfig, UsageLimits
 from .context import ContextManager, ContextObserver, ContextSnapshot
 from .prompts import (
-    PromptProvider,
     PromptTemplate,
     current_datetime_prompt,
     json_output_reminder_prompt,
-    render_prompt,
 )
 from .providers import create_http_client, create_model, create_model_settings, get_output_type
 
@@ -34,7 +32,8 @@ __all__ = [
     # Configuration
     "ModelConfig",
     "UsageLimits",
-    "AgentRuntimeConfig",
+    "RuntimeConfig",
+    "HttpClientConfig",
     "ReactAgentConfig",
     # Agent
     "ReactAgent",
@@ -45,8 +44,6 @@ __all__ = [
     "ContextSnapshot",
     # Prompts
     "PromptTemplate",
-    "PromptProvider",
-    "render_prompt",
     "current_datetime_prompt",
     "json_output_reminder_prompt",
     # Providers

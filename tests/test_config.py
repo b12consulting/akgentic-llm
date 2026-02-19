@@ -3,7 +3,7 @@
 import pytest
 from pydantic import ValidationError
 
-from akgentic.llm.config import AgentRuntimeConfig, ModelConfig, ReactAgentConfig, UsageLimits
+from akgentic.llm.config import ModelConfig, ReactAgentConfig, RuntimeConfig, UsageLimits
 
 
 class TestModelConfig:
@@ -147,47 +147,54 @@ class TestAgentRuntimeConfig:
 
     def test_defaults(self):
         """Test default values."""
-        config = AgentRuntimeConfig()
+        config = RuntimeConfig()
         assert config.retries == 3
         assert config.end_strategy == "exhaustive"
         assert config.parallel_tool_calls is True
-        assert config.timeout_seconds == 120.0
-        assert config.max_http_retries == 5
-        assert config.retry_backoff_multiplier == 0.5
-        assert config.retry_backoff_max == 60.0
+        assert config.http_client_config.timeout_seconds == 120.0
+        assert config.http_client_config.max_retries == 5
+        assert config.http_client_config.backoff_multiplier == 0.5
+        assert config.http_client_config.backoff_max == 60.0
 
     def test_custom_values(self):
         """Test custom configuration."""
-        config = AgentRuntimeConfig(
-            retries=5, end_strategy="early", parallel_tool_calls=False, timeout_seconds=60.0, max_http_retries=3
+        from akgentic.llm.config import HttpClientConfig
+
+        config = RuntimeConfig(
+            retries=5,
+            end_strategy="early",
+            parallel_tool_calls=False,
+            http_client_config=HttpClientConfig(timeout_seconds=60.0, max_retries=3),
         )
         assert config.retries == 5
         assert config.end_strategy == "early"
         assert config.parallel_tool_calls is False
-        assert config.timeout_seconds == 60.0
-        assert config.max_http_retries == 3
+        assert config.http_client_config.timeout_seconds == 60.0
+        assert config.http_client_config.max_retries == 3
 
     def test_invalid_strategy(self):
         """Test invalid end_strategy raises error."""
         with pytest.raises(ValidationError):
-            AgentRuntimeConfig(end_strategy="invalid")  # type: ignore
+            RuntimeConfig(end_strategy="invalid")  # type: ignore
 
     def test_negative_retries_invalid(self):
         """Test negative retries raise error."""
         with pytest.raises(ValidationError):
-            AgentRuntimeConfig(retries=-1)
+            RuntimeConfig(retries=-1)
 
     def test_zero_retries_valid(self):
         """Test zero retries is valid."""
-        config = AgentRuntimeConfig(retries=0)
+        config = RuntimeConfig(retries=0)
         assert config.retries == 0
 
     def test_serialization(self):
         """Test model serialization."""
-        config = AgentRuntimeConfig(retries=5, timeout_seconds=90.0)
+        from akgentic.llm.config import HttpClientConfig
+
+        config = RuntimeConfig(retries=5, http_client_config=HttpClientConfig(timeout_seconds=90.0))
         data = config.model_dump()
         assert data["retries"] == 5
-        assert data["timeout_seconds"] == 90.0
+        assert data["http_client_config"]["timeout_seconds"] == 90.0
 
 
 class TestReactAgentConfig:
@@ -195,69 +202,60 @@ class TestReactAgentConfig:
 
     def test_full_config(self):
         """Test complete agent configuration."""
+        from akgentic.llm.config import HttpClientConfig
+
         config = ReactAgentConfig(
-            model=ModelConfig(provider="openai", model="gpt-4o", temperature=0.7),
+            model_cfg=ModelConfig(provider="openai", model="gpt-4o", temperature=0.7),
             usage_limits=UsageLimits(request_limit=10, total_tokens_limit=5000),
-            runtime=AgentRuntimeConfig(retries=5, timeout_seconds=60.0),
-            system_prompts=["You are a helpful assistant.", "Always be concise."],
+            runtime_cfg=RuntimeConfig(retries=5, http_client_config=HttpClientConfig(timeout_seconds=60.0)),
         )
-        assert config.model.provider == "openai"
-        assert config.model.model == "gpt-4o"
-        assert config.model.temperature == 0.7
+        assert config.model_cfg.provider == "openai"
+        assert config.model_cfg.model == "gpt-4o"
+        assert config.runtime_cfg.retries == 5
+        assert config.runtime_cfg.http_client_config.timeout_seconds == 60.0
+        assert config.model_cfg.temperature == 0.7
         assert config.usage_limits.request_limit == 10  # type: ignore
         assert config.usage_limits.total_tokens_limit == 5000  # type: ignore
-        assert config.runtime.retries == 5
-        assert config.runtime.timeout_seconds == 60.0
-        assert len(config.system_prompts) == 2
-        assert config.system_prompts[0] == "You are a helpful assistant."
+        assert config.runtime_cfg.retries == 5
 
     def test_defaults(self):
         """Test default values."""
         config = ReactAgentConfig()
-        assert config.model.provider == "openai"
-        assert config.model.model == "gpt-4.1"
-        assert config.usage_limits is None
-        assert config.runtime.retries == 3
-        assert config.runtime.timeout_seconds == 120.0
-        assert config.system_prompts == []
+        assert config.model_cfg.provider == "openai"
+        assert config.model_cfg.model == "gpt-4.1"
+        assert config.usage_limits is not None
+        assert config.usage_limits.request_limit == 50
+        assert config.runtime_cfg.retries == 3
+        assert config.runtime_cfg.http_client_config.timeout_seconds == 120.0
 
     def test_minimal_config(self):
         """Test minimal configuration."""
-        config = ReactAgentConfig(model=ModelConfig(provider="anthropic", model="claude-3-5-sonnet-20241022"))
-        assert config.model.provider == "anthropic"
-        assert config.model.model == "claude-3-5-sonnet-20241022"
+        config = ReactAgentConfig(model_cfg=ModelConfig(provider="anthropic", model="claude-3-5-sonnet-20241022"))
+        assert config.model_cfg.provider == "anthropic"
+        assert config.model_cfg.model == "claude-3-5-sonnet-20241022"
         # Defaults should be set
-        assert config.usage_limits is None  # Optional, defaults to None
-        assert config.runtime is not None
-        assert config.system_prompts == []
-
-    def test_system_prompts(self):
-        """Test system prompts configuration."""
-        prompts = ["You are an expert.", "Be helpful."]
-        config = ReactAgentConfig(model=ModelConfig(provider="openai", model="gpt-4o"), system_prompts=prompts)
-        assert config.system_prompts == prompts
+        assert config.usage_limits is not None
+        assert config.usage_limits.request_limit == 50
+        assert config.runtime_cfg is not None
 
     def test_serialization(self):
         """Test model serialization."""
         config = ReactAgentConfig(
-            model=ModelConfig(provider="openai", model="gpt-4o"),
+            model_cfg=ModelConfig(provider="openai", model="gpt-4o"),
             usage_limits=UsageLimits(request_limit=10),
-            system_prompts=["Test prompt"],
         )
         data = config.model_dump()
-        assert data["model"]["provider"] == "openai"
+        assert data["model_cfg"]["provider"] == "openai"
         assert data["usage_limits"]["request_limit"] == 10
-        assert data["system_prompts"] == ["Test prompt"]
 
     def test_json_serialization(self):
         """Test JSON serialization."""
-        config = ReactAgentConfig(model=ModelConfig(provider="openai", model="gpt-4o"), system_prompts=["Test"])
+        config = ReactAgentConfig(model_cfg=ModelConfig(provider="openai", model="gpt-4o"))
         json_str = config.model_dump_json()
         assert "openai" in json_str
         assert "gpt-4o" in json_str
-        assert "Test" in json_str
 
     def test_nested_validation(self):
         """Test nested validation errors propagate."""
         with pytest.raises(ValidationError):
-            ReactAgentConfig(model=ModelConfig(provider="openai", model="gpt-4o", temperature=3.0))
+            ReactAgentConfig(model_cfg=ModelConfig(provider="openai", model="gpt-4o", temperature=3.0))

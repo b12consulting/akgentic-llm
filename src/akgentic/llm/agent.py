@@ -1,7 +1,6 @@
 """REACT-based LLM agent with context management and iteration support."""
 
 import asyncio
-from datetime import datetime, timezone
 from typing import Any
 
 from pydantic_ai import Agent, UsageLimitExceeded
@@ -82,56 +81,30 @@ class ReactAgent:
             self._context.subscribe(observer)
 
         # Create HTTP client
-        self._http_client = create_http_client(
-            timeout_s=config.runtime.timeout_seconds,
-            max_attempts=config.runtime.max_http_retries,
-            exp_multiplier=config.runtime.retry_backoff_multiplier,
-            exp_max_s=config.runtime.retry_backoff_max,
+        http_client = create_http_client(
+            timeout_s=config.runtime_cfg.http_client_config.timeout_seconds,
+            max_attempts=config.runtime_cfg.http_client_config.max_retries,
+            exp_multiplier=config.runtime_cfg.http_client_config.backoff_multiplier,
+            exp_max_s=config.runtime_cfg.http_client_config.backoff_max,
         )
 
         # Create model from config
-        self._model = create_model(config.model, self._http_client)
+        self._model = create_model(config.model_cfg, http_client)
 
         # Wrap result_type with provider-aware output strategy for structured output
-        wrapped_result_type: Any = get_output_type(config.model, result_type)
+        wrapped_result_type: Any = get_output_type(config.model_cfg, result_type)
 
         # Create pydantic-ai Agent
         self._pydantic_agent: Agent[Any, Any] = Agent(
             model=self._model,
             tools=tools or [],
             toolsets=toolsets or [],
-            retries=config.runtime.retries,
+            retries=config.runtime_cfg.retries,
             deps_type=deps_type,  # type: ignore[arg-type]
-            end_strategy=config.runtime.end_strategy,
+            end_strategy=config.runtime_cfg.end_strategy,
             output_type=wrapped_result_type,
             history_processors=[],  # Empty for MVP (story 2-1-6b deferred)
         )
-
-        # Register system prompts
-        self._register_system_prompts()
-
-    def _register_system_prompts(self) -> None:
-        """Register system prompts with the pydantic-ai agent.
-
-        Conditionally registers:
-        - config_prompts: From config.system_prompts if provided
-
-        Always registers:
-        - current_datetime_prompt: Current date/time in system timezone
-        """
-
-        # Register config prompts if provided
-        if self._config.system_prompts:
-
-            @self._pydantic_agent.system_prompt(dynamic=True)
-            def config_prompts(ctx: Any) -> str:
-                return "\n".join(self._config.system_prompts)
-
-        # Always register datetime prompt
-        @self._pydantic_agent.system_prompt(dynamic=True)
-        def current_datetime_prompt(ctx: Any) -> str:
-            now = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M")
-            return f"The current date and time is {now}."
 
     async def run(self, user_prompt: str, deps: Any = None, output_type: type[Any] | None = None) -> Any:
         """Execute agent with REACT pattern.
@@ -159,9 +132,9 @@ class ReactAgent:
             async with self._pydantic_agent.iter(
                 user_prompt=user_prompt,
                 deps=deps,
-                message_history=self._context.messages,
                 usage_limits=pydantic_limits,
-                output_type=get_output_type(self._config.model, output_type),
+                message_history=self._context.messages,
+                output_type=get_output_type(self._config.model_cfg, output_type),
             ) as run:
                 async for _ in run:
                     # Observers subscribed via subscribe_context() are notified

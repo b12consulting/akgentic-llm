@@ -37,7 +37,7 @@ class MockObserver:
 def minimal_config():
     """Minimal ReactAgentConfig for testing."""
     return ReactAgentConfig(
-        model=ModelConfig(provider="openai", model="gpt-4o"),
+        model_cfg=ModelConfig(provider="openai", model="gpt-4o"),
     )
 
 
@@ -45,17 +45,8 @@ def minimal_config():
 def config_with_limits():
     """ReactAgentConfig with usage limits."""
     return ReactAgentConfig(
-        model=ModelConfig(provider="openai", model="gpt-4o"),
+        model_cfg=ModelConfig(provider="openai", model="gpt-4o"),
         usage_limits=UsageLimits(request_limit=5, total_tokens_limit=1000),
-    )
-
-
-@pytest.fixture
-def config_with_prompts():
-    """ReactAgentConfig with system prompts."""
-    return ReactAgentConfig(
-        model=ModelConfig(provider="openai", model="gpt-4o"),
-        system_prompts=["You are a helpful assistant.", "Always be concise."],
     )
 
 
@@ -366,16 +357,6 @@ class TestReactAgentSyncMethod:
 
 class TestReactAgentSystemPrompts:
     """Test system prompt registration."""
-
-    def test_config_system_prompts_registered(self, config_with_prompts):
-        """Test system prompts from config.system_prompts are registered."""
-        agent = ReactAgent(config=config_with_prompts)
-        # Check that agent was created (prompts registered during init)
-        assert agent is not None
-        # System prompts are registered as decorators on pydantic_agent
-        # We can't easily test the prompt content without running the agent,
-        # but we can verify initialization succeeded
-        assert len(config_with_prompts.system_prompts) == 2
 
     def test_current_datetime_prompt_registered(self, minimal_config):
         """Test current_datetime_prompt always registered."""
