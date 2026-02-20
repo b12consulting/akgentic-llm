@@ -15,12 +15,26 @@ LLM integration layer for Akgentic agent systems - clean abstraction for LLM pro
 
 ## Installation
 
+### Standalone Package
+
 ```bash
 # With uv (recommended)
 uv add akgentic-llm
 
 # With pip
 pip install akgentic-llm
+```
+
+### Within Monorepo Workspace
+
+If you're developing in the Akgentic Platform v2 monorepo:
+
+```bash
+# From workspace root
+source .venv/bin/activate
+
+# Package is already installed in editable mode via workspace
+# Cross-package dependencies (akgentic-core) are automatically resolved
 ```
 
 ## Quick Start
@@ -30,7 +44,7 @@ from akgentic.llm import ReactAgent, ModelConfig, ReactAgentConfig
 
 # Configure agent
 config = ReactAgentConfig(
-    model=ModelConfig(provider="openai", model="gpt-4o")
+    model_cfg=ModelConfig(provider="openai", model="gpt-4o")
 )
 
 # Create agent
@@ -94,11 +108,11 @@ limits = UsageLimits(
 ### Complete Agent Configuration
 
 ```python
-from akgentic.llm import ReactAgentConfig, ModelConfig, UsageLimits, AgentRuntimeConfig
+from akgentic.llm import ReactAgentConfig, ModelConfig, UsageLimits, RuntimeConfig, HttpClientConfig
 
 # Full configuration with all options
 config = ReactAgentConfig(
-    model=ModelConfig(
+    model_cfg=ModelConfig(
         provider="openai",
         model="gpt-4o",
         temperature=0.7,
@@ -108,16 +122,14 @@ config = ReactAgentConfig(
         request_limit=10,
         total_tokens_limit=5000
     ),
-    runtime=AgentRuntimeConfig(
+    runtime_cfg=RuntimeConfig(
         retries=5,
         end_strategy="exhaustive",
-        timeout_seconds=120.0,
-        max_http_retries=5
-    ),
-    system_prompts=[
-        "You are a helpful assistant.",
-        "Always provide detailed explanations."
-    ]
+        http_client_config=HttpClientConfig(
+            timeout_seconds=120.0,
+            max_retries=5
+        )
+    )
 )
 
 # Use with agent
@@ -154,16 +166,43 @@ See [architecture.md](../../_bmad-output/planning-artifacts/architecture.md#phas
 
 ## Development
 
+### Standalone Package Development
+
 ```bash
-# Install with dev dependencies
-uv add --dev akgentic-llm
+# Clone and enter package directory
+cd packages/akgentic-llm
+
+# Create virtual environment
+uv venv
+
+# Activate it
+source .venv/bin/activate
+
+# Install in editable mode with dev dependencies
+uv pip install -e ".[dev]"
 
 # Run tests
-uv run pytest
+pytest
 
 # Type checking
-uv run mypy src/
+mypy src/
 
 # Linting
-uv run ruff check src/
+ruff check src/
+```
+
+### Monorepo Workspace Development
+
+```bash
+# From workspace root
+source .venv/bin/activate
+
+# Run tests
+pytest packages/akgentic-llm/tests/
+
+# Type checking
+mypy packages/akgentic-llm/src/
+
+# Linting
+ruff check packages/akgentic-llm/src/
 ```
