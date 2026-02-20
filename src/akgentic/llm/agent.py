@@ -106,7 +106,9 @@ class ReactAgent:
             history_processors=[],  # Empty for MVP (story 2-1-6b deferred)
         )
 
-    async def run(self, user_prompt: str, deps: Any = None, output_type: type[Any] | None = None) -> Any:
+    async def run(
+        self, user_prompt: str, deps: Any = None, output_type: type[Any] | None = None
+    ) -> Any:
         """Execute agent with REACT pattern.
 
         Runs pydantic-ai agent iteratively, updating context after each
@@ -154,7 +156,9 @@ class ReactAgent:
         except UsageLimitExceeded as e:
             raise UsageLimitError(str(e)) from e
 
-    def run_sync(self, user_prompt: str, deps: Any = None, output_type: type[Any] | None = None) -> Any:
+    def run_sync(
+        self, user_prompt: str, deps: Any = None, output_type: type[Any] | None = None
+    ) -> Any:
         """Execute agent synchronously.
 
         Convenience wrapper around run() for synchronous contexts.

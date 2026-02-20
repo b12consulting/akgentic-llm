@@ -21,7 +21,9 @@ def _is_system_message(msg: ModelMessage) -> bool:
     Returns:
         True if message is a system message
     """
-    return isinstance(msg, ModelRequest) and any(isinstance(part, SystemPromptPart) for part in msg.parts)
+    return isinstance(msg, ModelRequest) and any(
+        isinstance(part, SystemPromptPart) for part in msg.parts
+    )
 
 
 @runtime_checkable

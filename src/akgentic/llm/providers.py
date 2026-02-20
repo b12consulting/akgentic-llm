@@ -119,7 +119,9 @@ def _supports_native_output(config: ModelConfig) -> bool:
     return False
 
 
-def get_output_type(config: ModelConfig, output_type: type[T] | None) -> NativeOutput[T] | type[T] | None:
+def get_output_type(
+    config: ModelConfig, output_type: type[T] | None
+) -> NativeOutput[T] | type[T] | None:
     """Get the appropriate output type wrapper for structured output based on provider.
 
     For providers with native structured output support (OpenAI, Azure, Anthropic,
@@ -379,7 +381,9 @@ def _create_azure_model(
 
     base_url = os.getenv("AZURE_OPENAI_ENDPOINT")
     if not base_url:
-        raise ValueError("AZURE_OPENAI_ENDPOINT environment variable is required for Azure provider")
+        raise ValueError(
+            "AZURE_OPENAI_ENDPOINT environment variable is required for Azure provider"
+        )
     return OpenAIChatModel(
         model_name=config.model,
         provider=OpenAIProvider(base_url=base_url, http_client=http_client),
@@ -556,6 +560,8 @@ def create_model(
     factory = _PROVIDER_FACTORIES.get(config.provider)
     if factory is None:
         supported = ", ".join(_PROVIDER_FACTORIES.keys())
-        raise ValueError(f"Unsupported provider: {config.provider}. Supported providers: {supported}")
+        raise ValueError(
+            f"Unsupported provider: {config.provider}. Supported providers: {supported}"
+        )
 
     return factory(config, http_client)

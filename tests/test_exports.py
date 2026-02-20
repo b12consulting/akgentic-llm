@@ -17,7 +17,9 @@ def test_no_unexpected_exports():
     exported_without_submodules = exported - submodules
     expected = set(akgentic.llm.__all__)
     # __version__ might not always be in dir() depending on how it's defined
-    assert exported_without_submodules == expected, f"Unexpected exports: {exported_without_submodules - expected}"
+    assert exported_without_submodules == expected, (
+        f"Unexpected exports: {exported_without_submodules - expected}"
+    )
 
 
 def test_key_exports_present():

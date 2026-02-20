@@ -74,7 +74,9 @@ class TestModelConfig:
 
     def test_json_serialization(self):
         """Test JSON serialization."""
-        config = ModelConfig(provider="anthropic", model="claude-3-5-sonnet-20241022", temperature=0.7)
+        config = ModelConfig(
+            provider="anthropic", model="claude-3-5-sonnet-20241022", temperature=0.7
+        )
         json_str = config.model_dump_json()
         assert "anthropic" in json_str
         assert "claude-3-5-sonnet-20241022" in json_str
@@ -207,7 +209,9 @@ class TestReactAgentConfig:
         config = ReactAgentConfig(
             model_cfg=ModelConfig(provider="openai", model="gpt-4o", temperature=0.7),
             usage_limits=UsageLimits(request_limit=10, total_tokens_limit=5000),
-            runtime_cfg=RuntimeConfig(retries=5, http_client_config=HttpClientConfig(timeout_seconds=60.0)),
+            runtime_cfg=RuntimeConfig(
+                retries=5, http_client_config=HttpClientConfig(timeout_seconds=60.0)
+            ),
         )
         assert config.model_cfg.provider == "openai"
         assert config.model_cfg.model == "gpt-4o"
@@ -230,7 +234,9 @@ class TestReactAgentConfig:
 
     def test_minimal_config(self):
         """Test minimal configuration."""
-        config = ReactAgentConfig(model_cfg=ModelConfig(provider="anthropic", model="claude-3-5-sonnet-20241022"))
+        config = ReactAgentConfig(
+            model_cfg=ModelConfig(provider="anthropic", model="claude-3-5-sonnet-20241022")
+        )
         assert config.model_cfg.provider == "anthropic"
         assert config.model_cfg.model == "claude-3-5-sonnet-20241022"
         # Defaults should be set
@@ -258,4 +264,6 @@ class TestReactAgentConfig:
     def test_nested_validation(self):
         """Test nested validation errors propagate."""
         with pytest.raises(ValidationError):
-            ReactAgentConfig(model_cfg=ModelConfig(provider="openai", model="gpt-4o", temperature=3.0))
+            ReactAgentConfig(
+                model_cfg=ModelConfig(provider="openai", model="gpt-4o", temperature=3.0)
+            )

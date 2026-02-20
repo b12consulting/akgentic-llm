@@ -81,11 +81,15 @@ class ModelConfig(BaseModel):
         description="Model identifier (e.g., gpt-4.1, claude-3-5-sonnet-20241022)",
     )
 
-    temperature: float | None = Field(default=None, ge=0.0, le=2.0, description="Sampling temperature (0.0-2.0)")
+    temperature: float | None = Field(
+        default=None, ge=0.0, le=2.0, description="Sampling temperature (0.0-2.0)"
+    )
 
     seed: int | None = Field(default=None, description="Random seed for reproducible outputs")
 
-    max_tokens: int | None = Field(default=None, gt=0, description="Maximum tokens in model response")
+    max_tokens: int | None = Field(
+        default=None, gt=0, description="Maximum tokens in model response"
+    )
 
     reasoning_effort: Literal["low", "medium", "high"] | None = Field(
         default=None, description="Reasoning effort for o1/o3 models"
@@ -130,15 +134,25 @@ class UsageLimits(BaseModel):
         >>> limits = UsageLimits(request_limit=None, total_tokens_limit=None)
     """
 
-    request_limit: int | None = Field(default=50, gt=0, description="Maximum number of LLM requests per run")
+    request_limit: int | None = Field(
+        default=50, gt=0, description="Maximum number of LLM requests per run"
+    )
 
-    tool_calls_limit: int | None = Field(default=None, gt=0, description="Maximum number of tool calls per run")
+    tool_calls_limit: int | None = Field(
+        default=None, gt=0, description="Maximum number of tool calls per run"
+    )
 
-    input_tokens_limit: int | None = Field(default=None, gt=0, description="Maximum input/prompt tokens")
+    input_tokens_limit: int | None = Field(
+        default=None, gt=0, description="Maximum input/prompt tokens"
+    )
 
-    output_tokens_limit: int | None = Field(default=None, gt=0, description="Maximum output/completion tokens")
+    output_tokens_limit: int | None = Field(
+        default=None, gt=0, description="Maximum output/completion tokens"
+    )
 
-    total_tokens_limit: int | None = Field(default=None, gt=0, description="Maximum total tokens (input + output)")
+    total_tokens_limit: int | None = Field(
+        default=None, gt=0, description="Maximum total tokens (input + output)"
+    )
 
 
 class HttpClientConfig(BaseModel):
@@ -193,7 +207,9 @@ class HttpClientConfig(BaseModel):
     )
 
     backoff_max: float = Field(
-        default=60.0, gt=0, description="Maximum backoff delay in seconds to prevent excessive retry waits"
+        default=60.0,
+        gt=0,
+        description="Maximum backoff delay in seconds to prevent excessive retry waits",
     )
 
 
@@ -238,11 +254,13 @@ class RuntimeConfig(BaseModel):
     )
 
     parallel_tool_calls: bool = Field(
-        default=True, description="Enable parallel tool execution when model supports concurrent calls"
+        default=True,
+        description="Enable parallel tool execution when model supports concurrent calls",
     )
 
     http_client_config: HttpClientConfig = Field(
-        default_factory=HttpClientConfig, description="HTTP client configuration for API communication"
+        default_factory=HttpClientConfig,
+        description="HTTP client configuration for API communication",
     )
 
 
@@ -290,6 +308,10 @@ class ReactAgentConfig(BaseModel):
 
     model_cfg: ModelConfig = Field(default_factory=ModelConfig, description="Model configuration")
 
-    runtime_cfg: RuntimeConfig = Field(default_factory=RuntimeConfig, description="Runtime behavior configuration")
+    runtime_cfg: RuntimeConfig = Field(
+        default_factory=RuntimeConfig, description="Runtime behavior configuration"
+    )
 
-    usage_limits: UsageLimits = Field(default_factory=UsageLimits, description="Usage limits for cost control")
+    usage_limits: UsageLimits = Field(
+        default_factory=UsageLimits, description="Usage limits for cost control"
+    )

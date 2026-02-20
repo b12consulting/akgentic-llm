@@ -23,7 +23,9 @@ from akgentic.llm.providers import (
 # ---------------------------------------------------------------------------
 
 
-def _make_status_error(status_code: int, headers: dict[str, str] | None = None) -> httpx.HTTPStatusError:
+def _make_status_error(
+    status_code: int, headers: dict[str, str] | None = None
+) -> httpx.HTTPStatusError:
     """Build an httpx.HTTPStatusError for a given status code."""
     headers = headers or {}
     request = httpx.Request("GET", "https://api.example.com/test")
@@ -166,7 +168,9 @@ class TestCreateModelSettings:
 
     def test_nvidia_non_openai_disables_parallel_tool_calls(self) -> None:
         """NVIDIA non-openai models get parallel_tool_calls=False."""
-        config = ModelConfig(provider="nvidia", model="meta/llama-3.1-70b-instruct", max_tokens=1000)
+        config = ModelConfig(
+            provider="nvidia", model="meta/llama-3.1-70b-instruct", max_tokens=1000
+        )
         settings = create_model_settings(config)
         assert settings is not None
         assert settings["parallel_tool_calls"] is False
@@ -314,7 +318,9 @@ class TestCreateHttpClient:
 
         client = create_http_client(max_attempts=5, exp_multiplier=0.01, exp_max_s=0.05)
         assert isinstance(client._transport, AsyncTenacityTransport)
-        with patch.object(client._transport.wrapped, "handle_async_request", side_effect=fake_handle):
+        with patch.object(
+            client._transport.wrapped, "handle_async_request", side_effect=fake_handle
+        ):
             response = await client.get("https://api.example.com/test")
 
         assert response.status_code == 200
@@ -338,7 +344,9 @@ class TestCreateHttpClient:
 
         client = create_http_client(max_attempts=3, exp_multiplier=0.01, exp_max_s=0.05)
         assert isinstance(client._transport, AsyncTenacityTransport)
-        with patch.object(client._transport.wrapped, "handle_async_request", side_effect=fake_handle):
+        with patch.object(
+            client._transport.wrapped, "handle_async_request", side_effect=fake_handle
+        ):
             response = await client.get("https://api.example.com/test")
 
         assert response.status_code == 200
@@ -356,7 +364,9 @@ class TestCreateHttpClient:
 
         client = create_http_client(max_attempts=3, exp_multiplier=0.01, exp_max_s=0.05)
         assert isinstance(client._transport, AsyncTenacityTransport)
-        with patch.object(client._transport.wrapped, "handle_async_request", side_effect=always_500):
+        with patch.object(
+            client._transport.wrapped, "handle_async_request", side_effect=always_500
+        ):
             with pytest.raises(httpx.HTTPStatusError):
                 await client.get("https://api.example.com/test")
 
@@ -374,7 +384,9 @@ class TestCreateHttpClient:
 
         client = create_http_client(max_attempts=5, exp_multiplier=0.01, exp_max_s=0.05)
         assert isinstance(client._transport, AsyncTenacityTransport)
-        with patch.object(client._transport.wrapped, "handle_async_request", side_effect=always_400):
+        with patch.object(
+            client._transport.wrapped, "handle_async_request", side_effect=always_400
+        ):
             with pytest.raises(httpx.HTTPStatusError):
                 await client.get("https://api.example.com/test")
 
@@ -392,7 +404,9 @@ class TestCreateHttpClient:
 
         client = create_http_client(max_attempts=5, exp_multiplier=0.01, exp_max_s=0.05)
         assert isinstance(client._transport, AsyncTenacityTransport)
-        with patch.object(client._transport.wrapped, "handle_async_request", side_effect=always_404):
+        with patch.object(
+            client._transport.wrapped, "handle_async_request", side_effect=always_404
+        ):
             with pytest.raises(httpx.HTTPStatusError):
                 await client.get("https://api.example.com/test")
 
@@ -561,7 +575,9 @@ class TestCreateModel:
 
     @patch("pydantic_ai.providers.anthropic.AnthropicProvider")
     @patch("pydantic_ai.models.anthropic.AnthropicModel")
-    def test_anthropic_http_client_passed_to_provider(self, mock_model_cls, mock_provider_cls) -> None:
+    def test_anthropic_http_client_passed_to_provider(
+        self, mock_model_cls, mock_provider_cls
+    ) -> None:
         """http_client is passed to AnthropicProvider."""
         mock_client = MagicMock(spec=httpx.AsyncClient)
         config = ModelConfig(provider="anthropic", model="claude-3-5-sonnet-20241022")
@@ -641,7 +657,9 @@ class TestCreateModel:
 
     @patch("pydantic_ai.providers.mistral.MistralProvider")
     @patch("pydantic_ai.models.mistral.MistralModel")
-    def test_mistral_http_client_passed_to_provider(self, mock_model_cls, mock_provider_cls) -> None:
+    def test_mistral_http_client_passed_to_provider(
+        self, mock_model_cls, mock_provider_cls
+    ) -> None:
         """http_client is passed to MistralProvider."""
         mock_client = MagicMock(spec=httpx.AsyncClient)
         config = ModelConfig(provider="mistral", model="mistral-large-latest")
@@ -722,7 +740,9 @@ class TestCreateModel:
     @patch("akgentic.llm.providers.create_http_client")
     @patch("pydantic_ai.providers.openai.OpenAIProvider")
     @patch("pydantic_ai.models.openai.OpenAIChatModel")
-    def test_http_client_created_when_none(self, mock_model_cls, mock_provider_cls, mock_create_client) -> None:
+    def test_http_client_created_when_none(
+        self, mock_model_cls, mock_provider_cls, mock_create_client
+    ) -> None:
         """create_http_client() is called when http_client=None and passed to provider."""
         mock_create_client.return_value = MagicMock(spec=httpx.AsyncClient)
         config = ModelConfig(provider="openai", model="gpt-4o")
@@ -751,7 +771,9 @@ class TestCreateModel:
 
     @patch("pydantic_ai.providers.openai.OpenAIProvider")
     @patch("pydantic_ai.models.openai.OpenAIChatModel")
-    def test_none_optional_params_produce_no_settings(self, mock_model_cls, mock_provider_cls) -> None:
+    def test_none_optional_params_produce_no_settings(
+        self, mock_model_cls, mock_provider_cls
+    ) -> None:
         """When temperature/max_tokens/seed are all None, settings=None is passed."""
         mock_client = MagicMock(spec=httpx.AsyncClient)
         config = ModelConfig(provider="openai", model="gpt-4o")
@@ -767,7 +789,9 @@ class TestCreateModel:
     def test_max_tokens_passed_in_settings(self, mock_model_cls, mock_provider_cls) -> None:
         """max_tokens is included in ModelSettings when set."""
         mock_client = MagicMock(spec=httpx.AsyncClient)
-        config = ModelConfig(provider="anthropic", model="claude-3-5-sonnet-20241022", max_tokens=512)
+        config = ModelConfig(
+            provider="anthropic", model="claude-3-5-sonnet-20241022", max_tokens=512
+        )
 
         create_model(config, http_client=mock_client)
 

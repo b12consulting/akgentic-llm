@@ -18,11 +18,16 @@ LLM integration layer for Akgentic agent systems - clean abstraction for LLM pro
 ### Standalone Package
 
 ```bash
-# With uv (recommended)
-uv add akgentic-llm
+# Clone and enter package directory
+cd packages/akgentic-llm
 
-# With pip
-pip install akgentic-llm
+# Create virtual environment
+uv venv
+
+# Activate it
+source .venv/bin/activate
+
+uv pip install -e .
 ```
 
 ### Within Monorepo Workspace
@@ -44,14 +49,14 @@ from akgentic.llm import ReactAgent, ModelConfig, ReactAgentConfig
 
 # Configure agent
 config = ReactAgentConfig(
-    model_cfg=ModelConfig(provider="openai", model="gpt-4o")
+    model_cfg=ModelConfig(provider="openai", model="gpt-4.1")
 )
 
 # Create agent
-agent = ReactAgent(config=config, deps_type=MyDeps)
+agent = ReactAgent(config=config)
 
 # Run agent
-result, messages = await agent.run("Hello, how are you?")
+result = agent.run_sync("Hello, how are you?")
 print(result)
 ```
 
@@ -105,7 +110,43 @@ limits = UsageLimits(
 )
 ```
 
-### Complete Agent Configuration
+### Runtime Configuration
+
+```python
+from akgentic.llm import RuntimeConfig, HttpClientConfig
+
+# Default runtime settings
+runtime = RuntimeConfig()
+
+# Custom retry and execution strategy
+runtime = RuntimeConfig(
+    retries=5,                      # Retry tool failures 5 times
+    end_strategy="exhaustive",      # Execute all tools vs. early stop
+    parallel_tool_calls=True        # Enable concurrent tool execution
+)
+```
+
+End Strategies:
+
+- `"early"`: Stops after first successful tool result (fast path)
+- `"exhaustive"`: Executes all tool calls even when result is available (complete data gathering)
+
+```python
+runtime = RuntimeConfig(
+    retries=5,
+    end_strategy="exhaustive",
+    parallel_tool_calls=True
+    http_client_config=HttpClientConfig(
+        timeout_seconds=120.0,      # Max time for single LLM request
+        max_retries=5,              # HTTP retry attempts
+        backoff_multiplier=0.5,     # Exponential backoff multiplier
+        backoff_max=60.0            # Max backoff delay
+    )
+```
+
+`HttpClientConfig` allows fine-tuning of HTTP request behavior for LLM calls, including timeouts and retry logic.
+
+### Complete agent configuration example
 
 ```python
 from akgentic.llm import ReactAgentConfig, ModelConfig, UsageLimits, RuntimeConfig, HttpClientConfig
