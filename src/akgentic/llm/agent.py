@@ -95,7 +95,7 @@ class ReactAgent:
         wrapped_result_type: Any = get_output_type(config.model_cfg, result_type)
 
         # Create pydantic-ai Agent
-        self._pydantic_agent: Agent[Any, Any] = Agent(
+        self._pydantic_agent = Agent(
             model=self._model,
             tools=tools or [],
             toolsets=toolsets or [],
