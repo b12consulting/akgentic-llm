@@ -8,6 +8,15 @@ from typing import Any, Protocol, runtime_checkable
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic_ai.messages import ModelMessage, ModelRequest, SystemPromptPart
 
+from akgentic.core.messages.orchestrator import EventMessage
+
+##
+## Events
+##
+LLM_MESSAGE_EVENT = "llm_message_event"
+LLM_CHECK_POINT_EVENT = "llm_checkpoint_event"
+LLM_REWIND_EVENT = "llm_rewind_event"
+
 
 def _is_system_message(msg: ModelMessage) -> bool:
     """Check if a message is a system message.
@@ -28,44 +37,13 @@ def _is_system_message(msg: ModelMessage) -> bool:
 
 @runtime_checkable
 class ContextObserver(Protocol):
-    """Observer protocol for LLM context changes.
+    """Observer protocol for LLM context changes."""
 
-    Implement this protocol to be notified of context events:
-    - Message additions
-    - Checkpoint creation
-    - Rewind operations
-
-    Example:
-        >>> class MyObserver:
-        ...     def on_message_added(self, message):
-        ...         print(f"Message added: {message}")
-        ...     def on_checkpoint_created(self, snapshot):
-        ...         print(f"Checkpoint: {snapshot.checkpoint_id}")
-        ...     def on_rewind(self, snapshot):
-        ...         print(f"Rewound to: {snapshot.checkpoint_id}")
-    """
-
-    def on_message_added(self, message: ModelMessage) -> None:
-        """Called when a message is added to context.
+    def notify_event(self, event_message: EventMessage) -> None:
+        """Called when we need to notify the orchestartor
 
         Args:
-            message: The message that was added
-        """
-        ...
-
-    def on_checkpoint_created(self, snapshot: "ContextSnapshot") -> None:
-        """Called when a checkpoint is created.
-
-        Args:
-            snapshot: The snapshot that was created
-        """
-        ...
-
-    def on_rewind(self, snapshot: "ContextSnapshot") -> None:
-        """Called when context is rewound to a checkpoint.
-
-        Args:
-            snapshot: The snapshot that was restored
+            message: The event message
         """
         ...
 
@@ -170,7 +148,7 @@ class ContextManager:
 
         # Notify observers
         for observer in self._observers:
-            observer.on_message_added(message)
+            observer.notify_event(EventMessage(type=LLM_MESSAGE_EVENT, event=message))
 
     def _apply_window(self) -> None:
         """Apply sliding window to messages.
@@ -221,7 +199,7 @@ class ContextManager:
 
         # Notify observers
         for observer in self._observers:
-            observer.on_checkpoint_created(snapshot)
+            observer.notify_event(EventMessage(type=LLM_CHECK_POINT_EVENT, event=snapshot))
 
         return snapshot
 
@@ -242,7 +220,7 @@ class ContextManager:
 
         # Notify observers
         for observer in self._observers:
-            observer.on_rewind(snapshot)
+            observer.notify_event(EventMessage(type=LLM_CHECK_POINT_EVENT, event=snapshot))
 
     def get_checkpoint(self, checkpoint_id: str) -> ContextSnapshot | None:
         """Get a checkpoint by id.
