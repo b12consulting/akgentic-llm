@@ -3,19 +3,17 @@
 import copy
 import uuid
 from datetime import datetime
-from typing import Any, Protocol, runtime_checkable
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic_ai.messages import ModelMessage, ModelRequest, SystemPromptPart
 
-from akgentic.core.messages.orchestrator import EventMessage
-
-##
-## Events
-##
-LLM_MESSAGE_EVENT = "llm_message_event"
-LLM_CHECK_POINT_EVENT = "llm_checkpoint_event"
-LLM_REWIND_EVENT = "llm_rewind_event"
+from akgentic.llm.event import (
+    ContextObserver,
+    LlmCheckpointCreatedEvent,
+    LlmCheckpointRestoredEvent,
+    LlmMessageEvent,
+)
 
 
 def _is_system_message(msg: ModelMessage) -> bool:
@@ -33,19 +31,6 @@ def _is_system_message(msg: ModelMessage) -> bool:
     return isinstance(msg, ModelRequest) and any(
         isinstance(part, SystemPromptPart) for part in msg.parts
     )
-
-
-@runtime_checkable
-class ContextObserver(Protocol):
-    """Observer protocol for LLM context changes."""
-
-    def notify_event(self, event_message: EventMessage) -> None:
-        """Called when we need to notify the orchestartor
-
-        Args:
-            message: The event message
-        """
-        ...
 
 
 class ContextSnapshot(BaseModel):
@@ -148,7 +133,7 @@ class ContextManager:
 
         # Notify observers
         for observer in self._observers:
-            observer.notify_event(EventMessage(type=LLM_MESSAGE_EVENT, event=message))
+            observer.notify_event(LlmMessageEvent(message=message))
 
     def _apply_window(self) -> None:
         """Apply sliding window to messages.
@@ -199,7 +184,7 @@ class ContextManager:
 
         # Notify observers
         for observer in self._observers:
-            observer.notify_event(EventMessage(type=LLM_CHECK_POINT_EVENT, event=snapshot))
+            observer.notify_event(LlmCheckpointCreatedEvent(snapshot=snapshot))
 
         return snapshot
 
@@ -220,7 +205,7 @@ class ContextManager:
 
         # Notify observers
         for observer in self._observers:
-            observer.notify_event(EventMessage(type=LLM_CHECK_POINT_EVENT, event=snapshot))
+            observer.notify_event(LlmCheckpointRestoredEvent(snapshot=snapshot))
 
     def get_checkpoint(self, checkpoint_id: str) -> ContextSnapshot | None:
         """Get a checkpoint by id.

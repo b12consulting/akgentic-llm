@@ -21,6 +21,11 @@ Key Concepts:
 from .agent import ReactAgent, UsageLimitError
 from .config import HttpClientConfig, ModelConfig, ReactAgentConfig, RuntimeConfig, UsageLimits
 from .context import ContextManager, ContextObserver, ContextSnapshot
+from .event import (
+    LlmCheckpointCreatedEvent,
+    LlmCheckpointRestoredEvent,
+    LlmMessageEvent,
+)
 from .prompts import (
     PromptTemplate,
     current_datetime_prompt,
@@ -42,6 +47,9 @@ __all__ = [
     "ContextManager",
     "ContextObserver",
     "ContextSnapshot",
+    "LlmMessageEvent",
+    "LlmCheckpointCreatedEvent",
+    "LlmCheckpointRestoredEvent",
     # Prompts
     "PromptTemplate",
     "current_datetime_prompt",

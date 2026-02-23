@@ -24,6 +24,9 @@ spec.loader.exec_module(context_module)  # type: ignore[union-attr]
 ContextManager = context_module.ContextManager
 ContextObserver = context_module.ContextObserver
 ContextSnapshot = context_module.ContextSnapshot
+LlmMessageEvent = context_module.LlmMessageEvent
+LlmCheckpointCreatedEvent = context_module.LlmCheckpointCreatedEvent
+LlmCheckpointRestoredEvent = context_module.LlmCheckpointRestoredEvent
 
 
 class MockObserver:
@@ -34,17 +37,14 @@ class MockObserver:
         self.checkpoints_created: list[ContextSnapshot] = []
         self.rewinds: list[ContextSnapshot] = []
 
-    def on_message_added(self, message: ModelMessage) -> None:
-        """Track message additions."""
-        self.messages_added.append(message)
-
-    def on_checkpoint_created(self, snapshot: ContextSnapshot) -> None:
-        """Track checkpoint creations."""
-        self.checkpoints_created.append(snapshot)
-
-    def on_rewind(self, snapshot: ContextSnapshot) -> None:
-        """Track rewinds."""
-        self.rewinds.append(snapshot)
+    def notify_event(self, event: object) -> None:
+        """Track typed context events."""
+        if isinstance(event, LlmMessageEvent):
+            self.messages_added.append(event.message)
+        elif isinstance(event, LlmCheckpointCreatedEvent):
+            self.checkpoints_created.append(event.snapshot)
+        elif isinstance(event, LlmCheckpointRestoredEvent):
+            self.rewinds.append(event.snapshot)
 
 
 def create_user_message(content: str) -> ModelRequest:
