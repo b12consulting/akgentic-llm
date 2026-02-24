@@ -82,7 +82,7 @@ class ReactAgent:
 
         # Create HTTP client
         http_client = create_http_client(
-            timeout_s=config.runtime_cfg.http_client_config.timeout_seconds,
+            timeout_s=config.runtime_cfg.http_client_config.timeout,
             max_attempts=config.runtime_cfg.http_client_config.max_retries,
             exp_multiplier=config.runtime_cfg.http_client_config.backoff_multiplier,
             exp_max_s=config.runtime_cfg.http_client_config.backoff_max,

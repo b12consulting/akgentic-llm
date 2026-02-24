@@ -163,7 +163,7 @@ class HttpClientConfig(BaseModel):
     - Backoff formula: min(max_delay, multiplier * (2 ** attempt))
 
     Attributes:
-        timeout_seconds: Maximum time for single LLM request (connection + response)
+        timeout: Maximum time for single LLM request (connection + response)
         max_retries: Maximum retry attempts for transient HTTP failures
         backoff_multiplier: Base delay multiplier for exponential backoff (seconds)
         backoff_max: Cap on backoff delay to prevent excessive waiting
@@ -174,21 +174,21 @@ class HttpClientConfig(BaseModel):
         >>>
         >>> # Aggressive: fast timeout, fewer retries
         >>> client = HttpClientConfig(
-        ...     timeout_seconds=30.0,
+        ...     timeout=30.0,
         ...     max_retries=2,
         ...     backoff_multiplier=0.2
         ... )
         >>>
         >>> # Conservative: long timeout, many retries
         >>> client = HttpClientConfig(
-        ...     timeout_seconds=300.0,
+        ...     timeout=300.0,
         ...     max_retries=10,
         ...     backoff_multiplier=1.0,
         ...     backoff_max=120.0
         ... )
     """
 
-    timeout_seconds: float = Field(
+    timeout: float = Field(
         default=120.0,
         gt=0,
         description="Maximum duration for single LLM request including connection and response time",
@@ -232,13 +232,13 @@ class RuntimeConfig(BaseModel):
         >>>
         >>> # Aggressive: fast timeout, fewer retries
         >>> runtime = RuntimeConfig(
-        ...     http_client_config=HttpClientConfig(timeout_seconds=30.0, max_retries=2, backoff_multiplier=0.2)
+        ...     http_client_config=HttpClientConfig(timeout=30.0, max_retries=2, backoff_multiplier=0.2)
         ... )
         >>>
         >>> # Conservative: long timeout, many retries
         >>> runtime = RuntimeConfig(
         ...     http_client_config=
-                    HttpClientConfig(timeout_seconds=300.0, max_retries=10, backoff_multiplier=1.0, backoff_max=120.0)
+                    HttpClientConfig(timeout=300.0, max_retries=10, backoff_multiplier=1.0, backoff_max=120.0)
         ... )
     """
 
@@ -301,7 +301,7 @@ class ReactAgentConfig(BaseModel):
         ...     ),
         ...     runtime_cfg=RuntimeConfig(
         ...         end_strategy="exhaustive",
-        ...         http_client=HttpClientConfig(timeout_seconds=180.0)
+        ...         http_client=HttpClientConfig(timeout=180.0)
         ...     )
         ... )
     """

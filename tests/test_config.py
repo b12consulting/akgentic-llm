@@ -153,7 +153,7 @@ class TestAgentRuntimeConfig:
         assert config.retries == 3
         assert config.end_strategy == "exhaustive"
         assert config.parallel_tool_calls is True
-        assert config.http_client_config.timeout_seconds == 120.0
+        assert config.http_client_config.timeout == 120.0
         assert config.http_client_config.max_retries == 5
         assert config.http_client_config.backoff_multiplier == 0.5
         assert config.http_client_config.backoff_max == 60.0
@@ -166,12 +166,12 @@ class TestAgentRuntimeConfig:
             retries=5,
             end_strategy="early",
             parallel_tool_calls=False,
-            http_client_config=HttpClientConfig(timeout_seconds=60.0, max_retries=3),
+            http_client_config=HttpClientConfig(timeout=60.0, max_retries=3),
         )
         assert config.retries == 5
         assert config.end_strategy == "early"
         assert config.parallel_tool_calls is False
-        assert config.http_client_config.timeout_seconds == 60.0
+        assert config.http_client_config.timeout == 60.0
         assert config.http_client_config.max_retries == 3
 
     def test_invalid_strategy(self):
@@ -193,10 +193,10 @@ class TestAgentRuntimeConfig:
         """Test model serialization."""
         from akgentic.llm.config import HttpClientConfig
 
-        config = RuntimeConfig(retries=5, http_client_config=HttpClientConfig(timeout_seconds=90.0))
+        config = RuntimeConfig(retries=5, http_client_config=HttpClientConfig(timeout=90.0))
         data = config.model_dump()
         assert data["retries"] == 5
-        assert data["http_client_config"]["timeout_seconds"] == 90.0
+        assert data["http_client_config"]["timeout"] == 90.0
 
 
 class TestReactAgentConfig:
@@ -209,14 +209,12 @@ class TestReactAgentConfig:
         config = ReactAgentConfig(
             model_cfg=ModelConfig(provider="openai", model="gpt-4o", temperature=0.7),
             usage_limits=UsageLimits(request_limit=10, total_tokens_limit=5000),
-            runtime_cfg=RuntimeConfig(
-                retries=5, http_client_config=HttpClientConfig(timeout_seconds=60.0)
-            ),
+            runtime_cfg=RuntimeConfig(retries=5, http_client_config=HttpClientConfig(timeout=60.0)),
         )
         assert config.model_cfg.provider == "openai"
         assert config.model_cfg.model == "gpt-4o"
         assert config.runtime_cfg.retries == 5
-        assert config.runtime_cfg.http_client_config.timeout_seconds == 60.0
+        assert config.runtime_cfg.http_client_config.timeout == 60.0
         assert config.model_cfg.temperature == 0.7
         assert config.usage_limits.request_limit == 10  # type: ignore
         assert config.usage_limits.total_tokens_limit == 5000  # type: ignore
@@ -230,7 +228,7 @@ class TestReactAgentConfig:
         assert config.usage_limits is not None
         assert config.usage_limits.request_limit == 50
         assert config.runtime_cfg.retries == 3
-        assert config.runtime_cfg.http_client_config.timeout_seconds == 120.0
+        assert config.runtime_cfg.http_client_config.timeout == 120.0
 
     def test_minimal_config(self):
         """Test minimal configuration."""

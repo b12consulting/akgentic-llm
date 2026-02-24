@@ -137,7 +137,7 @@ runtime = RuntimeConfig(
     end_strategy="exhaustive",
     parallel_tool_calls=True
     http_client_config=HttpClientConfig(
-        timeout_seconds=120.0,      # Max time for single LLM request
+        timeout=120.0,      # Max time for single LLM request
         max_retries=5,              # HTTP retry attempts
         backoff_multiplier=0.5,     # Exponential backoff multiplier
         backoff_max=60.0            # Max backoff delay
@@ -167,7 +167,7 @@ config = ReactAgentConfig(
         retries=5,
         end_strategy="exhaustive",
         http_client_config=HttpClientConfig(
-            timeout_seconds=120.0,
+            timeout=120.0,
             max_retries=5
         )
     )
