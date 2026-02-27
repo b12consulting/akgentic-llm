@@ -104,6 +104,7 @@ class ReactAgent:
             end_strategy=config.runtime_cfg.end_strategy,
             output_type=wrapped_result_type,
             history_processors=[],  # Empty for MVP (story 2-1-6b deferred)
+            instrument=True,
         )
 
     async def run(
