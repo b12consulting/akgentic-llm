@@ -170,7 +170,7 @@ def get_output_type(
     if output_type is str or output_type is None:
         return output_type
     if _supports_native_output(config):
-        return NativeOutput(output_type)
+        return NativeOutput(output_type, strict=True)
     return output_type
 
 
