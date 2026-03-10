@@ -77,8 +77,8 @@ class ModelConfig(BaseModel):
     )
 
     model: str = Field(
-        default="gpt-4.1",
-        description="Model identifier (e.g., gpt-4.1, claude-3-5-sonnet-20241022)",
+        default="gpt-5.2",
+        description="Model identifier (e.g., gpt-5.2, claude-3-5-sonnet-20241022)",
     )
 
     temperature: float | None = Field(
