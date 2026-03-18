@@ -3,6 +3,7 @@
 from unittest.mock import MagicMock, patch
 
 import pytest
+from pydantic_ai import BinaryContent
 from pydantic_ai.exceptions import UsageLimitExceeded
 from pydantic_ai.messages import ModelRequest, UserPromptPart
 
@@ -12,6 +13,7 @@ from akgentic.llm import (
     ReactAgentConfig,
     UsageLimitError,
     UsageLimits,
+    UserPrompt,
 )
 
 
@@ -426,3 +428,128 @@ class TestReactAgentUsageLimits:
         agent = ReactAgent(config=minimal_config)
         pydantic_limits = agent._to_pydantic_limits(None)
         assert pydantic_limits is None
+
+
+class TestReactAgentMultimodalPrompt:
+    """Test ReactAgent multimodal UserPrompt support."""
+
+    def test_str_prompt_passes_through(self, minimal_config):
+        """Test str user_prompt passes through to pydantic-ai unchanged."""
+        agent = ReactAgent(config=minimal_config)
+        captured_kwargs: dict = {}
+
+        class MockRun:
+            def __init__(self, *args, **kwargs):
+                captured_kwargs.update(kwargs)
+                self.result = MagicMock(output="ok")
+                self._new_messages = []
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_):
+                return False
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                raise StopAsyncIteration
+
+            def new_messages(self):
+                return self._new_messages
+
+        with patch.object(agent._pydantic_agent, "iter", side_effect=MockRun):
+            agent.run_sync("plain text")
+
+        assert captured_kwargs["user_prompt"] == "plain text"
+
+    def test_list_prompt_passes_through_unchanged(self, minimal_config):
+        """Test list[str | BinaryContent] passes to pydantic-ai unchanged."""
+        agent = ReactAgent(config=minimal_config)
+        captured_kwargs: dict = {}
+        multimodal = ["describe: ", BinaryContent(data=b"imgbytes", media_type="image/png")]
+
+        class MockRun:
+            def __init__(self, *args, **kwargs):
+                captured_kwargs.update(kwargs)
+                self.result = MagicMock(output="ok")
+                self._new_messages = []
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_):
+                return False
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                raise StopAsyncIteration
+
+            def new_messages(self):
+                return self._new_messages
+
+        with patch.object(agent._pydantic_agent, "iter", side_effect=MockRun):
+            agent.run_sync(multimodal)
+
+        assert captured_kwargs["user_prompt"] is multimodal  # exact same object, no copy
+
+    def test_user_prompt_importable(self):
+        """Test UserPrompt type alias importable from akgentic.llm."""
+        from akgentic.llm import UserPrompt as UP
+
+        assert UP is not None
+
+    def test_user_prompt_alias_in_module_scope(self):
+        """Test UserPrompt imported at top of test file is not None."""
+        assert UserPrompt is not None
+
+    def test_user_prompt_is_union_type(self):
+        """Test UserPrompt type alias resolves to a union containing str and list."""
+        import types
+
+        # UserPrompt = str | list[str | BinaryContent] is a UnionType in Python 3.10+
+        assert isinstance(UserPrompt, types.UnionType)
+        # Both str and list must be args of the union
+        union_args = UserPrompt.__args__
+        assert str in union_args
+        # list type should be present (as a generic alias)
+        list_args = [a for a in union_args if hasattr(a, "__origin__") and a.__origin__ is list]
+        assert len(list_args) == 1
+
+    def test_no_conversion_in_run(self, minimal_config):
+        """Test no BinaryContent construction or list conversion inside run()."""
+        agent = ReactAgent(config=minimal_config)
+        captured_kwargs: dict = {}
+        # Use a list prompt to verify it passes through as-is (same identity)
+        bc = BinaryContent(data=b"x", media_type="image/png")
+        multimodal: list[str | BinaryContent] = ["text", bc]
+
+        class MockRun:
+            def __init__(self, *args, **kwargs):
+                captured_kwargs.update(kwargs)
+                self.result = MagicMock(output="ok")
+                self._new_messages = []
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_):
+                return False
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                raise StopAsyncIteration
+
+            def new_messages(self):
+                return self._new_messages
+
+        with patch.object(agent._pydantic_agent, "iter", side_effect=MockRun):
+            agent.run_sync(multimodal)
+
+        # The exact same list object must be passed — no copy, no wrapping
+        assert captured_kwargs["user_prompt"] is multimodal

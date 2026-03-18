@@ -18,7 +18,7 @@ Key Concepts:
     - PromptTemplate: Template-based prompts with parameter substitution
 """
 
-from .agent import ReactAgent, UsageLimitError
+from .agent import ReactAgent, UsageLimitError, UserPrompt
 from .config import HttpClientConfig, ModelConfig, ReactAgentConfig, RuntimeConfig, UsageLimits
 from .context import ContextManager, ContextObserver, ContextSnapshot
 from .event import (
@@ -43,6 +43,7 @@ __all__ = [
     # Agent
     "ReactAgent",
     "UsageLimitError",
+    "UserPrompt",
     # Context
     "ContextManager",
     "ContextObserver",
