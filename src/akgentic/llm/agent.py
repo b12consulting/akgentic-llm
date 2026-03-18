@@ -3,12 +3,14 @@
 import asyncio
 from typing import Any
 
-from pydantic_ai import Agent, UsageLimitExceeded
+from pydantic_ai import Agent, BinaryContent, UsageLimitExceeded
 from pydantic_ai import UsageLimits as PydanticUsageLimits
 
 from .config import ReactAgentConfig, UsageLimits
 from .context import ContextManager, ContextObserver, ContextSnapshot
 from .providers import create_http_client, create_model, get_output_type
+
+UserPrompt = str | list[str | BinaryContent]
 
 
 class UsageLimitError(Exception):
@@ -108,7 +110,7 @@ class ReactAgent:
         )
 
     async def run(
-        self, user_prompt: str, deps: Any = None, output_type: type[Any] | None = None
+        self, user_prompt: UserPrompt, deps: Any = None, output_type: type[Any] | None = None
     ) -> Any:
         """Execute agent with REACT pattern.
 
@@ -158,7 +160,7 @@ class ReactAgent:
             raise UsageLimitError(str(e)) from e
 
     def run_sync(
-        self, user_prompt: str, deps: Any = None, output_type: type[Any] | None = None
+        self, user_prompt: UserPrompt, deps: Any = None, output_type: type[Any] | None = None
     ) -> Any:
         """Execute agent synchronously.
 
