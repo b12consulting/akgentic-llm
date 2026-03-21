@@ -1,5 +1,8 @@
 # akgentic-llm
 
+[![CI](https://github.com/b12consulting/akgentic-llm/actions/workflows/ci.yml/badge.svg)](https://github.com/b12consulting/akgentic-llm/actions/workflows/ci.yml)
+[![Coverage](https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/gpiroux/dd80a44fe9e2e27b46f7f3431e19202f/raw/coverage.json)](https://github.com/b12consulting/akgentic-llm/actions/workflows/ci.yml)
+
 LLM integration layer for Akgentic agent systems - clean abstraction for LLM providers with REACT pattern support.
 
 ## Features

@@ -7,7 +7,8 @@ from pydantic_ai import Agent, BinaryContent, UsageLimitExceeded
 from pydantic_ai import UsageLimits as PydanticUsageLimits
 
 from .config import ReactAgentConfig, UsageLimits
-from .context import ContextManager, ContextObserver, ContextSnapshot
+from .context import ContextManager, ContextSnapshot
+from .event import ContextObserver
 from .providers import create_http_client, create_model, get_output_type
 
 UserPrompt = str | list[str | BinaryContent]

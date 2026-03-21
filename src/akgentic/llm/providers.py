@@ -231,7 +231,8 @@ def create_http_client(
 
     Retry Strategy:
         - Retries on HTTP 429 (rate limit) and 5xx (server errors)
-        - Retries on transient network errors (ConnectError, RemoteProtocolError, ReadError, WriteError)
+        - Retries on transient network errors
+            (ConnectError, RemoteProtocolError, ReadError, WriteError)
         - ``Retry-After`` header parsed and honoured (capped at ``retry_after_cap_s``)
         - Fallback: randomised exponential backoff with jitter
         - Fast-fail on 4xx errors other than 429 and on timeouts

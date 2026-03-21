@@ -20,8 +20,9 @@ Key Concepts:
 
 from .agent import ReactAgent, UsageLimitError, UserPrompt
 from .config import HttpClientConfig, ModelConfig, ReactAgentConfig, RuntimeConfig, UsageLimits
-from .context import ContextManager, ContextObserver, ContextSnapshot
+from .context import ContextManager, ContextSnapshot
 from .event import (
+    ContextObserver,
     LlmCheckpointCreatedEvent,
     LlmCheckpointRestoredEvent,
     LlmMessageEvent,

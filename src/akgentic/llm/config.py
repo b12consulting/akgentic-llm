@@ -191,19 +191,19 @@ class HttpClientConfig(BaseModel):
     timeout: float = Field(
         default=120.0,
         gt=0,
-        description="Maximum duration for single LLM request including connection and response time",
+        description="Maximum duration for single LLM request including connection and response time",  # noqa: E501
     )
 
     max_retries: int = Field(
         default=5,
         ge=1,
-        description="Maximum HTTP retry attempts for transient failures (rate limits, service unavailable)",
+        description="Maximum HTTP retry attempts for transient failures (rate limits, service unavailable)",  # noqa: E501
     )
 
     backoff_multiplier: float = Field(
         default=0.5,
         gt=0,
-        description="Base delay multiplier for exponential backoff: delay = multiplier * (2 ** attempt)",
+        description="Base delay multiplier for exponential backoff: delay = multiplier * (2 ** attempt)",  # noqa: E501
     )
 
     backoff_max: float = Field(
@@ -220,7 +220,8 @@ class RuntimeConfig(BaseModel):
         retries: Number of retry attempts for tool call failures and output validation errors
         end_strategy: Tool execution termination strategy
         parallel_tool_calls: Enable concurrent tool execution when model supports it
-        http_client_config: HTTP client configuration for API communication (timeout and retry settings)
+        http_client_config: HTTP client configuration for API communication
+            (timeout and retry settings)
 
     Tool Execution Strategies:
         - 'early': Stops after first successful result (fast path)
@@ -232,13 +233,16 @@ class RuntimeConfig(BaseModel):
         >>>
         >>> # Aggressive: fast timeout, fewer retries
         >>> runtime = RuntimeConfig(
-        ...     http_client_config=HttpClientConfig(timeout=30.0, max_retries=2, backoff_multiplier=0.2)
+        ...     http_client_config=HttpClientConfig(
+        ...         timeout=30.0, max_retries=2, backoff_multiplier=0.2
+        ...     )
         ... )
         >>>
         >>> # Conservative: long timeout, many retries
         >>> runtime = RuntimeConfig(
-        ...     http_client_config=
-                    HttpClientConfig(timeout=300.0, max_retries=10, backoff_multiplier=1.0, backoff_max=120.0)
+        ...     http_client_config=HttpClientConfig(
+        ...         timeout=300.0, max_retries=10, backoff_multiplier=1.0, backoff_max=120.0
+        ...     )
         ... )
     """
 
@@ -250,7 +254,7 @@ class RuntimeConfig(BaseModel):
 
     end_strategy: Literal["early", "exhaustive"] = Field(
         default="exhaustive",
-        description="Tool execution strategy: 'early' stops after first result, 'exhaustive' runs all tools",
+        description="Tool execution strategy: 'early' stops after first result, 'exhaustive' runs all tools",  # noqa: E501
     )
 
     parallel_tool_calls: bool = Field(

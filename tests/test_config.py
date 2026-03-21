@@ -224,7 +224,7 @@ class TestReactAgentConfig:
         """Test default values."""
         config = ReactAgentConfig()
         assert config.model_cfg.provider == "openai"
-        assert config.model_cfg.model == "gpt-4.1"
+        assert config.model_cfg.model == "gpt-5.2"
         assert config.usage_limits is not None
         assert config.usage_limits.request_limit == 50
         assert config.runtime_cfg.retries == 3

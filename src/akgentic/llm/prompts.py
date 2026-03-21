@@ -67,4 +67,7 @@ def json_output_reminder_prompt(ctx: Any) -> str:
 
     Useful for models that sometimes include explanatory text.
     """
-    return "\n\nCRITICAL: Return ONLY a valid JSON object. Do not include explanations or markdown code blocks."
+    return (
+        "\n\nCRITICAL: Return ONLY a valid JSON object."
+        " Do not include explanations or markdown code blocks."
+    )
