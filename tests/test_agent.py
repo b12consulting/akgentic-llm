@@ -21,18 +21,10 @@ class MockObserver:
     """Mock observer for context notifications."""
 
     def __init__(self):
-        self.messages_added = []
-        self.checkpoints_created = []
-        self.rewinds = []
+        self.events = []
 
-    def on_message_added(self, message):
-        self.messages_added.append(message)
-
-    def on_checkpoint_created(self, snapshot):
-        self.checkpoints_created.append(snapshot)
-
-    def on_rewind(self, snapshot):
-        self.rewinds.append(snapshot)
+    def notify_event(self, event: object) -> None:
+        self.events.append(event)
 
 
 @pytest.fixture
@@ -294,7 +286,7 @@ class TestReactAgentContextMethods:
             await agent.run("test query")
 
             # Observer should have been notified
-            assert len(observer.messages_added) == 1
+            assert len(observer.events) == 1
 
     def test_checkpoint_creates_snapshot(self, minimal_config):
         """Test checkpoint() creates snapshot."""
