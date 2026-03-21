@@ -240,7 +240,7 @@ tool-call responses.
 
 ```python
 # NVIDIA NIM — openai-compatible model (native output)
-ModelConfig(provider="nvidia", model="openai/gpt-4o-mini")
+ModelConfig(provider="nvidia", model="openai/gpt-oss-120b")
 
 # NVIDIA NIM — non-OpenAI model (no native output)
 ModelConfig(provider="nvidia", model="meta/llama-3.1-8b-instruct")

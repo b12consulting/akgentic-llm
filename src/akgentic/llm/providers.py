@@ -88,7 +88,7 @@ def _supports_native_output(config: ModelConfig) -> bool:
     - openai: GPT-4o, o1 series, etc.
     - azure: Azure OpenAI Service
     - anthropic: Claude 3.5 Sonnet, etc.
-    - nvidia: Only for models with "openai" prefix (e.g., "openai/gpt-4o-mini")
+    - nvidia: Only for models with "openai" prefix (e.g., "openai/gpt-oss-120b")
 
     Providers without native support (use prompt-based extraction):
     - google-gla: Google Gemini models
@@ -108,7 +108,7 @@ def _supports_native_output(config: ModelConfig) -> bool:
         >>> config = ModelConfig(provider="google-gla", model="gemini-2.0-flash")
         >>> _supports_native_output(config)
         False
-        >>> config = ModelConfig(provider="nvidia", model="openai/gpt-4o-mini")
+        >>> config = ModelConfig(provider="nvidia", model="openai/gpt-oss-120b")
         >>> _supports_native_output(config)
         True
     """
