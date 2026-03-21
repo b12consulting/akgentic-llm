@@ -50,6 +50,8 @@ jobs:
           --cov-report=term-missing
           --cov-report=json:coverage.json
           --cov-fail-under=80
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
 
       - name: Update coverage badge
         if: github.ref_name == 'master' && github.event_name == 'push'
