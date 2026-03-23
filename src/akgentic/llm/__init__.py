@@ -26,6 +26,8 @@ from .event import (
     LlmCheckpointCreatedEvent,
     LlmCheckpointRestoredEvent,
     LlmMessageEvent,
+    ToolCallEvent,
+    ToolReturnEvent,
 )
 from .prompts import (
     PromptTemplate,
@@ -52,6 +54,8 @@ __all__ = [
     "LlmMessageEvent",
     "LlmCheckpointCreatedEvent",
     "LlmCheckpointRestoredEvent",
+    "ToolCallEvent",
+    "ToolReturnEvent",
     # Prompts
     "PromptTemplate",
     "current_datetime_prompt",
