@@ -256,6 +256,31 @@ class TestParallelToolCalls:
         assert event_b.run_id == RUN_ID_STR
         assert event_a.run_id == event_b.run_id
 
+    def test_two_consecutive_runs_carry_distinct_run_ids(self) -> None:
+        """Events from different runs must carry different run_id values.
+
+        Verifies that run_id reflects the originating message, not a shared state.
+        """
+        manager, capture = _make_manager_with_capture()
+        msg_a = ModelResponse(
+            parts=[ToolCallPart(tool_name="tool_x", tool_call_id="call_r1", args="{}")],
+            timestamp=datetime.now(),
+            run_id=RUN_ID,
+        )
+        msg_b = ModelResponse(
+            parts=[ToolCallPart(tool_name="tool_x", tool_call_id="call_r2", args="{}")],
+            timestamp=datetime.now(),
+            run_id=RUN_ID_B,
+        )
+        manager.add_message(msg_a)
+        manager.add_message(msg_b)
+
+        tool_events = [e for e in capture.events if isinstance(e, ToolCallEvent)]
+        assert len(tool_events) == 2
+        assert tool_events[0].run_id == RUN_ID_STR
+        assert tool_events[1].run_id == RUN_ID_B_STR
+        assert tool_events[0].run_id != tool_events[1].run_id
+
 
 # ---------------------------------------------------------------------------
 # AC-4 / AC-6: tool-return part → ToolReturnEvent(success=True) with run_id
@@ -337,6 +362,33 @@ class TestRetryPromptWithId:
         event = capture.events[1]
         assert isinstance(event, ToolReturnEvent)
         assert event.run_id == RUN_ID_STR
+
+
+# ---------------------------------------------------------------------------
+# Edge case: run_id=None → event.run_id == "None"
+# ---------------------------------------------------------------------------
+
+
+class TestRunIdNone:
+    """Document the behaviour when message.run_id is None.
+
+    pydantic-ai types run_id as str | None; str(None) == "None".
+    Consumers that filter events by run_id must account for this sentinel.
+    """
+
+    def test_tool_call_event_run_id_is_none_string_when_message_run_id_is_none(self) -> None:
+        """ToolCallEvent.run_id == 'None' when message.run_id is None."""
+        manager, capture = _make_manager_with_capture()
+        msg = ModelResponse(
+            parts=[ToolCallPart(tool_name="t", tool_call_id="c", args="{}")],
+            timestamp=datetime.now(),
+            run_id=None,  # type: ignore[arg-type]
+        )
+        manager.add_message(msg)
+
+        event = capture.events[1]
+        assert isinstance(event, ToolCallEvent)
+        assert event.run_id == str(None)  # "None"
 
 
 # ---------------------------------------------------------------------------
