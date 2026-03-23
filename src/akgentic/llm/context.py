@@ -232,9 +232,7 @@ class ContextManager:
         self._checkpoints[checkpoint_id] = snapshot
         self._checkpoint_order.append(checkpoint_id)
 
-        # Notify observers
-        for observer in self._observers:
-            observer.notify_event(LlmCheckpointCreatedEvent(snapshot=snapshot))
+        self._notify(LlmCheckpointCreatedEvent(snapshot=snapshot))
 
         return snapshot
 
@@ -253,9 +251,7 @@ class ContextManager:
         snapshot = self._checkpoints[checkpoint_id]  # Raises KeyError if not found
         self._messages = list(snapshot.messages)
 
-        # Notify observers
-        for observer in self._observers:
-            observer.notify_event(LlmCheckpointRestoredEvent(snapshot=snapshot))
+        self._notify(LlmCheckpointRestoredEvent(snapshot=snapshot))
 
     def get_checkpoint(self, checkpoint_id: str) -> ContextSnapshot | None:
         """Get a checkpoint by id.

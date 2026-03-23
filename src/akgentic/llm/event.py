@@ -56,7 +56,7 @@ class ToolReturnEvent:
 
     Emitted after ``LlmMessageEvent`` for:
     - ``tool-return`` parts in a ``ModelRequest`` → ``success=True``
-    - ``retry-prompt`` parts with a non-None ``tool_call_id`` → ``success=False``
+    - ``retry-prompt`` parts with a non-None ``tool_name`` → ``success=False``
 
     Attributes:
         tool_name: Name of the tool that was called.
