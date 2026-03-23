@@ -30,6 +30,46 @@ class LlmCheckpointRestoredEvent:
     snapshot: ContextSnapshot
 
 
+@dataclass(frozen=True)
+class ToolCallEvent:
+    """Event emitted when the LLM invokes a tool.
+
+    Emitted after ``LlmMessageEvent`` for every ``tool-call`` part found in
+    a ``ModelResponse``. Multiple tool calls in a single response produce one
+    ``ToolCallEvent`` per part, in part order.
+
+    Attributes:
+        tool_name: Name of the tool being called.
+        tool_call_id: Unique identifier for this call (assigned by the model).
+        arguments: Raw JSON string of the arguments passed to the tool.
+            Consumers who need structured access should do ``json.loads(event.arguments)``.
+    """
+
+    tool_name: str
+    tool_call_id: str
+    arguments: str
+
+
+@dataclass(frozen=True)
+class ToolReturnEvent:
+    """Event emitted when a tool call completes (successfully or with an error).
+
+    Emitted after ``LlmMessageEvent`` for:
+    - ``tool-return`` parts in a ``ModelRequest`` → ``success=True``
+    - ``retry-prompt`` parts with a non-None ``tool_name`` → ``success=False``
+
+    Attributes:
+        tool_name: Name of the tool that was called.
+        tool_call_id: Identifier matching the originating ``ToolCallEvent``.
+        success: ``True`` if the tool returned normally; ``False`` if the model
+            issued a retry prompt due to a tool error.
+    """
+
+    tool_name: str
+    tool_call_id: str
+    success: bool
+
+
 @runtime_checkable
 class ContextObserver(Protocol):
     """Observer protocol for LLM context changes."""

@@ -13,6 +13,8 @@ from akgentic.llm.event import (
     LlmCheckpointCreatedEvent,
     LlmCheckpointRestoredEvent,
     LlmMessageEvent,
+    ToolCallEvent,
+    ToolReturnEvent,
 )
 
 
@@ -119,21 +121,69 @@ class ContextManager:
         """
         return list(self._messages)
 
+    def _notify(self, event: object) -> None:
+        """Notify all observers with a domain event.
+
+        Args:
+            event: Domain event to broadcast
+        """
+        for observer in self._observers:
+            observer.notify_event(event)
+
     def add_message(self, message: ModelMessage) -> None:
         """Add a message to context.
 
         Appends message, applies sliding window if configured,
-        and notifies observers.
+        and notifies observers. Emits ``LlmMessageEvent`` first, then
+        any tool-related events (``ToolCallEvent``, ``ToolReturnEvent``).
 
         Args:
             message: Message to add
         """
         self._messages.append(message)
         self._apply_window()
+        self._notify(LlmMessageEvent(message=message))
+        self._emit_tool_events(message)
 
-        # Notify observers
-        for observer in self._observers:
-            observer.notify_event(LlmMessageEvent(message=message))
+    def _emit_tool_events(self, message: ModelMessage) -> None:
+        """Emit ToolCallEvent or ToolReturnEvent for tool-related message parts.
+
+        Called after LlmMessageEvent is emitted. LlmMessageEvent ordering is guaranteed.
+        Gracefully handles messages with no parts attribute.
+
+        Args:
+            message: Message whose parts are inspected for tool activity
+        """
+        for part in getattr(message, "parts", []):
+            match part.part_kind:
+                case "tool-call":
+                    self._notify(
+                        ToolCallEvent(
+                            tool_name=part.tool_name,
+                            tool_call_id=part.tool_call_id,
+                            arguments=(
+                                part.args
+                                if isinstance(part.args, str)
+                                else part.args_as_json_str()
+                            ),
+                        )
+                    )
+                case "tool-return":
+                    self._notify(
+                        ToolReturnEvent(
+                            tool_name=part.tool_name,
+                            tool_call_id=part.tool_call_id,
+                            success=True,
+                        )
+                    )
+                case "retry-prompt" if part.tool_name is not None:
+                    self._notify(
+                        ToolReturnEvent(
+                            tool_name=part.tool_name,
+                            tool_call_id=part.tool_call_id,
+                            success=False,
+                        )
+                    )
 
     def _apply_window(self) -> None:
         """Apply sliding window to messages.
@@ -182,9 +232,7 @@ class ContextManager:
         self._checkpoints[checkpoint_id] = snapshot
         self._checkpoint_order.append(checkpoint_id)
 
-        # Notify observers
-        for observer in self._observers:
-            observer.notify_event(LlmCheckpointCreatedEvent(snapshot=snapshot))
+        self._notify(LlmCheckpointCreatedEvent(snapshot=snapshot))
 
         return snapshot
 
@@ -203,9 +251,7 @@ class ContextManager:
         snapshot = self._checkpoints[checkpoint_id]  # Raises KeyError if not found
         self._messages = list(snapshot.messages)
 
-        # Notify observers
-        for observer in self._observers:
-            observer.notify_event(LlmCheckpointRestoredEvent(snapshot=snapshot))
+        self._notify(LlmCheckpointRestoredEvent(snapshot=snapshot))
 
     def get_checkpoint(self, checkpoint_id: str) -> ContextSnapshot | None:
         """Get a checkpoint by id.
