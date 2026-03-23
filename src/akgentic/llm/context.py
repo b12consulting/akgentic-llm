@@ -154,11 +154,13 @@ class ContextManager:
         Args:
             message: Message whose parts are inspected for tool activity
         """
+        run_id = str(message.run_id)
         for part in getattr(message, "parts", []):
             match part.part_kind:
                 case "tool-call":
                     self._notify(
                         ToolCallEvent(
+                            run_id=run_id,
                             tool_name=part.tool_name,
                             tool_call_id=part.tool_call_id,
                             arguments=(
@@ -171,6 +173,7 @@ class ContextManager:
                 case "tool-return":
                     self._notify(
                         ToolReturnEvent(
+                            run_id=run_id,
                             tool_name=part.tool_name,
                             tool_call_id=part.tool_call_id,
                             success=True,
@@ -179,6 +182,7 @@ class ContextManager:
                 case "retry-prompt" if part.tool_name is not None:
                     self._notify(
                         ToolReturnEvent(
+                            run_id=run_id,
                             tool_name=part.tool_name,
                             tool_call_id=part.tool_call_id,
                             success=False,
