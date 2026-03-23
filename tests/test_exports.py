@@ -39,6 +39,13 @@ def test_key_exports_present():
     assert hasattr(akgentic.llm, "ContextObserver")
     assert hasattr(akgentic.llm, "ContextSnapshot")
 
+    # Events
+    assert hasattr(akgentic.llm, "LlmMessageEvent")
+    assert hasattr(akgentic.llm, "LlmCheckpointCreatedEvent")
+    assert hasattr(akgentic.llm, "LlmCheckpointRestoredEvent")
+    assert hasattr(akgentic.llm, "ToolCallEvent")
+    assert hasattr(akgentic.llm, "ToolReturnEvent")
+
     # Prompts
     assert hasattr(akgentic.llm, "PromptTemplate")
     assert hasattr(akgentic.llm, "current_datetime_prompt")
