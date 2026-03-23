@@ -22,6 +22,9 @@ call any LLM without coupling to a specific vendor or framework primitive.
 - [ReactAgent API](#reactagent-api)
 - [Multimodal Prompts](#multimodal-prompts)
 - [Context Management](#context-management)
+  - [ContextManager](#contextmanager)
+  - [Observer Pattern](#observer-pattern)
+  - [Tool Event Observability](#tool-event-observability)
 - [Prompts](#prompts)
 - [Development](#development)
 - [License](#license)
@@ -358,11 +361,19 @@ ctx.clear()
 ### Observer Pattern
 
 ```python
-from akgentic.llm import ContextObserver, LlmMessageEvent, LlmCheckpointCreatedEvent
+from akgentic.llm import (
+    ContextObserver, LlmMessageEvent, LlmCheckpointCreatedEvent,
+    ToolCallEvent, ToolReturnEvent,
+)
 
 class MyObserver:
     def notify_event(self, event: object) -> None:
-        if isinstance(event, LlmMessageEvent):
+        if isinstance(event, ToolCallEvent):
+            print(f"Tool called: {event.tool_name} ({event.tool_call_id})")
+        elif isinstance(event, ToolReturnEvent):
+            status = "success" if event.success else "error"
+            print(f"Tool returned: {event.tool_name} ({status})")
+        elif isinstance(event, LlmMessageEvent):
             print(f"New message: {event.message}")
         elif isinstance(event, LlmCheckpointCreatedEvent):
             print(f"Checkpoint created: {event.snapshot.checkpoint_id}")
@@ -371,8 +382,37 @@ agent = ReactAgent(config=config, observer=MyObserver())
 # or: agent.subscribe_context(MyObserver())
 ```
 
-Events: `LlmMessageEvent`, `LlmCheckpointCreatedEvent`, `LlmCheckpointRestoredEvent`.
+Events: `LlmMessageEvent`, `LlmCheckpointCreatedEvent`, `LlmCheckpointRestoredEvent`,
+`ToolCallEvent`, `ToolReturnEvent`.
 Observers are notified synchronously — exceptions propagate to the caller.
+
+### Tool Event Observability
+
+`ToolCallEvent` and `ToolReturnEvent` are emitted by `ContextManager.add_message()` after
+`LlmMessageEvent`, derived from the same message. They provide a clean observability interface
+for tool activity without requiring consumers to parse pydantic-ai message internals.
+
+**Part-kind → event mapping:**
+
+| `part_kind` in message | Event emitted | Condition |
+|---|---|---|
+| `tool-call` | `ToolCallEvent` | One event per part (parallel calls → N events) |
+| `tool-return` | `ToolReturnEvent(success=True)` | Always |
+| `retry-prompt` | `ToolReturnEvent(success=False)` | Only when tool raised an error |
+
+**Field semantics:**
+
+- `tool_name` — identifies which tool was called; primary routing key in observer handlers
+- `tool_call_id` — provider-assigned identifier; correlates a `ToolCallEvent` with its
+  corresponding `ToolReturnEvent` within the same message stream
+- `arguments` — raw JSON string from the provider. Use `json.loads(event.arguments)` for
+  structured access. Stored as `str` to avoid coupling to tool-specific parameter schemas.
+- `success` — `True` for clean returns; `False` when the tool raised an error (pydantic-ai
+  emits a `retry-prompt` part in that case). The return content is not carried in
+  `ToolReturnEvent`; it is already in the accompanying `LlmMessageEvent`.
+
+**Emission ordering:** `LlmMessageEvent` always fires first. Tool events follow immediately.
+A consumer receiving `ToolCallEvent` can safely assume the full message is already in context.
 
 ## Prompts
 
@@ -466,7 +506,8 @@ src/akgentic/llm/
     agent.py        # ReactAgent, UsageLimitError, UserPrompt type alias
     config.py       # ModelConfig, UsageLimits, HttpClientConfig, RuntimeConfig, ReactAgentConfig
     context.py      # ContextManager, ContextSnapshot
-    event.py        # LlmMessageEvent, LlmCheckpoint*Event, ContextObserver protocol
+    event.py        # LlmMessageEvent, LlmCheckpoint*Event, ToolCallEvent,
+                    #   ToolReturnEvent, ContextObserver protocol
     prompts.py      # PromptTemplate, current_datetime_prompt, json_output_reminder_prompt
     providers.py    # create_model(), create_http_client(), get_output_type(),
                     #   create_model_settings(), _supports_native_output()
