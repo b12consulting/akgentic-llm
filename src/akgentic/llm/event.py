@@ -39,12 +39,16 @@ class ToolCallEvent:
     ``ToolCallEvent`` per part, in part order.
 
     Attributes:
+        run_id: String representation of the pydantic-ai ``run_id`` UUID stamped
+            on the originating ``ModelResponse``. All ``ToolCallEvent`` instances
+            from the same ``ReactAgent.run()`` invocation share the same value.
         tool_name: Name of the tool being called.
         tool_call_id: Unique identifier for this call (assigned by the model).
         arguments: Raw JSON string of the arguments passed to the tool.
             Consumers who need structured access should do ``json.loads(event.arguments)``.
     """
 
+    run_id: str
     tool_name: str
     tool_call_id: str
     arguments: str
@@ -59,12 +63,16 @@ class ToolReturnEvent:
     - ``retry-prompt`` parts with a non-None ``tool_name`` → ``success=False``
 
     Attributes:
+        run_id: String representation of the pydantic-ai ``run_id`` UUID stamped
+            on the originating ``ModelRequest``. Matches the ``run_id`` on the
+            ``ToolCallEvent`` that initiated the corresponding tool call.
         tool_name: Name of the tool that was called.
         tool_call_id: Identifier matching the originating ``ToolCallEvent``.
         success: ``True`` if the tool returned normally; ``False`` if the model
             issued a retry prompt due to a tool error.
     """
 
+    run_id: str
     tool_name: str
     tool_call_id: str
     success: bool
