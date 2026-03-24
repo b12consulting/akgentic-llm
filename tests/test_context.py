@@ -439,7 +439,11 @@ class TestContextManagerRestore:
         manager.add_message(create_user_message("Old 2"))
         assert len(manager.messages) == 2
 
-        new_msgs = [create_user_message("New 1"), create_user_message("New 2"), create_user_message("New 3")]
+        new_msgs = [
+            create_user_message("New 1"),
+            create_user_message("New 2"),
+            create_user_message("New 3"),
+        ]
         manager.restore(new_msgs)
 
         assert len(manager.messages) == 3
