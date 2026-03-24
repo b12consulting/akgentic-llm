@@ -429,6 +429,96 @@ class TestContextManager:
         assert messages[4].parts[0].content == "User 2"  # type: ignore[attr-defined]
 
 
+class TestContextManagerRestore:
+    """Test ContextManager.restore() method."""
+
+    def test_restore_replaces_existing_messages(self) -> None:
+        """Test restore() replaces existing messages with provided list."""
+        manager = ContextManager()
+        manager.add_message(create_user_message("Old 1"))
+        manager.add_message(create_user_message("Old 2"))
+        assert len(manager.messages) == 2
+
+        new_msgs = [create_user_message("New 1"), create_user_message("New 2"), create_user_message("New 3")]
+        manager.restore(new_msgs)
+
+        assert len(manager.messages) == 3
+        assert manager.messages[0].parts[0].content == "New 1"  # type: ignore[attr-defined]
+        assert manager.messages[1].parts[0].content == "New 2"  # type: ignore[attr-defined]
+        assert manager.messages[2].parts[0].content == "New 3"  # type: ignore[attr-defined]
+
+    def test_restore_empty_clears_messages(self) -> None:
+        """Test restore([]) clears messages."""
+        manager = ContextManager()
+        manager.add_message(create_user_message("Existing"))
+        assert len(manager.messages) == 1
+
+        manager.restore([])
+
+        assert len(manager.messages) == 0
+
+    def test_restore_does_not_notify_observers(self) -> None:
+        """Test restore() does NOT notify observers (bulk rebuild, not incremental)."""
+        manager = ContextManager()
+        observer = MockObserver()
+        manager.subscribe(observer)
+
+        # Add a message normally — should notify
+        manager.add_message(create_user_message("Normal"))
+        assert len(observer.messages_added) == 1
+
+        # Restore — should NOT notify
+        manager.restore([create_user_message("Restored 1"), create_user_message("Restored 2")])
+
+        # Observer should still have only 1 notification (from add_message)
+        assert len(observer.messages_added) == 1
+        assert len(observer.checkpoints_created) == 0
+        assert len(observer.rewinds) == 0
+
+    def test_restore_does_not_apply_sliding_window(self) -> None:
+        """Test restore() does NOT apply sliding window (restored messages are authoritative)."""
+        manager = ContextManager(max_messages=2)
+
+        # Restore 5 messages — all should be kept despite max_messages=2
+        msgs = [create_user_message(f"Msg {i}") for i in range(5)]
+        manager.restore(msgs)
+
+        assert len(manager.messages) == 5
+
+    def test_restore_then_checkpoint_and_rewind(self) -> None:
+        """Test that after restore(), checkpoint() and rewind() still work correctly."""
+        manager = ContextManager()
+
+        # Restore some messages
+        restored = [create_user_message("R1"), create_user_message("R2")]
+        manager.restore(restored)
+        assert len(manager.messages) == 2
+
+        # Checkpoint
+        snapshot = manager.checkpoint(checkpoint_id="after-restore")
+        assert len(snapshot.messages) == 2
+
+        # Add more messages
+        manager.add_message(create_user_message("New"))
+        assert len(manager.messages) == 3
+
+        # Rewind
+        manager.rewind("after-restore")
+        assert len(manager.messages) == 2
+        assert manager.messages[0].parts[0].content == "R1"  # type: ignore[attr-defined]
+
+    def test_restore_creates_defensive_copy(self) -> None:
+        """Test restore() creates a defensive copy of the input list."""
+        manager = ContextManager()
+        original = [create_user_message("A")]
+        manager.restore(original)
+
+        # Mutate the original list — should not affect manager
+        original.append(create_user_message("B"))
+
+        assert len(manager.messages) == 1
+
+
 class TestContextObserverProtocol:
     """Test ContextObserver protocol conformance."""
 
