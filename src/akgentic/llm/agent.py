@@ -8,7 +8,7 @@ from pydantic_ai import UsageLimits as PydanticUsageLimits
 
 from .config import ReactAgentConfig, UsageLimits
 from .context import ContextManager, ContextSnapshot
-from .event import ContextObserver
+from .event import ContextObserver, LlmMessageEvent
 from .providers import create_http_client, create_model, get_output_type
 
 UserPrompt = str | list[str | BinaryContent]
@@ -243,6 +243,28 @@ class ReactAgent:
             KeyError: If checkpoint not found
         """
         self._context.rewind(checkpoint_id)
+
+    def restore_context(self, events: list[Any]) -> None:
+        """Restore LLM conversation context from persisted events.
+
+        Filters ``events`` for objects whose ``.event`` attribute is an
+        ``LlmMessageEvent``, extracts the ``ModelMessage`` from each, and
+        bulk-restores them into the ``ContextManager``.  Non-matching events
+        (e.g. ``ToolCallEvent``, arbitrary objects) are silently ignored.
+
+        Args:
+            events: List of event-like objects (typically ``EventMessage``
+                instances from ``akgentic-core``). Each object is expected
+                to carry a ``.event`` payload; only those where
+                ``isinstance(e.event, LlmMessageEvent)`` contribute a
+                message.
+        """
+        messages = [
+            e.event.message
+            for e in events
+            if hasattr(e, "event") and isinstance(e.event, LlmMessageEvent)
+        ]
+        self._context.restore(messages)
 
     def system_prompt(self, func: Any) -> Any:
         """Register a custom dynamic system prompt.

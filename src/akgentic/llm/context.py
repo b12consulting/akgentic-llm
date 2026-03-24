@@ -295,6 +295,21 @@ class ContextManager:
         if observer in self._observers:
             self._observers.remove(observer)
 
+    def restore(self, messages: list[ModelMessage]) -> None:
+        """Replace message history with the provided list.
+
+        Bulk-restores context from persisted event history. Unlike
+        ``add_message``, this method does **not** notify observers (restored
+        messages are already persisted — re-emitting events would cause
+        duplicates) and does **not** apply the sliding window (restored
+        messages are the authoritative history).
+
+        Args:
+            messages: Messages to restore as the new history.
+                A defensive copy is made so the caller's list is not shared.
+        """
+        self._messages = list(messages)
+
     def clear(self) -> None:
         """Clear all messages and checkpoints.
 

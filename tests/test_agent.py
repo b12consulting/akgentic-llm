@@ -1,5 +1,6 @@
 """Unit tests for ReactAgent implementation."""
 
+from dataclasses import dataclass
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -15,6 +16,7 @@ from akgentic.llm import (
     UsageLimits,
     UserPrompt,
 )
+from akgentic.llm.event import LlmMessageEvent, ToolCallEvent
 
 
 class MockObserver:
@@ -545,3 +547,102 @@ class TestReactAgentMultimodalPrompt:
 
         # The exact same list object must be passed — no copy, no wrapping
         assert captured_kwargs["user_prompt"] is multimodal
+
+
+# --- Helper event wrappers for restore_context tests ---
+
+
+@dataclass
+class FakeEventMessage:
+    """Mimics EventMessage from akgentic-core with an .event payload."""
+
+    event: object
+
+
+class TestReactAgentRestoreContext:
+    """Test ReactAgent.restore_context() method."""
+
+    def test_filters_llm_message_events(self, minimal_config):
+        """Test restore_context filters LlmMessageEvent from mixed event list."""
+        agent = ReactAgent(config=minimal_config)
+
+        msg1 = ModelRequest(parts=[UserPromptPart(content="Hello")])
+        msg2 = ModelRequest(parts=[UserPromptPart(content="World")])
+
+        events = [
+            FakeEventMessage(event=LlmMessageEvent(message=msg1)),
+            FakeEventMessage(
+                event=ToolCallEvent(
+                    run_id="r1", tool_name="t", tool_call_id="c1", arguments="{}"
+                )
+            ),
+            FakeEventMessage(event=LlmMessageEvent(message=msg2)),
+        ]
+
+        agent.restore_context(events)
+
+        assert len(agent.context.messages) == 2
+        assert agent.context.messages[0] is msg1
+        assert agent.context.messages[1] is msg2
+
+    def test_ignores_non_llm_events(self, minimal_config):
+        """Test restore_context ignores non-LlmMessageEvent events."""
+        agent = ReactAgent(config=minimal_config)
+
+        events = [
+            FakeEventMessage(
+                event=ToolCallEvent(
+                    run_id="r1", tool_name="t", tool_call_id="c1", arguments="{}"
+                )
+            ),
+            FakeEventMessage(event="arbitrary string"),
+            "not even an event message",
+        ]
+
+        agent.restore_context(events)
+
+        assert len(agent.context.messages) == 0
+
+    def test_handles_empty_event_list(self, minimal_config):
+        """Test restore_context handles empty event list gracefully."""
+        agent = ReactAgent(config=minimal_config)
+
+        # Pre-populate context to verify it gets cleared/replaced
+        agent.context.add_message(ModelRequest(parts=[UserPromptPart(content="pre")]))
+        assert len(agent.context.messages) == 1
+
+        agent.restore_context([])
+
+        assert len(agent.context.messages) == 0
+
+    def test_handles_zero_llm_events(self, minimal_config):
+        """Test restore_context handles list with zero LlmMessageEvent events."""
+        agent = ReactAgent(config=minimal_config)
+
+        agent.context.add_message(ModelRequest(parts=[UserPromptPart(content="pre")]))
+
+        events = [
+            FakeEventMessage(
+                event=ToolCallEvent(
+                    run_id="r1", tool_name="t", tool_call_id="c1", arguments="{}"
+                )
+            ),
+        ]
+
+        agent.restore_context(events)
+
+        # Should restore empty list (no LlmMessageEvents found)
+        assert len(agent.context.messages) == 0
+
+    def test_preserves_message_order(self, minimal_config):
+        """Test restore_context preserves original order of LlmMessageEvent messages."""
+        agent = ReactAgent(config=minimal_config)
+
+        msgs = [ModelRequest(parts=[UserPromptPart(content=f"msg-{i}")]) for i in range(5)]
+        events = [FakeEventMessage(event=LlmMessageEvent(message=m)) for m in msgs]
+
+        agent.restore_context(events)
+
+        assert len(agent.context.messages) == 5
+        for i, m in enumerate(agent.context.messages):
+            assert m.parts[0].content == f"msg-{i}"  # type: ignore[attr-defined]
