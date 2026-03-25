@@ -13,6 +13,7 @@ from akgentic.llm.event import (
     LlmCheckpointCreatedEvent,
     LlmCheckpointRestoredEvent,
     LlmMessageEvent,
+    LlmUsageEvent,
     ToolCallEvent,
     ToolReturnEvent,
 )
@@ -135,7 +136,8 @@ class ContextManager:
 
         Appends message, applies sliding window if configured,
         and notifies observers. Emits ``LlmMessageEvent`` first, then
-        any tool-related events (``ToolCallEvent``, ``ToolReturnEvent``).
+        any tool-related events (``ToolCallEvent``, ``ToolReturnEvent``),
+        and finally ``LlmUsageEvent`` for ``ModelResponse`` messages with usage data.
 
         Args:
             message: Message to add
@@ -144,6 +146,7 @@ class ContextManager:
         self._apply_window()
         self._notify(LlmMessageEvent(message=message))
         self._emit_tool_events(message)
+        self._emit_usage_event(message)
 
     def _emit_tool_events(self, message: ModelMessage) -> None:
         """Emit ToolCallEvent or ToolReturnEvent for tool-related message parts.
@@ -188,6 +191,26 @@ class ContextManager:
                             success=False,
                         )
                     )
+
+    def _emit_usage_event(self, message: ModelMessage) -> None:
+        """Emit LlmUsageEvent for ModelResponse messages with usage data."""
+        if getattr(message, "kind", None) != "response":
+            return
+        usage = getattr(message, "usage", None)
+        if usage is None:
+            return
+        self._notify(
+            LlmUsageEvent(
+                run_id=str(getattr(message, "run_id", None) or ""),
+                model_name=getattr(message, "model_name", None) or "",
+                provider_name=getattr(message, "provider_name", None) or "",
+                input_tokens=usage.input_tokens,
+                output_tokens=usage.output_tokens,
+                cache_read_tokens=usage.cache_read_tokens,
+                cache_write_tokens=usage.cache_write_tokens,
+                requests=usage.requests,
+            )
+        )
 
     def _apply_window(self) -> None:
         """Apply sliding window to messages.

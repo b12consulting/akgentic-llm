@@ -78,6 +78,38 @@ class ToolReturnEvent:
     success: bool
 
 
+@dataclass(frozen=True)
+class LlmUsageEvent:
+    """Event emitted for each ModelResponse with token usage data.
+
+    Emitted after LlmMessageEvent and tool events for every ModelResponse
+    message added to context. Consumers can aggregate by run_id for per-call
+    totals, or by agent/session at higher layers.
+
+    Attributes:
+        run_id: String representation of the pydantic-ai run_id stamped on
+            the originating ModelResponse. All events from the same
+            ReactAgent.run() invocation share the same value.
+        model_name: Model identifier as reported by the provider
+            (e.g. "claude-sonnet-4-20250514").
+        provider_name: Provider identifier (e.g. "anthropic", "openai").
+        input_tokens: Tokens consumed in the prompt.
+        output_tokens: Tokens generated in the response.
+        cache_read_tokens: Tokens read from provider cache.
+        cache_write_tokens: Tokens written to provider cache.
+        requests: Number of HTTP requests for this response.
+    """
+
+    run_id: str
+    model_name: str
+    provider_name: str
+    input_tokens: int
+    output_tokens: int
+    cache_read_tokens: int
+    cache_write_tokens: int
+    requests: int
+
+
 @runtime_checkable
 class ContextObserver(Protocol):
     """Observer protocol for LLM context changes."""
