@@ -25,6 +25,7 @@ call any LLM without coupling to a specific vendor or framework primitive.
   - [ContextManager](#contextmanager)
   - [Observer Pattern](#observer-pattern)
   - [Tool Event Observability](#tool-event-observability)
+- [Cost Tracking and Aggregation](#cost-tracking-and-aggregation)
 - [Prompts](#prompts)
 - [Development](#development)
 - [License](#license)
@@ -363,7 +364,7 @@ ctx.clear()
 ```python
 from akgentic.llm import (
     ContextObserver, LlmMessageEvent, LlmCheckpointCreatedEvent,
-    ToolCallEvent, ToolReturnEvent,
+    LlmUsageEvent, ToolCallEvent, ToolReturnEvent,
 )
 
 class MyObserver:
@@ -373,6 +374,8 @@ class MyObserver:
         elif isinstance(event, ToolReturnEvent):
             status = "success" if event.success else "error"
             print(f"Tool returned: {event.tool_name} ({status})")
+        elif isinstance(event, LlmUsageEvent):
+            print(f"Usage: {event.model_name} — {event.input_tokens}in/{event.output_tokens}out")
         elif isinstance(event, LlmMessageEvent):
             print(f"New message: {event.message}")
         elif isinstance(event, LlmCheckpointCreatedEvent):
@@ -382,8 +385,8 @@ agent = ReactAgent(config=config, observer=MyObserver())
 # or: agent.subscribe_context(MyObserver())
 ```
 
-Events: `LlmMessageEvent`, `LlmCheckpointCreatedEvent`, `LlmCheckpointRestoredEvent`,
-`ToolCallEvent`, `ToolReturnEvent`.
+Events: `LlmMessageEvent`, `LlmUsageEvent`, `LlmCheckpointCreatedEvent`,
+`LlmCheckpointRestoredEvent`, `ToolCallEvent`, `ToolReturnEvent`.
 Observers are notified synchronously — exceptions propagate to the caller.
 
 ### Tool Event Observability
@@ -413,6 +416,53 @@ for tool activity without requiring consumers to parse pydantic-ai message inter
 
 **Emission ordering:** `LlmMessageEvent` always fires first. Tool events follow immediately.
 A consumer receiving `ToolCallEvent` can safely assume the full message is already in context.
+
+## Cost Tracking and Aggregation
+
+`akgentic-llm` emits an `LlmUsageEvent` for every `ModelResponse` received from a provider.
+These events carry per-request token counts and can be aggregated into hierarchical cost
+summaries using `aggregate_usage()`.
+
+### Pricing Table
+
+Model pricing is externalized in `pricing.yaml` (bundled with the package). It covers
+Anthropic (Claude Sonnet 4, Claude Opus 4) and OpenAI (GPT-4.1 family, GPT-4o family,
+GPT-5 family) with per-1M-token rates for `input`, `output`, `cache_read`, and
+`cache_write`. The table is loaded once at import time into the `PRICING` dict.
+
+Pricing resolution uses substring matching against model names (longest key first), so
+versioned names like `"claude-sonnet-4-20250514"` match the `"claude-sonnet-4-20250514"`
+key, and `"gpt-4.1-mini-2025-12-11"` matches `"gpt-4.1-mini"` before `"gpt-4.1"`.
+
+### Aggregation
+
+```python
+from akgentic.llm import LlmUsageEvent, aggregate_usage
+
+# Collect events from an observer
+events: list[LlmUsageEvent] = my_observer.collected_events
+
+# Aggregate totals and per-model breakdown
+summary = aggregate_usage(events)
+print(f"Total cost: ${summary.total_cost_usd:.4f}")
+print(f"Input tokens: {summary.total_input_tokens}")
+for model_name, usage in summary.by_model.items():
+    print(f"  {model_name}: ${usage.estimated_cost_usd:.4f}")
+
+# Include per-run breakdown
+summary = aggregate_usage(events, by_run=True)
+for run in summary.runs:
+    print(f"Run {run.run_id}: ${run.total_cost_usd:.4f}")
+```
+
+### Data Models
+
+| Model | Description |
+|-------|-------------|
+| `LlmUsageEvent` | Frozen dataclass emitted per `ModelResponse` — carries `run_id`, `model_name`, `provider_name`, token counts, and `requests` |
+| `ModelUsage` | Aggregated tokens and estimated cost for a single model |
+| `RunUsageSummary` | Per-run summary with per-model breakdown |
+| `AgentUsageSummary` | Top-level summary with `by_model`, optional `runs`, and grand totals |
 
 ## Prompts
 
@@ -506,8 +556,11 @@ src/akgentic/llm/
     agent.py        # ReactAgent, UsageLimitError, UserPrompt type alias
     config.py       # ModelConfig, UsageLimits, HttpClientConfig, RuntimeConfig, ReactAgentConfig
     context.py      # ContextManager, ContextSnapshot
-    event.py        # LlmMessageEvent, LlmCheckpoint*Event, ToolCallEvent,
-                    #   ToolReturnEvent, ContextObserver protocol
+    event.py        # LlmMessageEvent, LlmUsageEvent, LlmCheckpoint*Event,
+                    #   ToolCallEvent, ToolReturnEvent, ContextObserver protocol
+    pricing.py      # PRICING dict, ModelUsage, RunUsageSummary, AgentUsageSummary,
+                    #   aggregate_usage()
+    pricing.yaml    # Externalized per-1M-token pricing table (Anthropic + OpenAI)
     prompts.py      # PromptTemplate, current_datetime_prompt, json_output_reminder_prompt
     providers.py    # create_model(), create_http_client(), get_output_type(),
                     #   create_model_settings(), _supports_native_output()
