@@ -8,8 +8,10 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TypedDict
 
+import yaml
 from pydantic import BaseModel, Field
 
 from akgentic.llm.event import LlmUsageEvent
@@ -25,32 +27,16 @@ class _ModelAccum(TypedDict):
     cache_write_tokens: int
     requests: int
 
-PRICING: dict[str, dict[str, float]] = {
-    "claude-sonnet-4-20250514": {
-        "input": 3.0,
-        "output": 15.0,
-        "cache_read": 0.30,
-        "cache_write": 3.75,
-    },
-    "claude-opus-4-20250514": {
-        "input": 15.0,
-        "output": 75.0,
-        "cache_read": 1.50,
-        "cache_write": 18.75,
-    },
-    "gpt-4o": {
-        "input": 2.50,
-        "output": 10.0,
-        "cache_read": 1.25,
-        "cache_write": 2.50,
-    },
-    "gpt-5.2": {
-        "input": 2.0,
-        "output": 8.0,
-        "cache_read": 0.50,
-        "cache_write": 2.0,
-    },
-}
+
+def _load_pricing() -> dict[str, dict[str, float]]:
+    """Load pricing table from pricing.yaml bundled alongside this module."""
+    yaml_path = Path(__file__).parent / "pricing.yaml"
+    with yaml_path.open() as f:
+        data: dict[str, dict[str, float]] = yaml.safe_load(f)
+        return data
+
+
+PRICING: dict[str, dict[str, float]] = _load_pricing()
 
 
 @dataclass(frozen=True)
@@ -124,6 +110,22 @@ class AgentUsageSummary(BaseModel):
     total_cost_usd: float = 0.0
 
 
+# PRICING keys sorted longest-first so "gpt-4.1-nano" matches before "gpt-4.1"
+_PRICING_KEYS_BY_LENGTH: list[str] = sorted(PRICING, key=len, reverse=True)
+
+
+def _resolve_pricing(model_name: str) -> dict[str, float]:
+    """Find pricing rates by checking if a PRICING key is contained in the model name.
+
+    Checks longest keys first so "gpt-4.1-mini" matches before "gpt-4.1".
+    Handles versioned names like "gpt-5.2-2025-12-11" naturally.
+    """
+    for key in _PRICING_KEYS_BY_LENGTH:
+        if key in model_name:
+            return PRICING[key]
+    return {}
+
+
 def _compute_model_cost(
     model_name: str,
     input_tokens: int,
@@ -132,7 +134,7 @@ def _compute_model_cost(
     cache_write_tokens: int,
 ) -> float:
     """Compute estimated USD cost for a model using the PRICING table."""
-    rates = PRICING.get(model_name, {})
+    rates = _resolve_pricing(model_name)
     return (
         input_tokens * rates.get("input", 0.0)
         + output_tokens * rates.get("output", 0.0)
