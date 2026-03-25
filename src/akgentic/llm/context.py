@@ -136,7 +136,8 @@ class ContextManager:
 
         Appends message, applies sliding window if configured,
         and notifies observers. Emits ``LlmMessageEvent`` first, then
-        any tool-related events (``ToolCallEvent``, ``ToolReturnEvent``).
+        any tool-related events (``ToolCallEvent``, ``ToolReturnEvent``),
+        and finally ``LlmUsageEvent`` for ``ModelResponse`` messages with usage data.
 
         Args:
             message: Message to add
