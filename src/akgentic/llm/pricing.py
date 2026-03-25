@@ -8,10 +8,22 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass
+from typing import TypedDict
 
 from pydantic import BaseModel, Field
 
 from akgentic.llm.event import LlmUsageEvent
+
+
+class _ModelAccum(TypedDict):
+    """Accumulator bucket for per-model token aggregation."""
+
+    provider_name: str
+    input_tokens: int
+    output_tokens: int
+    cache_read_tokens: int
+    cache_write_tokens: int
+    requests: int
 
 PRICING: dict[str, dict[str, float]] = {
     "claude-sonnet-4-20250514": {
@@ -154,29 +166,32 @@ def _build_model_usage(
     )
 
 
+def _new_accum() -> _ModelAccum:
+    """Create a zeroed accumulator bucket."""
+    return _ModelAccum(
+        provider_name="",
+        input_tokens=0,
+        output_tokens=0,
+        cache_read_tokens=0,
+        cache_write_tokens=0,
+        requests=0,
+    )
+
+
 def _aggregate_events(
     events: list[LlmUsageEvent],
-) -> dict[str, dict[str, int | str]]:
+) -> dict[str, _ModelAccum]:
     """Group events by model_name and accumulate token counts."""
-    accum: dict[str, dict[str, int | str]] = defaultdict(
-        lambda: {
-            "provider_name": "",
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "cache_read_tokens": 0,
-            "cache_write_tokens": 0,
-            "requests": 0,
-        }
-    )
+    accum: dict[str, _ModelAccum] = defaultdict(_new_accum)
     for ev in events:
         bucket = accum[ev.model_name]
         if not bucket["provider_name"]:
             bucket["provider_name"] = ev.provider_name
-        bucket["input_tokens"] = int(bucket["input_tokens"]) + ev.input_tokens
-        bucket["output_tokens"] = int(bucket["output_tokens"]) + ev.output_tokens
-        bucket["cache_read_tokens"] = int(bucket["cache_read_tokens"]) + ev.cache_read_tokens
-        bucket["cache_write_tokens"] = int(bucket["cache_write_tokens"]) + ev.cache_write_tokens
-        bucket["requests"] = int(bucket["requests"]) + ev.requests
+        bucket["input_tokens"] += ev.input_tokens
+        bucket["output_tokens"] += ev.output_tokens
+        bucket["cache_read_tokens"] += ev.cache_read_tokens
+        bucket["cache_write_tokens"] += ev.cache_write_tokens
+        bucket["requests"] += ev.requests
     return accum
 
 
@@ -206,12 +221,12 @@ def aggregate_usage(
     for model_name, bucket in model_accum.items():
         by_model[model_name] = _build_model_usage(
             model_name=model_name,
-            provider_name=str(bucket["provider_name"]),
-            input_tokens=int(bucket["input_tokens"]),
-            output_tokens=int(bucket["output_tokens"]),
-            cache_read_tokens=int(bucket["cache_read_tokens"]),
-            cache_write_tokens=int(bucket["cache_write_tokens"]),
-            requests=int(bucket["requests"]),
+            provider_name=bucket["provider_name"],
+            input_tokens=bucket["input_tokens"],
+            output_tokens=bucket["output_tokens"],
+            cache_read_tokens=bucket["cache_read_tokens"],
+            cache_write_tokens=bucket["cache_write_tokens"],
+            requests=bucket["requests"],
         )
 
     runs: list[RunUsageSummary] = []
@@ -224,12 +239,12 @@ def aggregate_usage(
             run_models = [
                 _build_model_usage(
                     model_name=mn,
-                    provider_name=str(b["provider_name"]),
-                    input_tokens=int(b["input_tokens"]),
-                    output_tokens=int(b["output_tokens"]),
-                    cache_read_tokens=int(b["cache_read_tokens"]),
-                    cache_write_tokens=int(b["cache_write_tokens"]),
-                    requests=int(b["requests"]),
+                    provider_name=b["provider_name"],
+                    input_tokens=b["input_tokens"],
+                    output_tokens=b["output_tokens"],
+                    cache_read_tokens=b["cache_read_tokens"],
+                    cache_write_tokens=b["cache_write_tokens"],
+                    requests=b["requests"],
                 )
                 for mn, b in run_accum.items()
             ]

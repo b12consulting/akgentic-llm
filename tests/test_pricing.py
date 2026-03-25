@@ -267,6 +267,29 @@ class TestAggregateUsageByRun:
         assert run2.total_input_tokens == 300
         assert run2.total_output_tokens == 150
 
+    def test_by_run_cost_consistency(self) -> None:
+        """RunUsageSummary.total_cost_usd must equal sum of its models' costs."""
+        events = [
+            _make_event(
+                run_id="run-1",
+                model_name="claude-sonnet-4-20250514",
+                input_tokens=1000,
+                output_tokens=500,
+            ),
+            _make_event(
+                run_id="run-1",
+                model_name="gpt-4o",
+                provider_name="openai",
+                input_tokens=2000,
+                output_tokens=1000,
+            ),
+        ]
+        result = aggregate_usage(events, by_run=True)
+        assert len(result.runs) == 1
+        run = result.runs[0]
+        expected_cost = sum(m.estimated_cost_usd for m in run.models)
+        assert run.total_cost_usd == expected_cost
+
     def test_by_run_false_no_runs(self) -> None:
         events = [_make_event()]
         result = aggregate_usage(events, by_run=False)
@@ -331,6 +354,21 @@ class TestCacheTokenPricing:
         assert model.estimated_cost_usd == expected_cost
         assert result.total_cache_read_tokens == 1_000_000
         assert result.total_cache_write_tokens == 1_000_000
+
+
+class TestTotalRequestsAccumulation:
+    """total_requests accumulates correctly across multiple events."""
+
+    def test_total_requests_multi_event(self) -> None:
+        events = [
+            _make_event(requests=3),
+            _make_event(requests=2),
+            _make_event(model_name="gpt-4o", provider_name="openai", requests=5),
+        ]
+        result = aggregate_usage(events)
+        assert result.total_requests == 10
+        assert result.by_model["claude-sonnet-4-20250514"].requests == 5
+        assert result.by_model["gpt-4o"].requests == 5
 
 
 class TestTotalCostConsistency:
