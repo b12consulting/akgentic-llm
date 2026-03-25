@@ -144,9 +144,10 @@ class TestSingleToolCall:
         msg = _tool_call_msg()
         manager.add_message(msg)
 
-        assert len(capture.events) == 2
+        assert len(capture.events) == 3
         assert isinstance(capture.events[0], LlmMessageEvent)
         assert isinstance(capture.events[1], ToolCallEvent)
+        # LlmUsageEvent is emitted last for ModelResponse messages
 
     def test_llm_message_event_carries_correct_message(self) -> None:
         """LlmMessageEvent.message must be the message passed to add_message()."""
@@ -206,7 +207,7 @@ class TestParallelToolCalls:
         )
         manager.add_message(msg)
 
-        assert len(capture.events) == 3
+        assert len(capture.events) == 4  # +1 for LlmUsageEvent
         assert isinstance(capture.events[0], LlmMessageEvent)
         assert isinstance(capture.events[1], ToolCallEvent)
         assert isinstance(capture.events[2], ToolCallEvent)
@@ -431,11 +432,11 @@ class TestTextOnlyResponse:
     """AC-7: text-only ModelResponse emits only LlmMessageEvent."""
 
     def test_text_only_emits_only_llm_message_event(self) -> None:
-        """TextPart response produces exactly one LlmMessageEvent, no tool events."""
+        """TextPart response produces LlmMessageEvent + LlmUsageEvent, no tool events."""
         manager, capture = _make_manager_with_capture()
         manager.add_message(_text_msg())
 
-        assert len(capture.events) == 1
+        assert len(capture.events) == 2  # LlmMessageEvent + LlmUsageEvent
         assert isinstance(capture.events[0], LlmMessageEvent)
 
     def test_text_only_no_tool_events(self) -> None:

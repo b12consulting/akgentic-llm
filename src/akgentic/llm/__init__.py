@@ -26,6 +26,7 @@ from .event import (
     LlmCheckpointCreatedEvent,
     LlmCheckpointRestoredEvent,
     LlmMessageEvent,
+    LlmUsageEvent,
     ToolCallEvent,
     ToolReturnEvent,
 )
@@ -52,6 +53,7 @@ __all__ = [
     "ContextObserver",
     "ContextSnapshot",
     "LlmMessageEvent",
+    "LlmUsageEvent",
     "LlmCheckpointCreatedEvent",
     "LlmCheckpointRestoredEvent",
     "ToolCallEvent",
