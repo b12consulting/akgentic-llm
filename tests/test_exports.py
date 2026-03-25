@@ -12,7 +12,7 @@ def test_all_exports_importable():
 def test_no_unexpected_exports():
     """Star import should only include __all__ members."""
     # Submodules are always visible via dir() but not in star imports
-    submodules = {"agent", "config", "context", "event", "prompts", "providers"}
+    submodules = {"agent", "config", "context", "event", "pricing", "prompts", "providers"}
     exported = {name for name in dir(akgentic.llm) if not name.startswith("_")}
     exported_without_submodules = exported - submodules
     expected = set(akgentic.llm.__all__)
@@ -50,6 +50,13 @@ def test_key_exports_present():
     assert hasattr(akgentic.llm, "PromptTemplate")
     assert hasattr(akgentic.llm, "current_datetime_prompt")
     assert hasattr(akgentic.llm, "json_output_reminder_prompt")
+
+    # Pricing & Aggregation
+    assert hasattr(akgentic.llm, "PRICING")
+    assert hasattr(akgentic.llm, "AgentUsageSummary")
+    assert hasattr(akgentic.llm, "ModelUsage")
+    assert hasattr(akgentic.llm, "RunUsageSummary")
+    assert hasattr(akgentic.llm, "aggregate_usage")
 
     # Providers
     assert hasattr(akgentic.llm, "create_model")
