@@ -365,7 +365,9 @@ def _create_azure_model(
 ) -> "OpenAIChatModel":
     """Create Azure OpenAI model.
 
-    Uses the Azure OpenAI endpoint from ``AZURE_OPENAI_ENDPOINT`` env var.
+    Uses the Azure OpenAI endpoint from ``AZURE_OPENAI_ENDPOINT`` env var,
+    the API key from ``AZURE_OPENAI_API_KEY``, and the API version from
+    ``OPENAI_API_VERSION``.
 
     Args:
         config: LLM model configuration.
@@ -378,7 +380,7 @@ def _create_azure_model(
         ValueError: If ``AZURE_OPENAI_ENDPOINT`` environment variable is not set.
     """
     from pydantic_ai.models.openai import OpenAIChatModel  # noqa: PLC0415
-    from pydantic_ai.providers.openai import OpenAIProvider  # noqa: PLC0415
+    from pydantic_ai.providers.azure import AzureProvider  # noqa: PLC0415
 
     base_url = os.getenv("AZURE_OPENAI_ENDPOINT")
     if not base_url:
@@ -387,7 +389,7 @@ def _create_azure_model(
         )
     return OpenAIChatModel(
         model_name=config.model,
-        provider=OpenAIProvider(base_url=base_url, http_client=http_client),
+        provider=AzureProvider(azure_endpoint=base_url, http_client=http_client),
         settings=_build_openai_settings(config),
     )
 
