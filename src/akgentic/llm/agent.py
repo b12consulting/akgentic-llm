@@ -1,15 +1,20 @@
 """REACT-based LLM agent with context management and iteration support."""
 
 import asyncio
+import logging
+import traceback
 from typing import Any
 
 from pydantic_ai import Agent, BinaryContent, UsageLimitExceeded
 from pydantic_ai import UsageLimits as PydanticUsageLimits
+from pydantic_ai.messages import ModelRequest, ModelResponse, ToolReturnPart
 
 from .config import ReactAgentConfig, UsageLimits
 from .context import ContextManager, ContextSnapshot
 from .event import ContextObserver, LlmMessageEvent
 from .providers import create_http_client, create_model, get_output_type
+
+logger = logging.getLogger(__name__)
 
 UserPrompt = str | list[str | BinaryContent]
 
@@ -158,7 +163,11 @@ class ReactAgent:
                 return run.result.output if run.result else None
 
         except UsageLimitExceeded as e:
+            self._heal_unprocessed_tool_calls(traceback.format_exc())
             raise UsageLimitError(str(e)) from e
+        except Exception:
+            self._heal_unprocessed_tool_calls(traceback.format_exc())
+            raise
 
     def run_sync(
         self, user_prompt: UserPrompt, deps: Any = None, output_type: type[Any] | None = None
@@ -202,6 +211,36 @@ class ReactAgent:
             output_tokens_limit=limits.output_tokens_limit,
             total_tokens_limit=limits.total_tokens_limit,
         )
+
+    def _heal_unprocessed_tool_calls(self, error_detail: str) -> None:
+        """Complete any pending tool calls in context with error responses.
+
+        When the REACT loop fails mid-execution, the last message may be a
+        ModelResponse with tool calls that never received results. This
+        appends a ModelRequest with ToolReturnPart for each pending call,
+        preventing the 'unprocessed tool calls' error on the next run().
+        """
+        messages = self._context.messages
+        if not messages:
+            return
+
+        last = messages[-1]
+        if not isinstance(last, ModelResponse) or not last.tool_calls:
+            return
+
+        error_parts: list[Any] = [
+            ToolReturnPart(
+                tool_name=call.tool_name,
+                content=f"Error: tool call aborted due to failure: {error_detail}",
+                tool_call_id=call.tool_call_id,
+            )
+            for call in last.tool_calls
+        ]
+
+        logger.warning(
+            "Healing %d unprocessed tool call(s) after error", len(error_parts)
+        )
+        self._context.add_message(ModelRequest(parts=error_parts))
 
     # API wrapper methods
 
