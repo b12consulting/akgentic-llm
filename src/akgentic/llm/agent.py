@@ -219,6 +219,11 @@ class ReactAgent:
         ModelResponse with tool calls that never received results. This
         appends a ModelRequest with ToolReturnPart for each pending call,
         preventing the 'unprocessed tool calls' error on the next run().
+
+        Args:
+            error_detail: Error detail string (typically a traceback) embedded
+                verbatim into each healing ``ToolReturnPart.content`` so the LLM
+                has visibility into the failure on the next turn.
         """
         messages = self._context.messages
         if not messages:
@@ -228,6 +233,9 @@ class ReactAgent:
         if not isinstance(last, ModelResponse) or not last.tool_calls:
             return
 
+        # list[Any] rather than list[ToolReturnPart] to satisfy mypy strict
+        # mode: ModelRequest.parts is a union type and narrowing to the
+        # concrete part type triggers an assignment-variance error.
         error_parts: list[Any] = [
             ToolReturnPart(
                 tool_name=call.tool_name,
