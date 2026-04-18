@@ -512,7 +512,7 @@ class TestCreateModel:
     # ------------------------------------------------------------------
 
     @patch.dict("os.environ", {"AZURE_OPENAI_ENDPOINT": "https://my-azure.openai.azure.com"})
-    @patch("pydantic_ai.providers.openai.OpenAIProvider")
+    @patch("pydantic_ai.providers.azure.AzureProvider")
     @patch("pydantic_ai.models.openai.OpenAIChatModel")
     def test_create_azure_model(self, mock_model_cls, mock_provider_cls) -> None:
         """create_model returns an OpenAIChatModel for provider='azure'."""
@@ -526,7 +526,7 @@ class TestCreateModel:
         assert result is mock_model_cls.return_value
 
     @patch.dict("os.environ", {"AZURE_OPENAI_ENDPOINT": "https://my-azure.openai.azure.com"})
-    @patch("pydantic_ai.providers.openai.OpenAIProvider")
+    @patch("pydantic_ai.providers.azure.AzureProvider")
     @patch("pydantic_ai.models.openai.OpenAIChatModel")
     def test_azure_uses_endpoint_from_env(self, mock_model_cls, mock_provider_cls) -> None:
         """Azure provider uses AZURE_OPENAI_ENDPOINT environment variable."""
@@ -536,7 +536,7 @@ class TestCreateModel:
         create_model(config, http_client=mock_client)
 
         mock_provider_cls.assert_called_once_with(
-            base_url="https://my-azure.openai.azure.com",
+            azure_endpoint="https://my-azure.openai.azure.com",
             http_client=mock_client,
         )
 
