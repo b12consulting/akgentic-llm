@@ -11,7 +11,7 @@ from pydantic_ai.messages import ModelRequest, ModelResponse, ToolReturnPart
 
 from .config import ReactAgentConfig, UsageLimits
 from .context import ContextManager, ContextSnapshot
-from .event import ContextObserver, LlmMessageEvent
+from .event import ContextObserver, LlmMessageEvent, LlmSystemPromptEvent
 from .providers import create_http_client, create_model, get_output_type
 
 logger = logging.getLogger(__name__)
@@ -163,6 +163,11 @@ class ReactAgent:
                             added_message_ids.add(msg_id)
                             self._context.add_message(message)
 
+                # Record this run's effective system prompt rendering exactly
+                # once, after pydantic-ai's in-place dynamic re-evaluation and
+                # the new_messages() drain, before returning (ADR-004 §2).
+                self._record_run_system_prompt(run)
+
                 return run.result.output if run.result else None
 
         except UsageLimitExceeded as e:
@@ -171,6 +176,28 @@ class ReactAgent:
         except Exception:
             self._heal_unprocessed_tool_calls(traceback.format_exc())
             raise
+
+    def _record_run_system_prompt(self, run: Any) -> None:
+        """Record the completed run's effective system prompt rendering once.
+
+        Derives the run's ``run_id`` from its own messages — the same value
+        ``_emit_tool_events`` reads via ``message.run_id`` — so the emitted
+        ``LlmSystemPromptEvent.run_id`` correlates with that run's
+        ``LlmMessageEvent``/``ToolCallEvent``/``LlmUsageEvent`` values. When the
+        run produced no new messages (no ``run_id`` available), the recording
+        call is skipped — there is nothing to record (ADR-004 §2).
+
+        Args:
+            run: The completed pydantic-ai run object, exposing
+                ``new_messages()``.
+        """
+        new_messages = run.new_messages()
+        if not new_messages:
+            return
+        run_id = getattr(new_messages[-1], "run_id", None)
+        if run_id is None:
+            return
+        self._context.record_system_prompt(str(run_id))
 
     def run_sync(
         self, user_prompt: UserPrompt, deps: Any = None, output_type: type[Any] | None = None
@@ -315,6 +342,33 @@ class ReactAgent:
             if hasattr(e, "event") and isinstance(e.event, LlmMessageEvent)
         ]
         self._context.restore(messages)
+        self._seed_system_prompt_from_events(events)
+
+    def _seed_system_prompt_from_events(self, events: list[Any]) -> None:
+        """Seed the dedup hash from the latest persisted ``LlmSystemPromptEvent``.
+
+        Scans ``events`` for the **latest** ``LlmSystemPromptEvent`` (the last in
+        append/persist order) and seeds ``ContextManager._last_system_prompt_hash``
+        from its ``content_hash`` via ``seed_system_prompt_hash`` — without firing
+        observers — so a restored agent does not re-emit an unchanged rendering.
+        When no such event is present (e.g. an older team), the dedup state is left
+        at its current ``None`` so the next run emits the ``None → hash`` transition
+        (ADR-004 §3). Additive to the message-restore scan; the same guard style is
+        reused.
+
+        Args:
+            events: The same event-like list passed to ``restore_context``.
+        """
+        latest = next(
+            (
+                e.event
+                for e in reversed(events)
+                if hasattr(e, "event") and isinstance(e.event, LlmSystemPromptEvent)
+            ),
+            None,
+        )
+        if latest is not None:
+            self._context.seed_system_prompt_hash(latest.content_hash)
 
     def system_prompt(self, func: Any) -> Any:
         """Register a custom dynamic system prompt.
