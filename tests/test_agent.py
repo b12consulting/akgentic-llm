@@ -564,6 +564,140 @@ class FakeEventMessage:
     event: object
 
 
+class TestReactAgentFoldsPendingOperatorActions:
+    """ReactAgent.run folds buffered pre-first-run operator actions (FR4, FR5)."""
+
+    @staticmethod
+    def _capturing_run_factory(captured: dict):
+        """Return a MockRun class that records the kwargs passed to iter()."""
+
+        class MockRun:
+            def __init__(self, *args, **kwargs):
+                captured.update(kwargs)
+                self.result = MagicMock(output="ok")
+                self._new_messages: list = []
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_):
+                return False
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                raise StopAsyncIteration
+
+            def new_messages(self):
+                return self._new_messages
+
+        return MockRun
+
+    @pytest.mark.asyncio
+    async def test_str_prompt_gets_preamble_prepended(self, minimal_config):
+        """FR4: a buffered entry is prepended to a str prompt with a blank-line join."""
+        agent = ReactAgent(config=minimal_config)
+        agent.context.record_operator_action("[Operator action] ran /reset")
+        captured: dict = {}
+
+        with patch.object(
+            agent._pydantic_agent, "iter", side_effect=self._capturing_run_factory(captured)
+        ):
+            await agent.run("hello")
+
+        assert captured["user_prompt"] == "[Operator action] ran /reset\n\nhello"
+
+    @pytest.mark.asyncio
+    async def test_multiple_entries_joined_in_order(self, minimal_config):
+        """FR4: multiple buffered entries join with blank lines, then the prompt."""
+        agent = ReactAgent(config=minimal_config)
+        agent.context.record_operator_action("first")
+        agent.context.record_operator_action("second")
+        captured: dict = {}
+
+        with patch.object(
+            agent._pydantic_agent, "iter", side_effect=self._capturing_run_factory(captured)
+        ):
+            await agent.run("body")
+
+        assert captured["user_prompt"] == "first\n\nsecond\n\nbody"
+
+    @pytest.mark.asyncio
+    async def test_list_prompt_gets_preamble_as_leading_element(self, minimal_config):
+        """FR4: a multimodal list prompt gets the preamble inserted as its first element."""
+        agent = ReactAgent(config=minimal_config)
+        agent.context.record_operator_action("op-A")
+        agent.context.record_operator_action("op-B")
+        bc = BinaryContent(data=b"img", media_type="image/png")
+        multimodal: list = ["describe", bc]
+        captured: dict = {}
+
+        with patch.object(
+            agent._pydantic_agent, "iter", side_effect=self._capturing_run_factory(captured)
+        ):
+            await agent.run(multimodal)
+
+        assert captured["user_prompt"] == ["op-A\n\nop-B", "describe", bc]
+
+    @pytest.mark.asyncio
+    async def test_run_clears_buffer(self, minimal_config):
+        """FR4: after a run the operator-action buffer is empty."""
+        agent = ReactAgent(config=minimal_config)
+        agent.context.record_operator_action("once")
+        captured: dict = {}
+
+        with patch.object(
+            agent._pydantic_agent, "iter", side_effect=self._capturing_run_factory(captured)
+        ):
+            await agent.run("q")
+
+        assert agent.context.drain_pending_operator_actions() == []
+
+    @pytest.mark.asyncio
+    async def test_empty_buffer_leaves_str_prompt_unchanged(self, minimal_config):
+        """FR4: with nothing buffered, a str prompt passes through unchanged."""
+        agent = ReactAgent(config=minimal_config)
+        captured: dict = {}
+
+        with patch.object(
+            agent._pydantic_agent, "iter", side_effect=self._capturing_run_factory(captured)
+        ):
+            await agent.run("plain")
+
+        assert captured["user_prompt"] == "plain"
+
+    @pytest.mark.asyncio
+    async def test_empty_buffer_leaves_list_prompt_identical(self, minimal_config):
+        """FR4: with nothing buffered, a list prompt passes through as the same object."""
+        agent = ReactAgent(config=minimal_config)
+        multimodal: list = ["text", BinaryContent(data=b"x", media_type="image/png")]
+        captured: dict = {}
+
+        with patch.object(
+            agent._pydantic_agent, "iter", side_effect=self._capturing_run_factory(captured)
+        ):
+            await agent.run(multimodal)
+
+        assert captured["user_prompt"] is multimodal
+
+    @pytest.mark.asyncio
+    async def test_message_history_stays_empty_so_system_prompt_injects(self, minimal_config):
+        """FR5: folding leaves message_history empty so pydantic-ai injects the system prompt."""
+        agent = ReactAgent(config=minimal_config)
+        agent.context.record_operator_action("[Operator action] ran /help")
+        captured: dict = {}
+
+        with patch.object(
+            agent._pydantic_agent, "iter", side_effect=self._capturing_run_factory(captured)
+        ):
+            await agent.run("question")
+
+        # message_history is the drain-independent run buffer — empty before the
+        # first run, so pydantic-ai's `if not messages` injection path runs.
+        assert captured["message_history"] == []
+
+
 class TestReactAgentRestoreContext:
     """Test ReactAgent.restore_context() method."""
 

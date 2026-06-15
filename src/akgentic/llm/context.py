@@ -7,7 +7,12 @@ from datetime import datetime
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
-from pydantic_ai.messages import ModelMessage, ModelRequest, SystemPromptPart
+from pydantic_ai.messages import (
+    ModelMessage,
+    ModelRequest,
+    SystemPromptPart,
+    UserPromptPart,
+)
 
 from akgentic.llm.event import (
     ContextObserver,
@@ -114,6 +119,7 @@ class ContextManager:
         self._checkpoint_order: list[str] = []
         self._observers: list[ContextObserver] = []
         self._last_system_prompt_hash: str | None = None
+        self._pending_operator_actions: list[str] = []
 
     @property
     def messages(self) -> list[ModelMessage]:
@@ -151,6 +157,50 @@ class ContextManager:
         self._notify(LlmMessageEvent(message=message))
         self._emit_tool_events(message)
         self._emit_usage_event(message)
+
+    def record_operator_action(self, entry: str) -> None:
+        """Record a human operator-action entry, respecting pydantic-ai's first-run rule.
+
+        pydantic-ai injects its registered ``@system_prompt`` functions only when
+        the ``message_history`` it is handed arrives empty (``if not messages``).
+        It never *adds* a missing system prompt to a non-empty history. That
+        couples how an operator action may be recorded to whether the run buffer
+        has been materialized yet:
+
+        - **After the first run** a system-bearing ``ModelRequest`` already exists
+          in ``_messages``, so appending a bare user-role ``ModelRequest`` is safe:
+          it emits an ``LlmMessageEvent`` and becomes visible in the next run's
+          history without affecting injection.
+        - **Before the first run** ``_messages`` is empty. Appending a system-less
+          ``ModelRequest`` here would make the next run's ``message_history``
+          non-empty and **suppress** system-prompt injection, leaving the agent's
+          first turn blind to its backstory/date/roster/mailbox. So the entry is
+          buffered instead, and ``ReactAgent.run`` folds it into the next run's
+          ``user_prompt`` (keeping ``message_history`` empty).
+
+        Args:
+            entry: The fully formatted operator-action text to record.
+        """
+        if self._messages:
+            self.add_message(ModelRequest(parts=[UserPromptPart(content=entry)]))
+        else:
+            self._pending_operator_actions.append(entry)
+
+    def drain_pending_operator_actions(self) -> list[str]:
+        """Return buffered pre-first-run operator actions and clear the buffer.
+
+        Returns the buffered entries in record order, then resets the buffer to
+        empty. ``ReactAgent.run`` calls this to fold the entries into the next
+        run's ``user_prompt`` so they reach the model without suppressing
+        system-prompt injection (see ``record_operator_action``).
+
+        Returns:
+            The buffered operator-action entries, in record order. Empty when
+            nothing has been buffered.
+        """
+        pending = self._pending_operator_actions
+        self._pending_operator_actions = []
+        return pending
 
     def _emit_tool_events(self, message: ModelMessage) -> None:
         """Emit ToolCallEvent or ToolReturnEvent for tool-related message parts.
