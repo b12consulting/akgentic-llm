@@ -140,6 +140,7 @@ class ReactAgent:
         Raises:
             UsageLimitError: If usage limits exceeded
         """
+        user_prompt = self._fold_pending_operator_actions(user_prompt)
         pydantic_limits = self._to_pydantic_limits(self._config.usage_limits)
 
         try:
@@ -176,6 +177,39 @@ class ReactAgent:
         except Exception:
             self._heal_unprocessed_tool_calls(traceback.format_exc())
             raise
+
+    def _fold_pending_operator_actions(self, user_prompt: UserPrompt) -> UserPrompt:
+        """Prepend any buffered pre-first-run operator actions to the run prompt.
+
+        Drains ``ContextManager._pending_operator_actions`` and folds the entries
+        into ``user_prompt`` so they reach the model **as prompt content** rather
+        than as a system-less ``ModelRequest`` in ``message_history`` — which
+        would make pydantic-ai's history non-empty and suppress system-prompt
+        injection on the first run. ``message_history`` is therefore left
+        untouched (empty before the first run), preserving injection.
+
+        Folding is per prompt shape:
+
+        - ``str`` prompt → ``f"{preamble}\\n\\n{user_prompt}"``;
+        - multimodal ``list`` prompt → the joined ``preamble`` inserted as the
+          leading element.
+
+        When nothing is buffered the prompt is returned unchanged.
+
+        Args:
+            user_prompt: The caller's prompt for this run (str or multimodal list).
+
+        Returns:
+            The prompt with buffered operator actions prepended, or the original
+            prompt when the buffer is empty.
+        """
+        pending = self._context.drain_pending_operator_actions()
+        if not pending:
+            return user_prompt
+        preamble = "\n\n".join(pending)
+        if isinstance(user_prompt, str):
+            return f"{preamble}\n\n{user_prompt}"
+        return [preamble, *user_prompt]
 
     def _record_run_system_prompt(self, run: Any) -> None:
         """Record the completed run's effective system prompt rendering once.
