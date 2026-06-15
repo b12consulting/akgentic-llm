@@ -254,16 +254,53 @@ class ContextManager:
         """
         self._last_system_prompt_hash = content_hash
 
+    def record_initial_system_prompt(self, backstory: str, run_id: str = "pre-run") -> None:
+        """Emit a display-only LlmSystemPromptEvent before any run.
+
+        Surfaces the agent's backstory in the trace immediately (no white panel)
+        while leaving the pydantic-ai run buffer (``_messages``) untouched, so
+        dynamic injection on the first run is unaffected. This method **never**
+        mutates ``_messages`` — the creation event appends nothing to the run
+        buffer. Latest-wins: the first real run renders backstory plus dynamic
+        blocks (date / roster / role profiles / mailbox), producing a different
+        hash, so ``record_system_prompt`` emits the full rendering and supersedes
+        this stub. ``dynamic_ref="agent_backstory"`` matches the registered
+        dynamic prompt label, keeping the head-block label stable across the
+        stub→full transition. Implements ADR-006 §2.
+
+        Args:
+            backstory: The agent's backstory to surface as the creation stub.
+            run_id: The run identifier to stamp on the event (default
+                ``"pre-run"``).
+        """
+        snapshots = [SystemPromptPartSnapshot(dynamic_ref="agent_backstory", content=backstory)]
+        content_hash = self._hash_parts(snapshots)
+        self._notify(LlmSystemPromptEvent(run_id, tuple(snapshots), content_hash))
+        self._last_system_prompt_hash = content_hash
+
     def _snapshot_system_parts(self) -> list[SystemPromptPartSnapshot]:
-        """Snapshot the first ModelRequest's system parts, in model order.
+        """Snapshot the first system-bearing ModelRequest's system parts.
+
+        Selects the first ``ModelRequest`` that has at least one
+        ``SystemPromptPart``, skipping any number of system-less leading
+        messages (e.g. an operator action whose first request carries only a
+        ``UserPromptPart``). Returns one snapshot per ``SystemPromptPart`` on
+        that request, in part order. Empty if no ``ModelRequest`` carries a
+        system part. Implements ADR-006 §1.
 
         Returns:
-            One snapshot per ``SystemPromptPart`` on the first ``ModelRequest``,
-            in part order. Empty if there is no first ``ModelRequest`` or it has
-            no system parts.
+            One snapshot per ``SystemPromptPart`` on the first system-bearing
+            ``ModelRequest``, in part order. Empty if no request has a system
+            part.
         """
         first_request = next(
-            (m for m in self._messages if isinstance(m, ModelRequest)), None
+            (
+                m
+                for m in self._messages
+                if isinstance(m, ModelRequest)
+                and any(p.part_kind == "system-prompt" for p in m.parts)
+            ),
+            None,
         )
         if first_request is None:
             return []

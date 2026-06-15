@@ -428,3 +428,162 @@ class TestEventDataclassProperties:
         snap = SystemPromptPartSnapshot(dynamic_ref="ref", content="body")
         with pytest.raises(dataclasses.FrozenInstanceError):
             snap.content = "other"  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# Story 7-1 AC #1, #2, #3: skip system-less leading messages
+# ---------------------------------------------------------------------------
+
+
+class TestSkipSystemLessLeadingMessage:
+    """Story 7-1: _snapshot_system_parts skips system-less leading messages."""
+
+    def test_skips_leading_operator_action(self) -> None:
+        """A bare-UserPromptPart leading request is skipped; the first
+        system-bearing request's parts are returned in order (AC #1)."""
+        manager, _capture = _make_manager_with_capture()
+        manager.add_message(ModelRequest(parts=[UserPromptPart(content="operator action")]))
+        manager.add_message(
+            _system_request(
+                ("agent_backstory", "You are a helpful agent."),
+                ("current_date", "Today is 2026-06-13."),
+            )
+        )
+
+        snapshots = manager._snapshot_system_parts()
+
+        assert snapshots == [
+            SystemPromptPartSnapshot(
+                dynamic_ref="agent_backstory", content="You are a helpful agent."
+            ),
+            SystemPromptPartSnapshot(dynamic_ref="current_date", content="Today is 2026-06-13."),
+        ]
+
+    def test_operator_action_first_emits_single_event(self) -> None:
+        """With an operator action first, record_system_prompt emits exactly one
+        event carrying the run's system parts in order (AC #3)."""
+        manager, capture = _make_manager_with_capture()
+        manager.add_message(ModelRequest(parts=[UserPromptPart(content="operator action")]))
+        manager.add_message(
+            _system_request(
+                ("agent_backstory", "Backstory."),
+                ("current_date", "Today is 2026-06-13."),
+                ("GetTeamRoster", "#GetTeamRoster: Alice, Bob"),
+            )
+        )
+        capture.events.clear()
+
+        manager.record_system_prompt("run-1")
+
+        events = _system_events(capture)
+        assert len(events) == 1
+        assert events[0].run_id == "run-1"
+        assert events[0].parts == (
+            SystemPromptPartSnapshot(dynamic_ref="agent_backstory", content="Backstory."),
+            SystemPromptPartSnapshot(dynamic_ref="current_date", content="Today is 2026-06-13."),
+            SystemPromptPartSnapshot(
+                dynamic_ref="GetTeamRoster", content="#GetTeamRoster: Alice, Bob"
+            ),
+        )
+
+    def test_no_system_bearing_request_returns_empty_and_emits_nothing(self) -> None:
+        """A multi-message buffer with no system-bearing request yields [] and
+        emits nothing (AC #2)."""
+        manager, capture = _make_manager_with_capture()
+        manager.add_message(ModelRequest(parts=[UserPromptPart(content="Hi")]))
+        manager.add_message(ModelResponse(parts=[TextPart(content="Hello")]))
+        capture.events.clear()
+
+        assert manager._snapshot_system_parts() == []
+        manager.record_system_prompt("run-1")
+        assert _system_events(capture) == []
+
+
+# ---------------------------------------------------------------------------
+# Story 7-1 AC #4, #5, #6: record_initial_system_prompt
+# ---------------------------------------------------------------------------
+
+
+class TestRecordInitialSystemPrompt:
+    """Story 7-1: record_initial_system_prompt emits a display-only stub."""
+
+    def test_emits_single_creation_event(self) -> None:
+        """One event with the expected single snapshot, run_id 'pre-run', a
+        non-empty hash, and _last_system_prompt_hash set (AC #4)."""
+        manager, capture = _make_manager_with_capture()
+
+        manager.record_initial_system_prompt("You are Bob, the architect.")
+
+        events = _system_events(capture)
+        assert len(events) == 1
+        event = events[0]
+        assert event.parts == (
+            SystemPromptPartSnapshot(
+                dynamic_ref="agent_backstory", content="You are Bob, the architect."
+            ),
+        )
+        assert event.run_id == "pre-run"
+        assert event.content_hash
+        assert manager._last_system_prompt_hash == event.content_hash
+
+    def test_never_touches_messages(self) -> None:
+        """_messages is unchanged (still empty) after the creation event (AC #5)."""
+        manager, _capture = _make_manager_with_capture()
+
+        manager.record_initial_system_prompt("You are Bob, the architect.")
+
+        assert manager._messages == []
+
+    def test_custom_run_id_is_honoured(self) -> None:
+        """A custom run_id overrides the 'pre-run' default (AC #6)."""
+        manager, capture = _make_manager_with_capture()
+
+        manager.record_initial_system_prompt("backstory", run_id="boot")
+
+        assert _system_events(capture)[0].run_id == "boot"
+
+
+# ---------------------------------------------------------------------------
+# Story 7-1 AC #7, #8: latest-wins / dedup after a creation stub
+# ---------------------------------------------------------------------------
+
+
+class TestCreationStubInteractionWithFirstRun:
+    """Story 7-1: stub interaction with the first real run."""
+
+    def test_latest_wins_stub_superseded_by_first_run(self) -> None:
+        """A first real run with backstory plus a dynamic block has a different
+        hash, so a second event is emitted and _messages has no pre-seeded
+        system message (AC #7)."""
+        manager, capture = _make_manager_with_capture()
+        manager.record_initial_system_prompt("Backstory.")
+        stub_hash = _system_events(capture)[0].content_hash
+
+        manager.add_message(
+            _system_request(
+                ("agent_backstory", "Backstory."),
+                ("current_date", "Today is 2026-06-13."),
+            )
+        )
+        capture.events.clear()
+
+        manager.record_system_prompt("run-1")
+
+        events = _system_events(capture)
+        assert len(events) == 1
+        assert events[0].content_hash != stub_hash
+        # Only the message the real run added is present; no pre-seeded stub message.
+        assert len(manager._messages) == 1
+
+    def test_dedup_after_stub_when_rendering_matches(self) -> None:
+        """An identical single-part agent_backstory rendering after the stub is
+        deduplicated by the seeded hash (AC #8)."""
+        manager, capture = _make_manager_with_capture()
+        manager.record_initial_system_prompt("Backstory.")
+        capture.events.clear()
+
+        manager.add_message(_system_request(("agent_backstory", "Backstory."), user=None))
+
+        manager.record_system_prompt("run-1")
+
+        assert _system_events(capture) == []
