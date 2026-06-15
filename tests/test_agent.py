@@ -926,3 +926,165 @@ class TestReactAgentRestoreSeedsSystemPromptHash:
         assert agent.context.messages[0] is msg1
         assert agent.context.messages[1] is msg2
         assert agent.context._last_system_prompt_hash == "abc"
+
+
+class TestReactAgentRestoreCreationEventParity:
+    """Restore parity for the persisted creation event (Story 7-2, ADR-006 §4).
+
+    A never-run agent persists a creation-stub LlmSystemPromptEvent (a single
+    ``agent_backstory`` part, ``run_id="pre-run"``) and no LlmMessageEvents.
+    Restore must seed the dedup hash from that stub WITHOUT re-emitting, and
+    rebuild ``_messages`` empty (rebuilt from LlmMessageEvents only). The first
+    full run then renders backstory plus dynamic blocks — a different hash — so
+    exactly one event is emitted (latest-wins). Restore-after-run keeps dedup
+    across restore; the latest persisted LlmSystemPromptEvent always wins.
+    """
+
+    def test_restore_before_first_run_seeds_without_reemit_and_empty_messages(
+        self, minimal_config
+    ):
+        """AC #1: creation stub seeds the hash, no re-emit, _messages empty."""
+        # Build the creation-stub event with the production stub hash via a probe.
+        probe = ReactAgent(config=minimal_config)
+        probe.context.record_initial_system_prompt("You are Bob, the architect.")
+        stub_hash = probe.context._last_system_prompt_hash
+
+        stub = LlmSystemPromptEvent(
+            run_id="pre-run",
+            parts=(
+                SystemPromptPartSnapshot(
+                    dynamic_ref="agent_backstory",
+                    content="You are Bob, the architect.",
+                ),
+            ),
+            content_hash=stub_hash,
+        )
+
+        observer = MockObserver()
+        agent = ReactAgent(config=minimal_config, observer=observer)
+        agent.restore_context([FakeEventMessage(event=stub)])
+
+        # (a) the dedup hash is seeded from the persisted creation stub
+        assert agent.context._last_system_prompt_hash == stub_hash
+        # (b) restore itself re-emitted nothing
+        assert _system_events(observer) == []
+        # (c) a never-run agent's run buffer restores empty
+        assert agent.context.messages == []
+
+    def test_first_full_run_after_restore_emits_once_latest_wins(self, minimal_config):
+        """AC #2: the restored never-run agent's first full run emits exactly one event."""
+        probe = ReactAgent(config=minimal_config)
+        probe.context.record_initial_system_prompt("You are Bob, the architect.")
+        stub_hash = probe.context._last_system_prompt_hash
+
+        stub = LlmSystemPromptEvent(
+            run_id="pre-run",
+            parts=(
+                SystemPromptPartSnapshot(
+                    dynamic_ref="agent_backstory",
+                    content="You are Bob, the architect.",
+                ),
+            ),
+            content_hash=stub_hash,
+        )
+
+        observer = MockObserver()
+        agent = ReactAgent(config=minimal_config, observer=observer)
+        agent.restore_context([FakeEventMessage(event=stub)])
+
+        # First full run: backstory PLUS a dynamic block ⇒ a different hash.
+        run = _make_mock_run(
+            [
+                _system_request_with_run_id(
+                    ("agent_backstory", "You are Bob, the architect."),
+                    ("current_date", "Today is 2026-06-15."),
+                    run_id="r1",
+                )
+            ]
+        )
+        with patch.object(agent._pydantic_agent, "iter", return_value=run):
+            agent.run_sync("query")
+
+        events = _system_events(observer)
+        assert len(events) == 1
+        assert events[0].content_hash != stub_hash
+        assert agent.context._last_system_prompt_hash == events[0].content_hash
+
+    def test_restore_after_run_dedup_holds_across_restore(self, minimal_config):
+        """AC #3: latest persisted full event seeds; identical next run does not re-emit."""
+        # Compute the real hash of the full multi-part rendering via a probe.
+        probe = ReactAgent(config=minimal_config)
+        probe.context.add_message(
+            _system_request_with_run_id(
+                ("agent_backstory", "B."),
+                ("current_date", "Today is 2026-06-15."),
+                run_id="r0",
+            )
+        )
+        probe.context.record_system_prompt("r0")
+        known_hash = probe.context._last_system_prompt_hash
+
+        full = LlmSystemPromptEvent(
+            run_id="r1",
+            parts=(
+                SystemPromptPartSnapshot(dynamic_ref="agent_backstory", content="B."),
+                SystemPromptPartSnapshot(
+                    dynamic_ref="current_date", content="Today is 2026-06-15."
+                ),
+            ),
+            content_hash=known_hash,
+        )
+
+        observer = MockObserver()
+        agent = ReactAgent(config=minimal_config, observer=observer)
+        agent.restore_context([FakeEventMessage(event=full)])
+
+        # The next run reproduces the identical rendering ⇒ dedup suppresses it.
+        run = _make_mock_run(
+            [
+                _system_request_with_run_id(
+                    ("agent_backstory", "B."),
+                    ("current_date", "Today is 2026-06-15."),
+                    run_id="r2",
+                )
+            ]
+        )
+        with patch.object(agent._pydantic_agent, "iter", return_value=run):
+            agent.run_sync("query")
+
+        assert _system_events(observer) == []
+
+    def test_latest_stub_wins_among_mixed_events(self, minimal_config):
+        """AC #4: a later creation-stub event's hash is the seed, restore fires nothing."""
+        earlier_full = LlmSystemPromptEvent(
+            run_id="r1",
+            parts=(
+                SystemPromptPartSnapshot(dynamic_ref="agent_backstory", content="B."),
+                SystemPromptPartSnapshot(
+                    dynamic_ref="current_date", content="Today is 2026-06-15."
+                ),
+            ),
+            content_hash="earlier-full-hash",
+        )
+        later_stub = LlmSystemPromptEvent(
+            run_id="pre-run",
+            parts=(
+                SystemPromptPartSnapshot(
+                    dynamic_ref="agent_backstory", content="You are Bob, the architect."
+                ),
+            ),
+            content_hash="later-stub-hash",
+        )
+
+        observer = MockObserver()
+        agent = ReactAgent(config=minimal_config, observer=observer)
+        agent.restore_context(
+            [
+                FakeEventMessage(event=earlier_full),
+                FakeEventMessage(event=later_stub),
+            ]
+        )
+
+        # The latest persisted LlmSystemPromptEvent wins, regardless of kind.
+        assert agent.context._last_system_prompt_hash == "later-stub-hash"
+        assert _system_events(observer) == []
