@@ -448,13 +448,27 @@ model saw on each run.
 
 **Emission semantics:** emitted by `ContextManager.record_system_prompt(run_id)`, which
 `ReactAgent` calls **once per completed run** after pydantic-ai's in-place re-evaluation has
-produced the rendering. It scans the first `ModelRequest`'s system parts, hashes the ordered
-`(dynamic_ref, content)` pairs, and emits **only when the content hash changed** since the
-previous run — run 1 emits via the `None → hash` transition; an unchanged rendering on later
-runs emits nothing, so the log does not grow with every run; a context with no system parts
-emits nothing. The event store stays **strictly append-only**: emission only appends, and
-restoring an agent re-seeds the dedup hash (via `seed_system_prompt_hash`) **without
-re-emitting** an unchanged rendering.
+produced the rendering. It scans the **first system-bearing** `ModelRequest`'s system parts —
+the first `ModelRequest` carrying at least one `SystemPromptPart`, skipping any number of
+system-less leading messages (such as an operator action) rather than simply the first
+`ModelRequest` — hashes the ordered `(dynamic_ref, content)` pairs, and emits **only when the
+content hash changed** since the previous run — run 1 emits via the `None → hash` transition;
+an unchanged rendering on later runs emits nothing, so the log does not grow with every run; a
+context with no system-bearing request emits nothing. The event store stays **strictly
+append-only**: emission only appends, and restoring an agent re-seeds the dedup hash (via
+`seed_system_prompt_hash`) **without re-emitting** an unchanged rendering.
+
+**Creation event — `record_initial_system_prompt(backstory, run_id="pre-run")`:** a
+**display-only** companion that a creator may emit (e.g. at agent creation) to surface the
+agent's backstory in the trace *before* any run, so a freshly created or restored-but-never-run
+agent shows its system prompt immediately. It emits a single `LlmSystemPromptEvent` whose only
+part is `SystemPromptPartSnapshot(dynamic_ref="agent_backstory", content=backstory)`, seeds the
+dedup hash, but **never seeds `_messages`** — the run buffer stays pydantic-ai's, so dynamic
+injection on the first run is untouched. It is **latest-wins**: the first real run renders the
+full prompt (backstory **plus** the dynamic blocks), whose different hash supersedes the stub via
+`record_system_prompt`. The persisted creation event is replayed on restore to re-seed the dedup
+hash **without re-emitting**; `_messages` is rebuilt from `LlmMessageEvent`s only (legitimately
+empty after restore-before-first-run). In a trace it appears as a `run_id == "pre-run"` event.
 
 **Usage — label each block by its source and render the text the model saw:**
 
