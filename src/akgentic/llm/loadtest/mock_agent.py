@@ -106,6 +106,10 @@ class MockReactAgent:
             )
         return asyncio.run(self.run(user_prompt, deps, output_type))
 
+    async def aclose(self) -> None:
+        """No-op teardown (mirrors ``ReactAgent.aclose``; the mock holds no client)."""
+        return None
+
     # --- state selection -----------------------------------------------------
 
     @staticmethod

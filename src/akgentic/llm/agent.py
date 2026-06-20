@@ -88,8 +88,10 @@ class ReactAgent:
         if observer:
             self._context.subscribe(observer)
 
-        # Create HTTP client
-        http_client = create_http_client(
+        # Create HTTP client. Held on the instance so its connection pool can be
+        # released on stop via aclose(); otherwise the pydantic-ai Model keeps the
+        # httpx.AsyncClient (open sockets/TLS buffers) alive past team teardown.
+        self._http_client = create_http_client(
             timeout_s=config.runtime_cfg.http_client_config.timeout,
             max_attempts=config.runtime_cfg.http_client_config.max_retries,
             exp_multiplier=config.runtime_cfg.http_client_config.backoff_multiplier,
@@ -97,7 +99,7 @@ class ReactAgent:
         )
 
         # Create model from config
-        self._model = create_model(config.model_cfg, http_client)
+        self._model = create_model(config.model_cfg, self._http_client)
 
         # Wrap result_type with provider-aware output strategy for structured output
         wrapped_result_type: Any = get_output_type(config.model_cfg, result_type)
@@ -250,10 +252,24 @@ class ReactAgent:
         Raises:
             UsageLimitError: If usage limits exceeded
         """
-        if self._event_loop and self._event_loop.is_running():
-            self._event_loop.run_until_complete(self.run(user_prompt, deps, output_type))
+        loop = self._event_loop
+        if loop is not None and not loop.is_closed() and not loop.is_running():
+            # Reuse the actor's persistent loop so the httpx connection pool stays
+            # bound to ONE stable loop across calls. A fresh asyncio.run() loop per
+            # call leaves pooled connections attached to already-closed loops, which
+            # makes aclose() raise on stop and leaks the pool (RAM grows per team).
+            return loop.run_until_complete(self.run(user_prompt, deps, output_type))
 
         return asyncio.run(self.run(user_prompt, deps, output_type))
+
+    async def aclose(self) -> None:
+        """Release the underlying httpx connection pool.
+
+        Must be called on agent/team teardown: the pydantic-ai Model (and its
+        provider) hold this client, so without aclose() its open sockets and
+        connection pool survive team stop and accumulate in the worker.
+        """
+        await self._http_client.aclose()
 
     def _to_pydantic_limits(self, limits: UsageLimits | None) -> PydanticUsageLimits | None:
         """Convert config UsageLimits to pydantic-ai UsageLimits.
