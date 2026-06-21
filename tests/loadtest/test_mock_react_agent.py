@@ -10,6 +10,7 @@ import asyncio
 import time
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 from pydantic import BaseModel
@@ -124,6 +125,20 @@ def test_provider_guard_raises() -> None:
     agent = _make_agent("@Manager")
     with pytest.raises(MockProviderReachedError):
         agent._build_model()
+
+
+@pytest.mark.asyncio
+async def test_aclose_is_harmless_noop() -> None:
+    """``aclose()`` returns None, builds no model/provider, and never raises."""
+    agent = _make_agent("@Manager")
+    with patch.object(agent, "_build_model", side_effect=AssertionError("must not build")):
+        result = await agent.aclose()
+        # A second call must also be harmless (drop-in parity with ReactAgent).
+        assert await agent.aclose() is None
+    assert result is None
+    # The zero-token guarantee holds: no model/provider was ever constructed.
+    assert agent._model is None
+    assert agent._http_client is None
 
 
 def test_no_token_usage_emitted() -> None:
