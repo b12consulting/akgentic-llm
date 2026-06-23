@@ -19,6 +19,26 @@ logger = logging.getLogger(__name__)
 UserPrompt = str | list[str | BinaryContent]
 
 
+def _evict_anyio_run_vars(loop: asyncio.AbstractEventLoop) -> None:
+    """Remove anyio's per-loop run-vars entry so the closed loop can be GC'd.
+
+    anyio keeps per-loop state in a module-global ``WeakKeyDictionary``
+    (``anyio.lowlevel._run_vars``, keyed by the loop); its value retains the
+    finished run ``Task``, which strong-references the loop, so the weak key
+    never clears and the loop leaks. Evicting our own loop's entry breaks that
+    ``_root_task → loop`` anchor. Best-effort and version-guarded: anyio
+    internals are private, and a missing/absent ``_run_vars`` (or no anyio) must
+    not break teardown. Local copy of ``akgentic.core.agent._evict_anyio_run_vars``
+    (NOT imported — ``akgentic-llm`` must not depend on a sibling package).
+    """
+    try:
+        from anyio.lowlevel import _run_vars  # noqa: PLC0415
+
+        _run_vars.pop(loop, None)
+    except Exception:
+        pass
+
+
 class UsageLimitError(Exception):
     """Raised when usage limits are exceeded during agent execution."""
 
@@ -288,11 +308,14 @@ class ReactAgent:
 
         Drives async resource teardown (``aclose()``) on the still-open loop,
         cancels stragglers, drains async generators and the default executor,
-        then closes the loop in ``finally``. The four-step order is load-bearing:
-        async exit handlers must run before the loop closes, and stragglers /
-        async generators must drain before ``loop.close()`` to avoid leaked
-        transports and "Task was destroyed but it is pending" warnings. A second
-        call is a harmless no-op; teardown failures are logged, never raised.
+        closes the loop, then evicts anyio's per-loop run-vars anchor — all in
+        ``finally``. The five-step order is load-bearing: async exit handlers
+        must run before the loop closes, and stragglers / async generators must
+        drain before ``loop.close()`` to avoid leaked transports and "Task was
+        destroyed but it is pending" warnings; step 5 (the eviction) runs after
+        ``loop.close()`` so the closed loop can actually be GC'd (the
+        ``_root_task`` ``RunVar`` would otherwise pin it). A second call is a
+        harmless no-op; teardown failures are logged, never raised.
         """
         loop = self._loop
         if self._closed or loop.is_closed():
@@ -308,6 +331,7 @@ class ReactAgent:
             logger.warning("ReactAgent.close() teardown failed", exc_info=True)
         finally:
             loop.close()  # 4. close the loop
+            _evict_anyio_run_vars(loop)  # 5. break anyio's _root_task → loop anchor
 
     @staticmethod
     def _cancel_pending(loop: asyncio.AbstractEventLoop) -> None:
