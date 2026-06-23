@@ -8,6 +8,7 @@ guard, latency, scenario caching, and determinism.
 
 import asyncio
 import time
+import warnings
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -16,6 +17,7 @@ import pytest
 from pydantic import BaseModel
 from pydantic_ai.messages import ModelRequest, ModelResponse, ToolCallPart, ToolReturnPart
 
+from akgentic.llm import ModelConfig, ReactAgent, ReactAgentConfig
 from akgentic.llm.event import (
     LlmUsageEvent,
     ToolCallEvent,
@@ -417,14 +419,27 @@ def _last_index(items: list[str], value: str) -> int:
 # ---------------------------------------------------------------------------
 
 
-def test_run_sync_with_non_running_loop_falls_back() -> None:
-    """A provided-but-idle event loop still routes through asyncio.run."""
-    loop = asyncio.new_event_loop()
+def test_event_loop_arg_accepted_and_ignored() -> None:
+    """``event_loop=`` is accepted but ignored: the mock owns its own loop.
+
+    Re-points the old fallback test (the asyncio.run fallback was removed): a
+    passed loop is not adopted as ``self._loop`` and ``run_sync`` still runs on
+    the owned loop, returning ``""``.
+    """
+    passed_loop = asyncio.new_event_loop()
     try:
-        agent = MockReactAgent(config=_make_config("@Expert"), event_loop=loop)
-        assert agent.run_sync("hi", deps=_Deps("@Expert")) == ""
+        agent = MockReactAgent(config=_make_config("@Expert"), event_loop=passed_loop)
+        try:
+            # The passed loop is NOT adopted as the mock's own loop.
+            assert agent._loop is not passed_loop
+            # run_sync runs on the owned loop and still returns "".
+            assert agent.run_sync("hi", deps=_Deps("@Expert")) == ""
+            # The passed loop was never used (untouched by the agent).
+            assert not passed_loop.is_closed()
+        finally:
+            agent.close()
     finally:
-        loop.close()
+        passed_loop.close()
 
 
 def test_restore_context_filters_llm_messages() -> None:
@@ -478,3 +493,135 @@ def test_regex_and_from_sender_matchers() -> None:
     assert agent.run_sync("foo42 here", deps=_Deps("@A")) == "rx-hit"
     assert agent.run_sync("from @Boss now", deps=_Deps("@A")) == "snd-hit"
     assert agent.run_sync("nothing matches", deps=_Deps("@A")) == "default"
+
+
+# ---------------------------------------------------------------------------
+# Story 11-3 (FR7) — synchronous close() parity with ReactAgent
+# ---------------------------------------------------------------------------
+
+
+def test_init_owns_open_nonrunning_loop() -> None:
+    """``__init__`` owns its own loop, open and not running, current on the thread (AC #4)."""
+    agent = _make_agent("@Manager")
+    try:
+        assert isinstance(agent._loop, asyncio.AbstractEventLoop)
+        assert not agent._loop.is_closed()
+        assert not agent._loop.is_running()
+        assert agent._closed is False
+        # set_event_loop made the agent's loop current on the constructing thread.
+        assert asyncio.get_event_loop() is agent._loop
+    finally:
+        agent.close()
+
+
+def test_close_is_callable_and_returns_none() -> None:
+    """``close()`` is synchronous, returns None, and closes the owned loop (AC #1)."""
+    agent = _make_agent("@Manager")
+    assert agent.close() is None
+    assert agent._loop.is_closed()
+    assert agent._closed is True
+
+
+def test_close_is_idempotent() -> None:
+    """A second and third ``close()`` is a harmless no-op (AC #2)."""
+    agent = _make_agent("@Manager")
+    agent.close()
+    # Repeated close() must not raise and must not error on the closed loop.
+    agent.close()
+    agent.close()
+    assert agent._loop.is_closed()
+
+
+def test_close_builds_no_model_or_client() -> None:
+    """``close()`` never builds a model/client; the provider guard is never tripped (AC #3)."""
+    agent = _make_agent("@Manager")
+    assert agent._model is None and agent._http_client is None
+    with patch.object(agent, "_build_model", side_effect=AssertionError("must not build")):
+        agent.close()
+    # Zero-token guarantee preserved across teardown.
+    assert agent._model is None and agent._http_client is None
+
+
+def test_close_cancels_pending_tasks() -> None:
+    """``close()`` cancels stragglers left on the loop before closing it (AC #5)."""
+    agent = _make_agent("@Manager")
+
+    async def forever() -> None:
+        await asyncio.sleep(3600)
+
+    # Schedule a long-lived task on the agent's loop without running it, so it is
+    # still pending when close() runs the cancel step.
+    pending = agent._loop.create_task(forever())
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        agent.close()
+
+    assert pending.cancelled()
+    assert agent._loop.is_closed()
+    messages = [str(w.message) for w in caught]
+    assert not any("pending" in m.lower() for m in messages), messages
+
+
+def test_close_logs_teardown_failure_and_still_closes_loop() -> None:
+    """A failing ``aclose()`` is logged (not raised) and the loop still closes (AC #5)."""
+    import akgentic.llm.loadtest.mock_agent as mock_mod
+
+    async def boom(_self: MockReactAgent) -> None:
+        raise RuntimeError("teardown boom")
+
+    agent = _make_agent("@Manager")
+    with (
+        patch.object(MockReactAgent, "aclose", new=boom),
+        patch.object(mock_mod, "logger") as log,
+    ):
+        # close() must NOT propagate the teardown failure.
+        agent.close()
+
+    log.warning.assert_called_once()
+    assert log.warning.call_args.kwargs.get("exc_info") is True
+    assert agent._loop.is_closed()
+
+
+def test_run_sync_runs_on_owned_loop() -> None:
+    """``run_sync`` runs the coroutine on ``self._loop`` (AC #7)."""
+    used_loop: list[asyncio.AbstractEventLoop] = []
+
+    async def stub_run(*_: Any, **__: Any) -> str:
+        used_loop.append(asyncio.get_running_loop())
+        return "ran-on-owned-loop"
+
+    agent = _make_agent("@Expert")
+    try:
+        with patch.object(MockReactAgent, "run", new=stub_run):
+            first = agent.run_sync("q", deps=_Deps("@Expert"))
+            second = agent.run_sync("q", deps=_Deps("@Expert"))
+        assert first == "ran-on-owned-loop"
+        assert second == "ran-on-owned-loop"
+        assert used_loop == [agent._loop, agent._loop]
+        assert not agent._loop.is_closed()
+    finally:
+        agent.close()
+
+
+def test_run_sync_after_close_raises() -> None:
+    """Calling ``run_sync`` on a closed mock raises (AC #7)."""
+    agent = _make_agent("@Expert")
+    agent.close()
+    with pytest.raises(RuntimeError):
+        agent.run_sync("q", deps=_Deps("@Expert"))
+
+
+def test_real_and_mock_close_without_branching() -> None:
+    """A caller can ``close()`` real and mock with no isinstance/type branch (AC #9)."""
+    real = ReactAgent(
+        config=ReactAgentConfig(model_cfg=ModelConfig(provider="openai", model="gpt-4o"))
+    )
+    mock = _make_agent("@Manager")
+
+    # No isinstance/type/hasattr branch at the call site — only close() is called
+    # on each agent. The real agent never runs (zero token egress).
+    for agent in (real, mock):
+        agent.close()
+        agent.close()  # idempotent second call
+        assert agent._loop.is_closed()
