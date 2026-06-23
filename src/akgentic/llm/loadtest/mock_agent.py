@@ -8,6 +8,7 @@ model or provider is ever built and no real tool is invoked.
 """
 
 import asyncio
+import logging
 import re
 import uuid
 from typing import Any
@@ -32,6 +33,8 @@ from akgentic.llm.loadtest.scenario import (
     load_scenario,
 )
 
+logger = logging.getLogger(__name__)
+
 
 class MockProviderReachedError(RuntimeError):
     """Raised if a provider factory is reached during a mock run (zero-egress guard)."""
@@ -54,11 +57,23 @@ class MockReactAgent:
 
         ``_model``/``_http_client`` stay ``None`` (zero-token guarantee). The
         scenario is resolved from ``config`` and loaded eagerly.
+
+        Args:
+            event_loop: Deprecated — accepted and ignored. The mock creates and
+                owns its own loop (``self._loop``) for drop-in parity with
+                ``ReactAgent``; the passed loop is neither adopted nor used by
+                ``run_sync``.
         """
+        # The mock owns its loop too (drop-in parity over the ReactAgent close
+        # surface): build no client/model, so loop creation can go first. The
+        # deprecated `event_loop=` argument is ignored.
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
+        self._closed = False
+
         self._config = config
         self._deps_type = deps_type
         self._result_type = result_type
-        self._event_loop = event_loop
         self._model: Any = None
         self._http_client: Any = None
 
@@ -99,16 +114,58 @@ class MockReactAgent:
     def run_sync(
         self, user_prompt: Any, deps: Any = None, output_type: type[Any] | None = None
     ) -> Any:
-        """Synchronous wrapper around :meth:`run` (mirrors ``ReactAgent.run_sync``)."""
-        if self._event_loop and self._event_loop.is_running():
-            return self._event_loop.run_until_complete(
-                self.run(user_prompt, deps, output_type)
-            )
-        return asyncio.run(self.run(user_prompt, deps, output_type))
+        """Synchronous wrapper around :meth:`run` (mirrors ``ReactAgent.run_sync``).
+
+        Always runs on the mock's own loop; there is no ``asyncio.run()``
+        fallback. Raises once the agent has been closed.
+
+        Raises:
+            RuntimeError: If the agent has been closed.
+        """
+        if self._closed or self._loop.is_closed():
+            raise RuntimeError("MockReactAgent is closed")
+        return self._loop.run_until_complete(self.run(user_prompt, deps, output_type))
 
     async def aclose(self) -> None:
         """No-op teardown (mirrors ``ReactAgent.aclose``; the mock holds no client)."""
         return None
+
+    def close(self) -> None:
+        """Synchronously tear the mock down; idempotent (mirrors ``ReactAgent.close``).
+
+        Drives the no-op ``aclose()`` on the still-open loop, cancels stragglers,
+        drains async generators and the default executor, then closes the loop in
+        ``finally``. A second call is a harmless no-op; teardown failures are
+        logged, never raised.
+        """
+        loop = self._loop
+        if self._closed or loop.is_closed():
+            return
+        self._closed = True
+        try:
+            if not loop.is_running():
+                loop.run_until_complete(self.aclose())  # 1. async resource teardown
+                self._cancel_pending(loop)  # 2. cancel stragglers
+                loop.run_until_complete(loop.shutdown_asyncgens())  # 3. drain async gens
+                loop.run_until_complete(loop.shutdown_default_executor())
+        except Exception:
+            logger.warning("MockReactAgent.close() teardown failed", exc_info=True)
+        finally:
+            loop.close()  # 4. close the loop
+
+    @staticmethod
+    def _cancel_pending(loop: asyncio.AbstractEventLoop) -> None:
+        """Cancel and await any tasks still pending on ``loop`` before close.
+
+        Local copy of ``ReactAgent._cancel_pending`` — kept self-contained so the
+        mock imports nothing from a sibling package (NFR1).
+        """
+        pending = [t for t in asyncio.all_tasks(loop) if not t.done()]
+        if not pending:
+            return
+        for task in pending:
+            task.cancel()
+        loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
 
     # --- state selection -----------------------------------------------------
 
