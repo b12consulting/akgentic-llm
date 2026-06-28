@@ -14,7 +14,7 @@ def test_no_unexpected_exports():
     # Submodules are always visible via dir() but not in star imports.
     # `loadtest` is an optional-extra subpackage, deliberately absent from __all__.
     submodules = {
-        "agent", "config", "context", "event", "loadtest",
+        "agent", "compaction", "config", "context", "event", "loadtest",
         "pricing", "prompts", "providers",
     }
     exported = {name for name in dir(akgentic.llm) if not name.startswith("_")}
