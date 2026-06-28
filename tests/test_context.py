@@ -12,8 +12,11 @@ from pydantic_ai.messages import (
     ModelResponse,
     SystemPromptPart,
     TextPart,
+    ToolCallPart,
+    ToolReturnPart,
     UserPromptPart,
 )
+from pydantic_ai.usage import RequestUsage
 
 spec = importlib.util.spec_from_file_location(
     "context", Path(__file__).parent.parent / "src" / "akgentic" / "llm" / "context.py"
@@ -24,6 +27,45 @@ spec.loader.exec_module(context_module)  # type: ignore[union-attr]
 ContextManager = context_module.ContextManager
 ContextObserver = context_module.ContextObserver
 LlmMessageEvent = context_module.LlmMessageEvent
+LlmContextCompactedEvent = context_module.LlmContextCompactedEvent
+LlmContextClearedEvent = context_module.LlmContextClearedEvent
+
+
+class EventRecorder:
+    """Observer that records every domain event in emission order."""
+
+    def __init__(self) -> None:
+        self.events: list[object] = []
+
+    def notify_event(self, event: object) -> None:
+        self.events.append(event)
+
+
+def create_tool_call(tool_name: str, call_id: str) -> ModelResponse:
+    """Create an assistant tool-call response for testing."""
+    return ModelResponse(
+        parts=[ToolCallPart(tool_name=tool_name, tool_call_id=call_id, args="{}")]
+    )
+
+
+def create_tool_return(tool_name: str, call_id: str) -> ModelRequest:
+    """Create a tool-return request for testing."""
+    return ModelRequest(
+        parts=[ToolReturnPart(tool_name=tool_name, tool_call_id=call_id, content="ok")]
+    )
+
+
+def make_compacted_event(summary: str, replaced: int) -> LlmContextCompactedEvent:
+    """Build an LlmContextCompactedEvent with the count-based fold fields."""
+    return LlmContextCompactedEvent(
+        run_id=None,
+        strategy_id="summarize",
+        summary=summary,
+        replaced_message_count=replaced,
+        summarizer_prompt_version="v1",
+        tokens_before=None,
+        tokens_after=None,
+    )
 
 
 class MockObserver:
@@ -401,3 +443,163 @@ class TestRecordOperatorAction:
 
         assert len(observer.messages_added) == 1
         assert observer.messages_added[0].parts[0].content == "op"  # type: ignore[attr-defined]
+
+
+class TestLastInputTokens:
+    """ContextManager.last_input_tokens tracks the last response's input tokens (AC 1)."""
+
+    @staticmethod
+    def _response_with_input_tokens(n: int) -> ModelResponse:
+        return ModelResponse(parts=[TextPart(content="ok")], usage=RequestUsage(input_tokens=n))
+
+    def test_none_before_any_usage(self) -> None:
+        """Before any usage-bearing response, last_input_tokens is None."""
+        assert ContextManager().last_input_tokens is None
+
+    def test_set_from_usage_bearing_response(self) -> None:
+        """A ModelResponse with usage sets last_input_tokens to its input_tokens."""
+        manager = ContextManager()
+        manager.add_message(self._response_with_input_tokens(100))
+        assert manager.last_input_tokens == 100
+
+    def test_last_response_wins(self) -> None:
+        """The most recent usage-bearing response wins."""
+        manager = ContextManager()
+        manager.add_message(self._response_with_input_tokens(100))
+        manager.add_message(self._response_with_input_tokens(250))
+        assert manager.last_input_tokens == 250
+
+    def test_non_response_message_leaves_value_unchanged(self) -> None:
+        """A non-response message does not change last_input_tokens."""
+        manager = ContextManager()
+        manager.add_message(self._response_with_input_tokens(100))
+        manager.add_message(create_user_message("a non-response message"))
+        assert manager.last_input_tokens == 100
+
+
+class TestContextManagerCompact:
+    """ContextManager.compact(event) — the mechanical fold (AC 2)."""
+
+    def test_folds_exact_non_system_count_and_inserts_summary(self) -> None:
+        """Removes exactly replaced_message_count non-system messages; inserts one summary."""
+        manager = ContextManager()
+        sys_msg = create_system_message("sys")
+        u1, a1 = create_user_message("u1"), create_assistant_message("a1")
+        u2, u3 = create_user_message("u2"), create_user_message("u3")
+        for m in (sys_msg, u1, a1, u2, u3):
+            manager.add_message(m)
+
+        manager.compact(make_compacted_event("THE SUMMARY", replaced=2))
+
+        msgs = manager.messages
+        assert len(msgs) == 4
+        assert msgs[0] is sys_msg  # system message never folded
+        assert isinstance(msgs[1], ModelRequest)
+        assert isinstance(msgs[1].parts[0], UserPromptPart)
+        assert msgs[1].parts[0].content == "[Conversation summary] THE SUMMARY"
+        assert msgs[2] is u2
+        assert msgs[3] is u3
+
+    def test_never_folds_system_messages_interspersed(self) -> None:
+        """System messages anywhere stay in place; the summary lands at the first fold slot."""
+        manager = ContextManager()
+        s0, s_mid = create_system_message("s0"), create_system_message("s-mid")
+        u1, u2, u3 = create_user_message("u1"), create_user_message("u2"), create_user_message("u3")
+        for m in (s0, u1, s_mid, u2, u3):
+            manager.add_message(m)
+
+        manager.compact(make_compacted_event("S", replaced=2))
+
+        msgs = manager.messages
+        assert len(msgs) == 4
+        assert msgs[0] is s0
+        assert msgs[1].parts[0].content == "[Conversation summary] S"  # type: ignore[union-attr]
+        assert msgs[2] is s_mid
+        assert msgs[3] is u3
+
+    def test_drops_orphan_tool_results_after_fold(self) -> None:
+        """A tool-return orphaned by folding its issuing tool-call is dropped."""
+        manager = ContextManager()
+        u1 = create_user_message("u1")
+        call = create_tool_call("f", "c1")
+        ret = create_tool_return("f", "c1")
+        u2 = create_user_message("u2")
+        for m in (u1, call, ret, u2):
+            manager.add_message(m)
+
+        # Fold u1 + the issuing tool-call; the tool-return is now orphaned.
+        manager.compact(make_compacted_event("S", replaced=2))
+
+        msgs = manager.messages
+        assert len(msgs) == 2
+        assert msgs[0].parts[0].content == "[Conversation summary] S"  # type: ignore[union-attr]
+        assert msgs[1] is u2
+
+    def test_emits_compaction_event_and_no_synthetic_message_event(self) -> None:
+        """compact emits the compaction event but no LlmMessageEvent for the summary."""
+        manager = ContextManager()
+        for m in (
+            create_user_message("u1"),
+            create_user_message("u2"),
+            create_user_message("u3"),
+        ):
+            manager.add_message(m)
+        recorder = EventRecorder()
+        manager.subscribe(recorder)
+
+        event = make_compacted_event("S", replaced=2)
+        manager.compact(event)
+
+        compacted = [e for e in recorder.events if isinstance(e, LlmContextCompactedEvent)]
+        synthetic = [e for e in recorder.events if isinstance(e, LlmMessageEvent)]
+        assert compacted == [event]
+        assert synthetic == []
+
+    def test_zero_count_event_is_clean_noop(self) -> None:
+        """A replaced_message_count == 0 event removes nothing and inserts nothing."""
+        manager = ContextManager()
+        u1, u2 = create_user_message("u1"), create_user_message("u2")
+        manager.add_message(u1)
+        manager.add_message(u2)
+        recorder = EventRecorder()
+        manager.subscribe(recorder)
+
+        event = make_compacted_event("ignored", replaced=0)
+        manager.compact(event)
+
+        assert manager.messages == [u1, u2]
+        assert [e for e in recorder.events if isinstance(e, LlmContextCompactedEvent)] == [event]
+
+
+class TestContextManagerClearContext:
+    """ContextManager.clear_context() — event-based wipe (AC 3)."""
+
+    def test_empties_history_resets_hash_emits_event_returns_count(self) -> None:
+        """Wipes history (system included), resets dedup hash, emits event, returns count."""
+        manager = ContextManager()
+        manager.add_message(create_system_message("sys"))
+        manager.add_message(create_user_message("u1"))
+        manager.add_message(create_user_message("u2"))
+        manager.seed_system_prompt_hash("abc")  # simulate a recorded rendering
+        recorder = EventRecorder()
+        manager.subscribe(recorder)
+
+        removed = manager.clear_context()
+
+        assert removed == 3
+        assert manager.messages == []  # the system ModelRequest is included
+        assert manager._last_system_prompt_hash is None  # dedup hash reset
+        cleared = [e for e in recorder.events if isinstance(e, LlmContextClearedEvent)]
+        assert len(cleared) == 1
+        assert cleared[0].run_id is None
+        assert cleared[0].cleared_message_count == 3
+
+    def test_clear_empty_history_returns_zero(self) -> None:
+        """Clearing an empty history returns 0 and emits a zero-count event."""
+        manager = ContextManager()
+        recorder = EventRecorder()
+        manager.subscribe(recorder)
+
+        assert manager.clear_context() == 0
+        cleared = [e for e in recorder.events if isinstance(e, LlmContextClearedEvent)]
+        assert cleared[0].cleared_message_count == 0

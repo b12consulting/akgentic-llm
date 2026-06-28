@@ -9,8 +9,11 @@ from pydantic_ai.messages import (
     UserPromptPart,
 )
 
+from akgentic.llm.compaction import _drop_orphan_tool_results
 from akgentic.llm.event import (
     ContextObserver,
+    LlmContextClearedEvent,
+    LlmContextCompactedEvent,
     LlmMessageEvent,
     LlmSystemPromptEvent,
     LlmUsageEvent,
@@ -78,6 +81,7 @@ class ContextManager:
         self._observers: list[ContextObserver] = []
         self._last_system_prompt_hash: str | None = None
         self._pending_operator_actions: list[str] = []
+        self._last_input_tokens: int | None = None
 
     @property
     def messages(self) -> list[ModelMessage]:
@@ -89,6 +93,17 @@ class ContextManager:
             Copy of current messages
         """
         return list(self._messages)
+
+    @property
+    def last_input_tokens(self) -> int | None:
+        """Provider-reported ``input_tokens`` of the last usage-bearing response.
+
+        Tracks the most recent ``ModelResponse``'s prompt size — in a multi-step
+        run the final request already reflects the whole accumulated history, so
+        this is the size that re-enters the next turn. The usage-based
+        auto-trigger reads it (no ``tiktoken``). ``None`` before any usage.
+        """
+        return self._last_input_tokens
 
     def _notify(self, event: object) -> None:
         """Notify all observers with a domain event.
@@ -211,6 +226,9 @@ class ContextManager:
         usage = getattr(message, "usage", None)
         if usage is None:
             return
+        # Last usage-bearing response wins; the final multi-step request already
+        # reflects the whole history, so this is the size that re-enters next turn.
+        self._last_input_tokens = usage.input_tokens
         self._notify(
             LlmUsageEvent(
                 run_id=str(getattr(message, "run_id", None) or ""),
@@ -347,6 +365,81 @@ class ContextManager:
         """
         if observer in self._observers:
             self._observers.remove(observer)
+
+    @staticmethod
+    def fold_compaction(
+        messages: list[ModelMessage], event: LlmContextCompactedEvent
+    ) -> list[ModelMessage]:
+        """Fold ``messages`` per ``event``: drop a leading prefix, insert a summary.
+
+        Removes the first ``event.replaced_message_count`` **non-system** messages
+        (counting from the first non-system message) and inserts exactly one
+        synthetic ``ModelRequest`` carrying a ``UserPromptPart`` prefixed
+        ``"[Conversation summary] "`` at the fold point. System messages are never
+        folded (same exemption as the sliding window). Pure and notify-free so the
+        live ``compact`` path and replay fold byte-identically; a final
+        ``_drop_orphan_tool_results`` guards OpenAI's ``role=tool`` adjacency. A
+        ``replaced_message_count <= 0`` event removes and inserts nothing.
+
+        Args:
+            messages: The history to fold.
+            event: The compaction event carrying the summary and fold count.
+
+        Returns:
+            The folded history (a new list; the input is not mutated).
+        """
+        if event.replaced_message_count <= 0:
+            return list(messages)
+        summary_msg = ModelRequest(
+            parts=[UserPromptPart(content=f"[Conversation summary] {event.summary}")]
+        )
+        folded: list[ModelMessage] = []
+        remaining = event.replaced_message_count
+        inserted = False
+        for msg in messages:
+            if _is_system_message(msg):
+                folded.append(msg)
+                continue
+            if remaining > 0:
+                remaining -= 1
+                if not inserted:
+                    folded.append(summary_msg)
+                    inserted = True
+                continue
+            folded.append(msg)
+        return _drop_orphan_tool_results(folded)
+
+    def compact(self, event: LlmContextCompactedEvent) -> None:
+        """Fold the history per ``event`` and emit it (append-only persistence).
+
+        Applies the shared mechanical fold, then notifies observers with the
+        compaction event. The synthetic summary is derivable from the event, so
+        no ``LlmMessageEvent`` is emitted for it — replaying both would
+        double-apply on restore.
+
+        Args:
+            event: The compaction event produced by the strategy + agent.
+        """
+        self._messages = self.fold_compaction(self._messages, event)
+        self._notify(event)
+
+    def clear_context(self) -> int:
+        """Wipe the conversation to empty and reset dedup state (event-based).
+
+        Removes every message — the leading system ``ModelRequest`` included — so
+        the next run's empty ``message_history`` makes pydantic-ai re-inject a
+        fresh dynamic system prompt; resets the ADR-004 dedup hash so that
+        rendering re-emits; emits ``LlmContextClearedEvent`` so replay diverges
+        from neither. Fully synchronous — no LLM, no loop.
+
+        Returns:
+            The number of messages removed.
+        """
+        removed = len(self._messages)
+        self._messages = []
+        self.seed_system_prompt_hash(None)
+        self._notify(LlmContextClearedEvent(None, removed))
+        return removed
 
     def restore(self, messages: list[ModelMessage]) -> None:
         """Replace message history with the provided list.

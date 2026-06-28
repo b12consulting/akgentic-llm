@@ -19,10 +19,25 @@ Key Concepts:
 """
 
 from .agent import ReactAgent, UsageLimitError, UserPrompt
-from .config import HttpClientConfig, ModelConfig, ReactAgentConfig, RuntimeConfig, UsageLimits
+from .compaction import (
+    COMPACTION_STRATEGIES,
+    CompactionResult,
+    CompactionStrategy,
+    create_compaction,
+)
+from .config import (
+    CompactionConfig,
+    HttpClientConfig,
+    ModelConfig,
+    ReactAgentConfig,
+    RuntimeConfig,
+    UsageLimits,
+)
 from .context import ContextManager
 from .event import (
     ContextObserver,
+    LlmContextClearedEvent,
+    LlmContextCompactedEvent,
     LlmMessageEvent,
     LlmSystemPromptEvent,
     LlmUsageEvent,
@@ -51,6 +66,7 @@ __all__ = [
     "RuntimeConfig",
     "HttpClientConfig",
     "ReactAgentConfig",
+    "CompactionConfig",
     # Agent
     "ReactAgent",
     "UsageLimitError",
@@ -64,6 +80,13 @@ __all__ = [
     "SystemPromptPartSnapshot",
     "ToolCallEvent",
     "ToolReturnEvent",
+    # Compaction
+    "LlmContextCompactedEvent",
+    "LlmContextClearedEvent",
+    "CompactionStrategy",
+    "CompactionResult",
+    "COMPACTION_STRATEGIES",
+    "create_compaction",
     # Prompts
     "PromptTemplate",
     "current_datetime_prompt",
