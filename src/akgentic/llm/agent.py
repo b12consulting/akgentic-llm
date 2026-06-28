@@ -10,7 +10,7 @@ from pydantic_ai import UsageLimits as PydanticUsageLimits
 from pydantic_ai.messages import ModelRequest, ModelResponse, ToolReturnPart
 
 from .config import ReactAgentConfig, UsageLimits
-from .context import ContextManager, ContextSnapshot
+from .context import ContextManager
 from .event import ContextObserver, LlmMessageEvent, LlmSystemPromptEvent
 from .providers import create_http_client, create_model, get_output_type
 
@@ -52,7 +52,6 @@ class ReactAgent:
     - REACT pattern support (via pydantic-ai)
     - Dynamic system prompts with registry
     - Context management with observer pattern
-    - Checkpoint/rewind for error recovery
     - Iterative execution with context updates
     - Tool integration
     - Usage limit enforcement
@@ -423,28 +422,6 @@ class ReactAgent:
             observer: Observer implementing ContextObserver protocol
         """
         self._context.subscribe(observer)
-
-    def checkpoint(self, checkpoint_id: str | None = None) -> ContextSnapshot:
-        """Create a checkpoint of current context.
-
-        Args:
-            checkpoint_id: Optional checkpoint ID (auto-generated if None)
-
-        Returns:
-            Created snapshot
-        """
-        return self._context.checkpoint(checkpoint_id)
-
-    def rewind(self, checkpoint_id: str) -> None:
-        """Restore context to a checkpoint.
-
-        Args:
-            checkpoint_id: Checkpoint to restore
-
-        Raises:
-            KeyError: If checkpoint not found
-        """
-        self._context.rewind(checkpoint_id)
 
     def restore_context(self, events: list[Any]) -> None:
         """Restore LLM conversation context from persisted events.

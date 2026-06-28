@@ -242,7 +242,6 @@ class TestReactAgentProperties:
         context = agent.context
         assert context is not None
         assert hasattr(context, "messages")
-        assert hasattr(context, "checkpoint")
 
     def test_pydantic_agent_property(self, minimal_config):
         """Test pydantic_agent property returns pydantic-ai Agent."""
@@ -295,29 +294,11 @@ class TestReactAgentContextMethods:
             # Observer should have been notified
             assert len(observer.events) == 1
 
-    def test_checkpoint_creates_snapshot(self, minimal_config):
-        """Test checkpoint() creates snapshot."""
+    def test_checkpoint_and_rewind_wrappers_removed(self, minimal_config):
+        """ReactAgent no longer exposes checkpoint/rewind wrappers (AC 4)."""
         agent = ReactAgent(config=minimal_config)
-        snapshot = agent.checkpoint("test-checkpoint")
-        assert snapshot is not None
-        assert snapshot.checkpoint_id == "test-checkpoint"
-
-    def test_rewind_restores_context(self, minimal_config):
-        """Test rewind() restores context."""
-        agent = ReactAgent(config=minimal_config)
-
-        # Create checkpoint
-        snapshot = agent.checkpoint("before")
-        assert snapshot.checkpoint_id == "before"
-
-        # Modify context (add a message)
-        test_message = ModelRequest(parts=[UserPromptPart(content="test")])
-        agent.context.add_message(test_message)
-        assert len(agent.context.messages) == 1
-
-        # Rewind
-        agent.rewind("before")
-        assert len(agent.context.messages) == 0
+        assert not hasattr(agent, "checkpoint")
+        assert not hasattr(agent, "rewind")
 
 
 class TestReactAgentSyncMethod:

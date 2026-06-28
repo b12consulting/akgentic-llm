@@ -6,28 +6,12 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 if TYPE_CHECKING:
     from pydantic_ai.messages import ModelMessage
 
-    from akgentic.llm.context import ContextSnapshot
-
 
 @dataclass(frozen=True)
 class LlmMessageEvent:
     """Event emitted when a new model message is added to context."""
 
     message: ModelMessage
-
-
-@dataclass(frozen=True)
-class LlmCheckpointCreatedEvent:
-    """Event emitted when a context checkpoint is created."""
-
-    snapshot: ContextSnapshot
-
-
-@dataclass(frozen=True)
-class LlmCheckpointRestoredEvent:
-    """Event emitted when context is restored from a checkpoint."""
-
-    snapshot: ContextSnapshot
 
 
 @dataclass(frozen=True)

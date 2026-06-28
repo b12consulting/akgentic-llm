@@ -1,12 +1,7 @@
-"""Context management with checkpointing and compactification."""
+"""Context management for LLM conversation history."""
 
-import copy
 import hashlib
-import uuid
-from datetime import datetime
-from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
 from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
@@ -16,8 +11,6 @@ from pydantic_ai.messages import (
 
 from akgentic.llm.event import (
     ContextObserver,
-    LlmCheckpointCreatedEvent,
-    LlmCheckpointRestoredEvent,
     LlmMessageEvent,
     LlmSystemPromptEvent,
     LlmUsageEvent,
@@ -44,43 +37,13 @@ def _is_system_message(msg: ModelMessage) -> bool:
     )
 
 
-class ContextSnapshot(BaseModel):
-    """Immutable snapshot of conversation context.
-
-    Used for checkpoint/rewind functionality. Messages are deep-copied
-    to ensure immutability.
-
-    Attributes:
-        checkpoint_id: Unique checkpoint identifier
-        timestamp: When the checkpoint was created
-        messages: Deep copy of messages at checkpoint
-        metadata: Optional custom metadata
-    """
-
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
-    checkpoint_id: str = Field(..., description="Unique checkpoint identifier")
-    timestamp: datetime = Field(..., description="When checkpoint was created")
-    # FIXME: Using Any instead of list[ModelMessage] due to pydantic-ai 1.60.0 bug
-    # pydantic-ai's ModelMessage dataclasses contain forward refs with AliasChoices
-    # that cause Pydantic schema generation to fail. Should either:
-    # 1. Convert ContextSnapshot to @dataclass(frozen=True) to avoid Pydantic validation
-    # 2. Wait for pydantic-ai fix and restore proper type: list[ModelMessage]
-    messages: Any = Field(..., description="Deep copy of messages (list[ModelMessage])")
-    metadata: dict[str, Any] = Field(default_factory=dict, description="Custom metadata")
-
-
 class ContextManager:
-    """Manages LLM conversation context with checkpointing.
+    """Manages LLM conversation context.
 
     Features:
     - Message history tracking
     - Observer pattern for notifications
-    - Checkpoint/rewind support
     - Sliding window with system message preservation
-
-    This implementation replicates V1's base_agent.py context management
-    with additional checkpoint functionality.
 
     Observer Behavior:
     - Observers are notified synchronously
@@ -93,9 +56,6 @@ class ContextManager:
         >>>
         >>> manager = ContextManager(max_messages=10)
         >>> manager.add_message(ModelRequest(parts=[UserPromptPart(content="Hello")]))
-        >>> snapshot = manager.checkpoint("before-llm-call")
-        >>> # ... LLM interaction ...
-        >>> manager.rewind("before-llm-call")  # Restore if needed
     """
 
     def __init__(
@@ -115,8 +75,6 @@ class ContextManager:
             raise ValueError(f"max_messages must be non-negative, got {max_messages}")
         self._max_messages = max_messages
         self._messages: list[ModelMessage] = []
-        self._checkpoints: dict[str, ContextSnapshot] = {}
-        self._checkpoint_order: list[str] = []
         self._observers: list[ContextObserver] = []
         self._last_system_prompt_hash: str | None = None
         self._pending_operator_actions: list[str] = []
@@ -371,76 +329,6 @@ class ContextManager:
         keep_non_system = max(0, self._max_messages - len(system_msgs))
         self._messages = system_msgs + non_system[-keep_non_system:]
 
-    def checkpoint(
-        self,
-        checkpoint_id: str | None = None,
-        metadata: dict[str, Any] | None = None,
-    ) -> ContextSnapshot:
-        """Create a checkpoint of current context.
-
-        Creates a deep copy of messages for immutable snapshot.
-        Auto-generates UUID if no id provided.
-
-        Args:
-            checkpoint_id: Optional checkpoint identifier (UUID generated if None)
-            metadata: Optional metadata to store with checkpoint
-
-        Returns:
-            Created snapshot
-        """
-        if checkpoint_id is None:
-            checkpoint_id = str(uuid.uuid4())
-
-        snapshot = ContextSnapshot(
-            checkpoint_id=checkpoint_id,
-            timestamp=datetime.now(),
-            messages=copy.deepcopy(self._messages),
-            metadata=metadata or {},
-        )
-
-        self._checkpoints[checkpoint_id] = snapshot
-        self._checkpoint_order.append(checkpoint_id)
-
-        self._notify(LlmCheckpointCreatedEvent(snapshot=snapshot))
-
-        return snapshot
-
-    def rewind(self, checkpoint_id: str) -> None:
-        """Restore context to a checkpoint.
-
-        Replaces current messages with copy from checkpoint.
-        Snapshot already contains deep copy, so no additional deepcopy needed.
-
-        Args:
-            checkpoint_id: Checkpoint to restore
-
-        Raises:
-            KeyError: If checkpoint_id not found
-        """
-        snapshot = self._checkpoints[checkpoint_id]  # Raises KeyError if not found
-        self._messages = list(snapshot.messages)
-
-        self._notify(LlmCheckpointRestoredEvent(snapshot=snapshot))
-
-    def get_checkpoint(self, checkpoint_id: str) -> ContextSnapshot | None:
-        """Get a checkpoint by id.
-
-        Args:
-            checkpoint_id: Checkpoint to retrieve
-
-        Returns:
-            Snapshot if found, None otherwise
-        """
-        return self._checkpoints.get(checkpoint_id)
-
-    def list_checkpoints(self) -> list[str]:
-        """List all checkpoint ids in creation order.
-
-        Returns:
-            List of checkpoint ids
-        """
-        return list(self._checkpoint_order)
-
     def subscribe(self, observer: ContextObserver) -> None:
         """Subscribe an observer to context events.
 
@@ -476,10 +364,8 @@ class ContextManager:
         self._messages = list(messages)
 
     def clear(self) -> None:
-        """Clear all messages and checkpoints.
+        """Clear all messages.
 
-        Resets context to empty state.
+        Resets the message history to empty.
         """
         self._messages.clear()
-        self._checkpoints.clear()
-        self._checkpoint_order.clear()

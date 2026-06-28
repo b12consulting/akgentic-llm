@@ -1,4 +1,4 @@
-"""Tests for context management with checkpointing."""
+"""Tests for context management."""
 
 # Direct import to avoid providers dependency issue temporarily
 import importlib.util
@@ -23,10 +23,7 @@ spec.loader.exec_module(context_module)  # type: ignore[union-attr]
 
 ContextManager = context_module.ContextManager
 ContextObserver = context_module.ContextObserver
-ContextSnapshot = context_module.ContextSnapshot
 LlmMessageEvent = context_module.LlmMessageEvent
-LlmCheckpointCreatedEvent = context_module.LlmCheckpointCreatedEvent
-LlmCheckpointRestoredEvent = context_module.LlmCheckpointRestoredEvent
 
 
 class MockObserver:
@@ -34,17 +31,11 @@ class MockObserver:
 
     def __init__(self) -> None:
         self.messages_added: list[ModelMessage] = []
-        self.checkpoints_created: list[ContextSnapshot] = []
-        self.rewinds: list[ContextSnapshot] = []
 
     def notify_event(self, event: object) -> None:
         """Track typed context events."""
         if isinstance(event, LlmMessageEvent):
             self.messages_added.append(event.message)
-        elif isinstance(event, LlmCheckpointCreatedEvent):
-            self.checkpoints_created.append(event.snapshot)
-        elif isinstance(event, LlmCheckpointRestoredEvent):
-            self.rewinds.append(event.snapshot)
 
 
 def create_user_message(content: str) -> ModelRequest:
@@ -63,39 +54,6 @@ def create_assistant_message(content: str) -> ModelResponse:
         parts=[TextPart(content=content)],
         timestamp=datetime.now(),
     )
-
-
-class TestContextSnapshot:
-    """Test ContextSnapshot model."""
-
-    def test_create_snapshot(self) -> None:
-        """Test creating a snapshot with all fields."""
-        msg = create_user_message("test")
-        timestamp = datetime.now()
-        metadata = {"key": "value"}
-
-        snapshot = ContextSnapshot(
-            checkpoint_id="test-id",
-            timestamp=timestamp,
-            messages=[msg],
-            metadata=metadata,
-        )
-
-        assert snapshot.checkpoint_id == "test-id"
-        assert snapshot.timestamp == timestamp
-        assert len(snapshot.messages) == 1
-        assert snapshot.metadata == metadata
-
-    def test_snapshot_default_metadata(self) -> None:
-        """Test snapshot with default empty metadata."""
-        msg = create_user_message("test")
-        snapshot = ContextSnapshot(
-            checkpoint_id="test-id",
-            timestamp=datetime.now(),
-            messages=[msg],
-        )
-
-        assert snapshot.metadata == {}
 
 
 class TestContextManager:
@@ -143,94 +101,6 @@ class TestContextManager:
         # Original should be unchanged
         assert len(manager.messages) == 1
 
-    def test_checkpoint_auto_generates_uuid(self) -> None:
-        """Test checkpoint auto-generates UUID if no id provided."""
-        manager = ContextManager()
-        manager.add_message(create_user_message("Hello"))
-
-        snapshot = manager.checkpoint()
-
-        assert snapshot.checkpoint_id is not None
-        assert len(snapshot.checkpoint_id) > 0
-        assert len(snapshot.messages) == 1
-
-    def test_checkpoint_with_explicit_id(self) -> None:
-        """Test checkpoint with explicit id."""
-        manager = ContextManager()
-        manager.add_message(create_user_message("Hello"))
-
-        snapshot = manager.checkpoint(checkpoint_id="my-checkpoint")
-
-        assert snapshot.checkpoint_id == "my-checkpoint"
-        assert len(snapshot.messages) == 1
-
-    def test_checkpoint_with_metadata(self) -> None:
-        """Test checkpoint with metadata."""
-        manager = ContextManager()
-        manager.add_message(create_user_message("Hello"))
-        metadata = {"reason": "test", "version": 1}
-
-        snapshot = manager.checkpoint(checkpoint_id="test", metadata=metadata)
-
-        assert snapshot.metadata == metadata
-
-    def test_rewind_restores_messages(self) -> None:
-        """Test rewind restores messages to checkpoint state."""
-        manager = ContextManager()
-        manager.add_message(create_user_message("Message 1"))
-        snapshot = manager.checkpoint(checkpoint_id="checkpoint-1")
-
-        manager.add_message(create_user_message("Message 2"))
-        manager.add_message(create_user_message("Message 3"))
-        assert len(manager.messages) == 3
-
-        manager.rewind("checkpoint-1")
-
-        assert len(manager.messages) == 1
-        assert manager.messages[0] == snapshot.messages[0]
-        assert manager.messages[0].parts[0].content == "Message 1"  # type: ignore[attr-defined]
-
-    def test_rewind_invalid_id_raises_keyerror(self) -> None:
-        """Test rewind with invalid id raises KeyError."""
-        manager = ContextManager()
-        manager.add_message(create_user_message("Hello"))
-
-        with pytest.raises(KeyError):
-            manager.rewind("nonexistent-checkpoint")
-
-    def test_get_checkpoint_returns_snapshot(self) -> None:
-        """Test get_checkpoint returns snapshot for valid id."""
-        manager = ContextManager()
-        manager.add_message(create_user_message("Hello"))
-        original_snapshot = manager.checkpoint(checkpoint_id="test")
-
-        retrieved = manager.get_checkpoint("test")
-
-        assert retrieved is not None
-        assert retrieved.checkpoint_id == original_snapshot.checkpoint_id
-        assert len(retrieved.messages) == 1
-
-    def test_get_checkpoint_returns_none_for_invalid_id(self) -> None:
-        """Test get_checkpoint returns None for invalid id."""
-        manager = ContextManager()
-
-        result = manager.get_checkpoint("nonexistent")
-
-        assert result is None
-
-    def test_list_checkpoints_returns_ids_in_order(self) -> None:
-        """Test list_checkpoints returns ids in creation order."""
-        manager = ContextManager()
-        manager.add_message(create_user_message("Message"))
-
-        manager.checkpoint(checkpoint_id="first")
-        manager.checkpoint(checkpoint_id="second")
-        manager.checkpoint(checkpoint_id="third")
-
-        checkpoint_ids = manager.list_checkpoints()
-
-        assert checkpoint_ids == ["first", "second", "third"]
-
     def test_observer_on_message_added(self) -> None:
         """Test observer on_message_added is called."""
         manager = ContextManager()
@@ -242,33 +112,6 @@ class TestContextManager:
 
         assert len(observer.messages_added) == 1
         assert observer.messages_added[0] == msg
-
-    def test_observer_on_checkpoint_created(self) -> None:
-        """Test observer on_checkpoint_created is called."""
-        manager = ContextManager()
-        observer = MockObserver()
-        manager.subscribe(observer)
-        manager.add_message(create_user_message("Hello"))
-
-        snapshot = manager.checkpoint(checkpoint_id="test")
-
-        assert len(observer.checkpoints_created) == 1
-        assert observer.checkpoints_created[0].checkpoint_id == snapshot.checkpoint_id
-
-    def test_observer_on_rewind(self) -> None:
-        """Test observer on_rewind is called."""
-        manager = ContextManager()
-        observer = MockObserver()
-        manager.subscribe(observer)
-
-        manager.add_message(create_user_message("Message 1"))
-        snapshot = manager.checkpoint(checkpoint_id="test")
-        manager.add_message(create_user_message("Message 2"))
-
-        manager.rewind("test")
-
-        assert len(observer.rewinds) == 1
-        assert observer.rewinds[0].checkpoint_id == snapshot.checkpoint_id
 
     def test_sliding_window_enforces_max_messages(self) -> None:
         """Test sliding window enforces max_messages limit."""
@@ -307,25 +150,6 @@ class TestContextManager:
         assert messages[1].parts[0].content == "User 2"  # type: ignore[attr-defined]
         assert messages[2].parts[0].content == "User 3"  # type: ignore[attr-defined]
 
-    def test_checkpoint_stores_deep_copy(self) -> None:
-        """Test checkpoint stores deep copy of messages."""
-        manager = ContextManager()
-        msg = create_user_message("Original")
-        manager.add_message(msg)
-
-        snapshot = manager.checkpoint(checkpoint_id="test")
-
-        # Modify the original message's content (if mutable parts exist)
-        # Since pydantic models are immutable, we'll add another message
-        manager.add_message(create_user_message("Modified"))
-
-        # Snapshot should still have only 1 message
-        assert len(snapshot.messages) == 1
-        assert snapshot.messages[0].parts[0].content == "Original"  # type: ignore[attr-defined]
-
-        # Manager should have 2 messages
-        assert len(manager.messages) == 2
-
     def test_unsubscribe_stops_notifications(self) -> None:
         """Test unsubscribe stops observer notifications."""
         manager = ContextManager()
@@ -349,39 +173,16 @@ class TestContextManager:
         # Should not raise an error
         manager.unsubscribe(observer)
 
-    def test_clear_empties_messages_and_checkpoints(self) -> None:
-        """Test clear empties messages and checkpoints."""
+    def test_clear_empties_messages(self) -> None:
+        """Test clear() empties the message history."""
         manager = ContextManager()
         manager.add_message(create_user_message("Message 1"))
-        manager.checkpoint(checkpoint_id="checkpoint-1")
         manager.add_message(create_user_message("Message 2"))
-        manager.checkpoint(checkpoint_id="checkpoint-2")
 
         assert len(manager.messages) == 2
-        assert len(manager.list_checkpoints()) == 2
 
         manager.clear()
 
-        assert len(manager.messages) == 0
-        assert len(manager.list_checkpoints()) == 0
-        assert manager.get_checkpoint("checkpoint-1") is None
-        assert manager.get_checkpoint("checkpoint-2") is None
-
-    def test_checkpoint_with_empty_messages(self) -> None:
-        """Test checkpoint works with empty message list."""
-        manager = ContextManager()
-
-        # Checkpoint before any messages added
-        snapshot = manager.checkpoint(checkpoint_id="empty")
-
-        assert len(snapshot.messages) == 0
-        assert snapshot.checkpoint_id == "empty"
-
-        # Should be able to rewind to empty state
-        manager.add_message(create_user_message("Message"))
-        assert len(manager.messages) == 1
-
-        manager.rewind("empty")
         assert len(manager.messages) == 0
 
     def test_sliding_window_with_only_system_messages_exceeding_limit(self) -> None:
@@ -476,8 +277,6 @@ class TestContextManagerRestore:
 
         # Observer should still have only 1 notification (from add_message)
         assert len(observer.messages_added) == 1
-        assert len(observer.checkpoints_created) == 0
-        assert len(observer.rewinds) == 0
 
     def test_restore_does_not_apply_sliding_window(self) -> None:
         """Test restore() does NOT apply sliding window (restored messages are authoritative)."""
@@ -488,28 +287,6 @@ class TestContextManagerRestore:
         manager.restore(msgs)
 
         assert len(manager.messages) == 5
-
-    def test_restore_then_checkpoint_and_rewind(self) -> None:
-        """Test that after restore(), checkpoint() and rewind() still work correctly."""
-        manager = ContextManager()
-
-        # Restore some messages
-        restored = [create_user_message("R1"), create_user_message("R2")]
-        manager.restore(restored)
-        assert len(manager.messages) == 2
-
-        # Checkpoint
-        snapshot = manager.checkpoint(checkpoint_id="after-restore")
-        assert len(snapshot.messages) == 2
-
-        # Add more messages
-        manager.add_message(create_user_message("New"))
-        assert len(manager.messages) == 3
-
-        # Rewind
-        manager.rewind("after-restore")
-        assert len(manager.messages) == 2
-        assert manager.messages[0].parts[0].content == "R1"  # type: ignore[attr-defined]
 
     def test_restore_creates_defensive_copy(self) -> None:
         """Test restore() creates a defensive copy of the input list."""
@@ -532,6 +309,19 @@ class TestContextObserverProtocol:
         assert isinstance(observer, ContextObserver)
 
 
+class TestCheckpointSurfaceRemoved:
+    """The checkpoint/rewind machinery is gone from ContextManager (AC 1, 2)."""
+
+    def test_checkpoint_methods_absent(self) -> None:
+        """No checkpoint/rewind/get_checkpoint/list_checkpoints on ContextManager."""
+        for name in ("checkpoint", "rewind", "get_checkpoint", "list_checkpoints"):
+            assert not hasattr(ContextManager, name)
+
+    def test_context_snapshot_absent(self) -> None:
+        """ContextSnapshot no longer exists in the context module."""
+        assert not hasattr(context_module, "ContextSnapshot")
+
+
 class TestRecordOperatorAction:
     """Test ContextManager.record_operator_action and drain (FR1, FR2a, FR2b, FR3)."""
 
@@ -547,8 +337,6 @@ class TestRecordOperatorAction:
         assert manager.messages == []
         # No LlmMessageEvent (or any tracked event) emitted.
         assert len(observer.messages_added) == 0
-        assert len(observer.checkpoints_created) == 0
-        assert len(observer.rewinds) == 0
 
     def test_buffers_multiple_in_order(self) -> None:
         """FR2a/FR3: multiple pre-run entries buffer in record order."""
