@@ -322,6 +322,40 @@ class TestCompactionConfig:
         assert cfg.summarizer_prompt_version == "v1"
         assert cfg.summary_model_cfg is None
 
+    def test_summary_instructions_default_non_empty(self):
+        """summary_instructions defaults to a non-empty domain-agnostic prompt — AC1."""
+        assert CompactionConfig().summary_instructions.strip() != ""
+
+    def test_summary_instructions_default_is_business_free(self):
+        """The default carries NONE of the legacy HR/payroll terms — AC2."""
+        text = CompactionConfig().summary_instructions.lower()
+        forbidden = [
+            "payco",
+            "dossier",
+            "joint committee",
+            "joined committee",
+            "employee",
+            "customer",
+            "payroll",
+            "salary",
+        ]
+        present = [term for term in forbidden if term in text]
+        assert not present, f"default summary_instructions still carries business terms: {present}"
+
+    def test_summary_instructions_default_keeps_intent_phrases(self):
+        """The default still instructs a Key entities section and verbatim preservation — AC3."""
+        text = CompactionConfig().summary_instructions
+        assert "Key entities" in text
+        assert "verbatim" in text.lower()
+
+    def test_summary_instructions_custom_round_trip(self):
+        """A custom summary_instructions value round-trips via model_dump/validate — AC7."""
+        cfg = CompactionConfig(summary_instructions="CUSTOM-XYZ summarizer guidance")
+        assert cfg.summary_instructions == "CUSTOM-XYZ summarizer guidance"
+        restored = CompactionConfig.model_validate(cfg.model_dump())
+        assert restored == cfg
+        assert restored.summary_instructions == "CUSTOM-XYZ summarizer guidance"
+
     def test_strategy_accepts_arbitrary_fqcn(self):
         """strategy is a plain str — an arbitrary dotted FQCN round-trips unchanged — AC 2."""
         fqcn = "mypkg.compaction.HeadlineCompaction"

@@ -244,32 +244,8 @@ def _drop_orphan_tool_results(messages: list[ModelMessage]) -> list[ModelMessage
 
 
 # ---------------------------------------------------------------------------
-# Summary instructions + formatting helpers
+# Summary formatting helpers
 # ---------------------------------------------------------------------------
-
-_SUMMARY_INSTRUCTIONS = """\
-You are a conversation summarizer. Given a sequence of messages from a conversation
-between a user and an AI assistant, produce a concise summary that preserves:
-
-1. **Person and entity names** — employee names, customer names, PayCo names, company names.
-   These MUST be preserved verbatim; they are frequently referenced later in the conversation.
-2. **Key identifiers** — case numbers, customer IDs, dossier numbers, \
-employee IDs, joint committees.
-3. **The original request/question** — what the user initially asked about. Summarize the core
-   question in full so the agent never needs to ask again.
-4. **Key facts and decisions** made during the conversation — answers found, conclusions reached.
-5. **Important context** — dates, amounts, specific data retrieved from tools.
-6. **Tool calls and their outcomes** — what tools were called, what was found.
-7. **Unanswered questions or pending items**
-
-Rules:
-- Be concise but do NOT omit any critical information
-- Use bullet points for clarity
-- Preserve specific numbers, names, and identifiers VERBATIM — never paraphrase a name or ID
-- Start the summary with a "Key entities" section listing all person names, IDs, and identifiers
-- This summary will replace the original messages in the agent's context window
-- Do NOT include any preamble like "Here is the summary" — just output the summary
-"""
 
 
 def _format_request_part(part: Any) -> str | None:
@@ -404,7 +380,7 @@ class SummarizingCompaction:
         if self._summarizer is None:
             self._summarizer = Agent(
                 model=create_model(self._model_cfg, self._http_client),
-                instructions=_SUMMARY_INSTRUCTIONS,
+                instructions=self._cfg.summary_instructions,
                 output_type=str,
             )
         return self._summarizer

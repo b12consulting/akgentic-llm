@@ -104,6 +104,34 @@ class ModelConfig(BaseModel):
     )
 
 
+#: Domain-agnostic default system prompt for the summarizing compaction strategy.
+#: Downstream callers may override it via ``CompactionConfig.summary_instructions``.
+#: Defined here (not in compaction.py) because compaction.py imports config.py — a
+#: reverse import would be circular.
+_DEFAULT_SUMMARY_INSTRUCTIONS = """\
+You are a conversation summarizer. Given a sequence of messages from a conversation
+between a user and an AI assistant, produce a concise summary that preserves:
+
+1. **Named entities** — people, organizations, products, and places. These MUST be
+   preserved verbatim; they are frequently referenced later in the conversation.
+2. **Key identifiers** — reference numbers, record/case IDs, and any other identifiers.
+3. **The original request/question** — what the user initially asked about. Summarize the core
+   question in full so the agent never needs to ask again.
+4. **Key facts and decisions** made during the conversation — answers found, conclusions reached.
+5. **Important context** — dates, amounts, specific data retrieved from tools.
+6. **Tool calls and their outcomes** — what tools were called, what was found.
+7. **Unanswered questions or pending items**
+
+Rules:
+- Be concise but do NOT omit any critical information
+- Use bullet points for clarity
+- Preserve specific numbers, names, and identifiers VERBATIM — never paraphrase a name or ID
+- Start the summary with a "Key entities" section listing all named entities and identifiers
+- This summary will replace the original messages in the agent's context window
+- Do NOT include any preamble like "Here is the summary" — just output the summary
+"""
+
+
 class CompactionConfig(BaseModel):
     """Configuration for pluggable LLM context compaction.
 
@@ -117,6 +145,8 @@ class CompactionConfig(BaseModel):
         keep_recent_messages: Trailing messages preserved verbatim (counts messages, not pairs).
         summary_target_tokens: Token budget the summarizer aims for.
         summarizer_prompt_version: Version tag of the summarizer prompt.
+        summary_instructions: System instructions for the summarizer; the default is
+            domain-agnostic. Override to supply domain-specific guidance without subclassing.
         summary_model_cfg: Optional model for summarization; None reuses the agent's model_cfg.
     """
 
@@ -138,6 +168,11 @@ class CompactionConfig(BaseModel):
 
     summarizer_prompt_version: str = Field(
         default="v1", description="Version tag of the summarizer prompt"
+    )
+
+    summary_instructions: str = Field(
+        default=_DEFAULT_SUMMARY_INSTRUCTIONS,
+        description="System instructions for the summarizer; default is domain-agnostic.",
     )
 
     summary_model_cfg: ModelConfig | None = Field(

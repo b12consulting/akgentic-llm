@@ -408,7 +408,8 @@ async def test_summarizing_prompt_carries_target_tokens_and_conversation() -> No
     assert "FIND_DOSSIER_42" in prompt
 
 
-def test_build_summarizer_wires_instructions(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_build_summarizer_wires_default_instructions(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Default-config summarizer is wired with cfg.summary_instructions — AC4, AC6."""
     captured: dict[str, object] = {}
 
     def fake_agent(**kwargs: object) -> _StubSummarizer:
@@ -417,11 +418,33 @@ def test_build_summarizer_wires_instructions(monkeypatch: pytest.MonkeyPatch) ->
 
     monkeypatch.setattr(comp, "create_model", lambda mc, hc=None: object())
     monkeypatch.setattr(comp, "Agent", fake_agent)
-    strat = SummarizingCompaction(CompactionConfig(), ModelConfig(), None)
+    cfg = CompactionConfig()
+    strat = SummarizingCompaction(cfg, ModelConfig(), None)
     built = strat._build_summarizer()
     assert strat._build_summarizer() is built  # cached on first build
-    assert captured["instructions"] is comp._SUMMARY_INSTRUCTIONS
+    assert captured["instructions"] == cfg.summary_instructions
     assert captured["output_type"] is str
+
+
+def test_build_summarizer_wires_custom_instructions(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Custom summary_instructions reaches the summarizer Agent end-to-end — AC4."""
+    captured: dict[str, object] = {}
+
+    def fake_agent(**kwargs: object) -> _StubSummarizer:
+        captured.update(kwargs)
+        return _StubSummarizer()
+
+    monkeypatch.setattr(comp, "create_model", lambda mc, hc=None: object())
+    monkeypatch.setattr(comp, "Agent", fake_agent)
+    cfg = CompactionConfig(summary_instructions="CUSTOM-XYZ instructions for the summarizer")
+    strat = SummarizingCompaction(cfg, ModelConfig(), None)
+    strat._build_summarizer()
+    assert captured["instructions"] == "CUSTOM-XYZ instructions for the summarizer"
+
+
+def test_module_no_longer_exposes_summary_instructions_constant() -> None:
+    """The hardcoded module constant is gone; the prompt lives on the config — AC5."""
+    assert not hasattr(comp, "_SUMMARY_INSTRUCTIONS")
 
 
 # ---------------------------------------------------------------------------
