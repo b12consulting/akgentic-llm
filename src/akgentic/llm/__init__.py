@@ -21,6 +21,7 @@ Key Concepts:
 from .agent import ReactAgent, UsageLimitError, UserPrompt
 from .compaction import (
     COMPACTION_STRATEGIES,
+    SUMMARY_INSTRUCTIONS,
     CompactionResult,
     CompactionStrategy,
     create_compaction,
@@ -86,6 +87,7 @@ __all__ = [
     "CompactionStrategy",
     "CompactionResult",
     "COMPACTION_STRATEGIES",
+    "SUMMARY_INSTRUCTIONS",
     "create_compaction",
     # Prompts
     "PromptTemplate",

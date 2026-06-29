@@ -409,7 +409,7 @@ async def test_summarizing_prompt_carries_target_tokens_and_conversation() -> No
 
 
 def test_build_summarizer_wires_default_instructions(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Default-config summarizer is wired with cfg.summary_instructions — AC4, AC6."""
+    """Default-config (v1) summarizer is wired with the registry's default instructions."""
     captured: dict[str, object] = {}
 
     def fake_agent(**kwargs: object) -> _StubSummarizer:
@@ -418,16 +418,17 @@ def test_build_summarizer_wires_default_instructions(monkeypatch: pytest.MonkeyP
 
     monkeypatch.setattr(comp, "create_model", lambda mc, hc=None: object())
     monkeypatch.setattr(comp, "Agent", fake_agent)
-    cfg = CompactionConfig()
-    strat = SummarizingCompaction(cfg, ModelConfig(), None)
+    strat = SummarizingCompaction(CompactionConfig(), ModelConfig(), None)
     built = strat._build_summarizer()
     assert strat._build_summarizer() is built  # cached on first build
-    assert captured["instructions"] == cfg.summary_instructions
+    assert captured["instructions"] == comp.SUMMARY_INSTRUCTIONS["v1"]
+    assert captured["instructions"] == comp._DEFAULT_SUMMARY_INSTRUCTIONS
     assert captured["output_type"] is str
 
 
-def test_build_summarizer_wires_custom_instructions(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Custom summary_instructions reaches the summarizer Agent end-to-end — AC4."""
+def test_build_summarizer_resolves_instructions_by_version(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The programmatic override seam: a registered prompt version is resolved from
+    SUMMARY_INSTRUCTIONS and reaches the Agent. The config/start event carries only the id."""
     captured: dict[str, object] = {}
 
     def fake_agent(**kwargs: object) -> _StubSummarizer:
@@ -436,15 +437,54 @@ def test_build_summarizer_wires_custom_instructions(monkeypatch: pytest.MonkeyPa
 
     monkeypatch.setattr(comp, "create_model", lambda mc, hc=None: object())
     monkeypatch.setattr(comp, "Agent", fake_agent)
-    cfg = CompactionConfig(summary_instructions="CUSTOM-XYZ instructions for the summarizer")
-    strat = SummarizingCompaction(cfg, ModelConfig(), None)
-    strat._build_summarizer()
-    assert captured["instructions"] == "CUSTOM-XYZ instructions for the summarizer"
+    comp.SUMMARY_INSTRUCTIONS["custom-test"] = "CUSTOM-XYZ instructions for the summarizer"
+    try:
+        cfg = CompactionConfig(summarizer_prompt_version="custom-test")
+        SummarizingCompaction(cfg, ModelConfig(), None)._build_summarizer()
+        assert captured["instructions"] == "CUSTOM-XYZ instructions for the summarizer"
+    finally:
+        del comp.SUMMARY_INSTRUCTIONS["custom-test"]
 
 
-def test_module_no_longer_exposes_summary_instructions_constant() -> None:
-    """The hardcoded module constant is gone; the prompt lives on the config — AC5."""
+def test_build_summarizer_unknown_version_falls_back_to_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unregistered prompt version falls back to the domain-agnostic default."""
+    captured: dict[str, object] = {}
+
+    def fake_agent(**kwargs: object) -> _StubSummarizer:
+        captured.update(kwargs)
+        return _StubSummarizer()
+
+    monkeypatch.setattr(comp, "create_model", lambda mc, hc=None: object())
+    monkeypatch.setattr(comp, "Agent", fake_agent)
+    cfg = CompactionConfig(summarizer_prompt_version="does-not-exist")
+    SummarizingCompaction(cfg, ModelConfig(), None)._build_summarizer()
+    assert captured["instructions"] == comp._DEFAULT_SUMMARY_INSTRUCTIONS
+
+
+def test_summary_instructions_registry_default_business_free_and_keeps_intent() -> None:
+    """The old hardcoded constant is gone; the registry's "v1" default is domain-agnostic
+    (no HR/payroll terms) yet preserves the summary intent."""
     assert not hasattr(comp, "_SUMMARY_INSTRUCTIONS")
+    assert "v1" in comp.SUMMARY_INSTRUCTIONS
+    text = comp.SUMMARY_INSTRUCTIONS["v1"]
+    assert text == comp._DEFAULT_SUMMARY_INSTRUCTIONS
+    lowered = text.lower()
+    forbidden = [
+        "payco",
+        "dossier",
+        "joint committee",
+        "joined committee",
+        "employee",
+        "customer",
+        "payroll",
+        "salary",
+    ]
+    present = [term for term in forbidden if term in lowered]
+    assert not present, f"default summary instructions still carry business terms: {present}"
+    assert "Key entities" in text
+    assert "verbatim" in lowered
 
 
 # ---------------------------------------------------------------------------

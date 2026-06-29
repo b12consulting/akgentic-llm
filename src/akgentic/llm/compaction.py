@@ -244,6 +244,43 @@ def _drop_orphan_tool_results(messages: list[ModelMessage]) -> list[ModelMessage
 
 
 # ---------------------------------------------------------------------------
+# Summarizer instructions: domain-agnostic default + override registry
+# ---------------------------------------------------------------------------
+
+#: Domain-agnostic default summarizer system prompt. Business-free by design.
+_DEFAULT_SUMMARY_INSTRUCTIONS = """\
+You are a conversation summarizer. Given a sequence of messages from a conversation
+between a user and an AI assistant, produce a concise summary that preserves:
+
+1. **Named entities** — people, organizations, products, and places. These MUST be
+   preserved verbatim; they are frequently referenced later in the conversation.
+2. **Key identifiers** — reference numbers, record/case IDs, and any other identifiers.
+3. **The original request/question** — what the user initially asked about. Summarize the core
+   question in full so the agent never needs to ask again.
+4. **Key facts and decisions** made during the conversation — answers found, conclusions reached.
+5. **Important context** — dates, amounts, specific data retrieved from tools.
+6. **Tool calls and their outcomes** — what tools were called, what was found.
+7. **Unanswered questions or pending items**
+
+Rules:
+- Be concise but do NOT omit any critical information
+- Use bullet points for clarity
+- Preserve specific numbers, names, and identifiers VERBATIM — never paraphrase a name or ID
+- Start the summary with a "Key entities" section listing all named entities and identifiers
+- This summary will replace the original messages in the agent's context window
+- Do NOT include any preamble like "Here is the summary" — just output the summary
+"""
+
+#: Public, mutable registry: prompt-version id -> summarizer instructions text.
+#: Keyed by ``CompactionConfig.summarizer_prompt_version`` so the serialized config
+#: (echoed in every start event) carries only the small id, never the full prompt.
+#: Override programmatically before any agent is built (open-extension precedent:
+#: ``COMPACTION_STRATEGIES``) — replace ``"v1"`` in place, or register a new id and
+#: point ``summarizer_prompt_version`` at it. An unknown id falls back to the default.
+SUMMARY_INSTRUCTIONS: dict[str, str] = {"v1": _DEFAULT_SUMMARY_INSTRUCTIONS}
+
+
+# ---------------------------------------------------------------------------
 # Summary formatting helpers
 # ---------------------------------------------------------------------------
 
@@ -376,11 +413,18 @@ class SummarizingCompaction:
         self._summarizer: Agent[None, str] | None = None
 
     def _build_summarizer(self) -> Agent[None, str]:
-        """Build (and cache) the summarizer pydantic-ai Agent. Overridable in tests."""
+        """Build (and cache) the summarizer pydantic-ai Agent. Overridable in tests.
+
+        Instructions are resolved from the ``SUMMARY_INSTRUCTIONS`` registry by the
+        config's ``summarizer_prompt_version`` (unknown id → domain-agnostic default).
+        """
         if self._summarizer is None:
+            instructions = SUMMARY_INSTRUCTIONS.get(
+                self._cfg.summarizer_prompt_version, _DEFAULT_SUMMARY_INSTRUCTIONS
+            )
             self._summarizer = Agent(
                 model=create_model(self._model_cfg, self._http_client),
-                instructions=self._cfg.summary_instructions,
+                instructions=instructions,
                 output_type=str,
             )
         return self._summarizer
