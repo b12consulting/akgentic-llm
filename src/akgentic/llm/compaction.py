@@ -48,9 +48,12 @@ class CompactionResult:
 
     Attributes:
         summary: The produced summary text (empty when nothing was folded).
-        replaced_message_count: Leading non-system messages this summary stands in for.
+        replaced_message_count: Observability count of folded non-system messages. On the
+            ``summarize`` path it is *not* the fold boundary (that path folds everything
+            non-system); it still doubles as the no-op signal (``0`` ⇒ nothing to compact).
         tokens_after: Optional post-compaction token estimate over the retained context
-            (system + summary + tail). ``None`` when nothing was folded (NoOp / empty middle).
+            (``summarize`` ⇒ system + summary, no tail; sliding ⇒ system + summary + tail).
+            ``None`` when nothing was folded (NoOp / no foldable content).
     """
 
     summary: str
@@ -438,40 +441,45 @@ class SummarizingCompaction:
         return self._summarizer
 
     async def compact(self, messages: list[ModelMessage]) -> CompactionResult:
-        system, middle, tail = _split_messages(messages, self._cfg.keep_recent_messages)
-        if not middle:
+        """Full-fold the conversation into one summary (ADR-010 §9).
+
+        Summarizes **every non-system part across the whole history** (part-level —
+        ``_format_messages_for_summary`` skips ``SystemPromptPart``s), so the post-fold
+        context is ``[system parts] + [summary]`` with no ``keep_recent`` tail.
+        ``keep_recent_messages`` is ignored here (a ``SlidingWindowCompaction`` knob);
+        ``replaced_message_count`` is an observability count, not the fold boundary.
+        """
+        system = [m for m in messages if _is_system_message(m)]
+        replaced = sum(1 for m in messages if not _is_system_message(m))
+        if replaced == 0:
             return CompactionResult(summary="", replaced_message_count=0, tokens_after=None)
         prompt = (
             f"Summarize the following conversation in at most "
             f"~{self._cfg.summary_target_tokens} tokens.\n\n"
-            f"---\n{_format_messages_for_summary(middle)}\n---"
+            f"---\n{_format_messages_for_summary(messages)}\n---"
         )
         try:
             output = (await self._build_summarizer().run(prompt)).output
         except Exception:
-            return self._truncation_fallback(system, middle, tail)
+            return self._truncation_fallback(system, replaced)
         return CompactionResult(
             summary=output,
-            replaced_message_count=len(middle),
-            tokens_after=_estimate_retained(system, output, tail),
+            replaced_message_count=replaced,
+            tokens_after=_estimate_retained(system, output, []),
         )
 
     def _truncation_fallback(
-        self,
-        system: list[ModelMessage],
-        middle: list[ModelMessage],
-        tail: list[ModelMessage],
+        self, system: list[ModelMessage], replaced: int
     ) -> CompactionResult:
-        """Count-based degrade-to-truncation (no tiktoken): fold the whole middle."""
-        count = len(middle)
+        """Count-based degrade-to-truncation (no tiktoken): fold all non-system content."""
         summary = (
-            f"[NOTE: {count} earlier conversation message(s) were "
+            f"[NOTE: {replaced} earlier conversation message(s) were "
             f"truncated to fit the context window.]"
         )
         return CompactionResult(
             summary=summary,
-            replaced_message_count=count,
-            tokens_after=_estimate_retained(system, summary, tail),
+            replaced_message_count=replaced,
+            tokens_after=_estimate_retained(system, summary, []),
         )
 
 
