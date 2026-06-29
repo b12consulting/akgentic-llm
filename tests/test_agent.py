@@ -1228,6 +1228,20 @@ class TestReactAgentManualCompact:
         assert [e for e in observer.events if isinstance(e, LlmContextCompactedEvent)] == []
         assert len(agent.context.messages) == 1
 
+    @pytest.mark.asyncio
+    async def test_emitted_event_carries_strategy_tokens_after(self, minimal_config):
+        """Story 12-4: the strategy's tokens_after is forwarded onto the emitted event."""
+        observer = MockObserver()
+        agent = ReactAgent(config=minimal_config, observer=observer)
+        agent._compaction = _RecordingCompaction(CompactionResult("S", 1, tokens_after=123))
+        agent._context.add_message(ModelRequest(parts=[UserPromptPart(content="u1")]))
+
+        await agent._compact_now()
+
+        events = [e for e in observer.events if isinstance(e, LlmContextCompactedEvent)]
+        assert len(events) == 1
+        assert events[0].tokens_after == 123
+
 
 class TestReactAgentClearContextWrapper:
     """Sync clear_context() wrapper (AC 7)."""

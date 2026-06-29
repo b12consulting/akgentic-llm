@@ -49,7 +49,8 @@ class CompactionResult:
     Attributes:
         summary: The produced summary text (empty when nothing was folded).
         replaced_message_count: Leading non-system messages this summary stands in for.
-        tokens_after: Optional post-compaction token estimate (always ``None`` for built-ins).
+        tokens_after: Optional post-compaction token estimate over the retained context
+            (system + summary + tail). ``None`` when nothing was folded (NoOp / empty middle).
     """
 
     summary: str
@@ -322,6 +323,36 @@ def _format_messages_for_summary(messages: list[ModelMessage]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Retained-context token estimate (ADR-010 §1: display-only, tokenizer-free)
+# ---------------------------------------------------------------------------
+
+
+def _estimate_tokens(text: str) -> int:
+    """Cheap, dependency-free token estimate (~4 chars/token, no ``tiktoken``).
+
+    A display estimate for observability — never the auto-compaction trigger,
+    which reads provider-reported usage.
+    """
+    return len(text) // 4
+
+
+def _join_message_text(messages: list[ModelMessage]) -> str:
+    """Concatenate best-effort text across every part of *messages*."""
+    return "\n".join(_extract_text_from_part(part) for msg in messages for part in msg.parts)
+
+
+def _estimate_retained(
+    system: list[ModelMessage], summary: str, tail: list[ModelMessage]
+) -> int:
+    """Estimate the post-compaction context size: system parts + summary + retained tail."""
+    return (
+        _estimate_tokens(_join_message_text(system))
+        + _estimate_tokens(summary)
+        + _estimate_tokens(_join_message_text(tail))
+    )
+
+
+# ---------------------------------------------------------------------------
 # Built-in strategies
 # ---------------------------------------------------------------------------
 
@@ -340,11 +371,12 @@ class SlidingWindowCompaction:
         self._keep_recent = keep_recent_messages
 
     async def compact(self, messages: list[ModelMessage]) -> CompactionResult:
-        _system, middle, _tail = _split_messages(messages, self._keep_recent)
+        system, middle, tail = _split_messages(messages, self._keep_recent)
         replaced = len(middle)
         summary = f"[Sliding window: dropped {replaced} earlier message(s)]" if replaced else ""
+        tokens_after = _estimate_retained(system, summary, tail) if replaced else None
         return CompactionResult(
-            summary=summary, replaced_message_count=replaced, tokens_after=None
+            summary=summary, replaced_message_count=replaced, tokens_after=tokens_after
         )
 
 
@@ -378,7 +410,7 @@ class SummarizingCompaction:
         return self._summarizer
 
     async def compact(self, messages: list[ModelMessage]) -> CompactionResult:
-        _system, middle, _tail = _split_messages(messages, self._cfg.keep_recent_messages)
+        system, middle, tail = _split_messages(messages, self._cfg.keep_recent_messages)
         if not middle:
             return CompactionResult(summary="", replaced_message_count=0, tokens_after=None)
         prompt = (
@@ -389,21 +421,29 @@ class SummarizingCompaction:
         try:
             output = (await self._build_summarizer().run(prompt)).output
         except Exception:
-            return self._truncation_fallback(middle)
+            return self._truncation_fallback(system, middle, tail)
         return CompactionResult(
-            summary=output, replaced_message_count=len(middle), tokens_after=None
+            summary=output,
+            replaced_message_count=len(middle),
+            tokens_after=_estimate_retained(system, output, tail),
         )
 
-    def _truncation_fallback(self, middle: list[ModelMessage]) -> CompactionResult:
+    def _truncation_fallback(
+        self,
+        system: list[ModelMessage],
+        middle: list[ModelMessage],
+        tail: list[ModelMessage],
+    ) -> CompactionResult:
         """Count-based degrade-to-truncation (no tiktoken): fold the whole middle."""
         count = len(middle)
+        summary = (
+            f"[NOTE: {count} earlier conversation message(s) were "
+            f"truncated to fit the context window.]"
+        )
         return CompactionResult(
-            summary=(
-                f"[NOTE: {count} earlier conversation message(s) were "
-                f"truncated to fit the context window.]"
-            ),
+            summary=summary,
             replaced_message_count=count,
-            tokens_after=None,
+            tokens_after=_estimate_retained(system, summary, tail),
         )
 
 

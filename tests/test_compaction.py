@@ -197,7 +197,8 @@ async def test_sliding_window_drops_head_with_marker() -> None:
     result = await SlidingWindowCompaction(2).compact(msgs)
     assert result.replaced_message_count == 4
     assert "dropped 4" in result.summary
-    assert result.tokens_after is None
+    # Story 12-4: a folding sliding window reports a non-null retained-context estimate.
+    assert result.tokens_after is not None and result.tokens_after > 0
 
 
 async def test_sliding_window_nothing_to_drop_is_zero_replacement() -> None:
@@ -367,7 +368,8 @@ async def test_summarizing_awaits_run_never_run_sync() -> None:
     result = await strat.compact([_user("a"), _assistant("b"), _user("c")])
     assert result.replaced_message_count == 2
     assert result.summary == "THE SUMMARY"
-    assert result.tokens_after is None
+    # Story 12-4: the summary path reports a retained-context estimate.
+    assert result.tokens_after is not None
     stub.run.assert_awaited_once()
     stub.run_sync.assert_not_called()
 
@@ -390,7 +392,8 @@ async def test_summarizing_falls_back_to_truncation_on_error() -> None:
     result = await strat.compact([_user("a"), _assistant("b"), _user("c")])
     assert result.replaced_message_count == 2
     assert "truncated to fit the context window" in result.summary
-    assert result.tokens_after is None
+    # Story 12-4: the truncation fallback also reports a retained-context estimate.
+    assert result.tokens_after is not None
     stub.run_sync.assert_not_called()
 
 
@@ -437,3 +440,60 @@ def test_module_imports_no_akgentic_sibling_and_no_tiktoken() -> None:
     # intra-package imports are relative (.config/.providers) -> never surface as "akgentic.*"
     assert not any(name.startswith("akgentic") for name in imported)
     assert "tiktoken" not in imported
+
+
+# ---------------------------------------------------------------------------
+# Story 12-4 — retained-context tokens_after estimate (ADR-010 §1)
+# ---------------------------------------------------------------------------
+
+
+def test_estimate_tokens_is_len_div_four() -> None:
+    assert comp._estimate_tokens("") == 0
+    assert comp._estimate_tokens("abc") == 0  # 3 // 4
+    assert comp._estimate_tokens("abcd") == 1
+    assert comp._estimate_tokens("a" * 41) == 10
+
+
+def test_estimate_retained_sums_system_summary_and_tail() -> None:
+    system = [_sys("s" * 40)]  # 10 tokens
+    tail = [_user("u" * 20)]  # 5 tokens
+    assert comp._estimate_retained(system, "x" * 8, tail) == 10 + 2 + 5
+
+
+async def test_summarizing_tokens_after_positive_and_below_full_estimate() -> None:
+    # A large middle replaced by a short summary => retained estimate well below the
+    # full-history estimate (the whole point of compaction). AC 1.
+    msgs: list[ModelMessage] = [
+        _sys("s" * 40),
+        _user("x" * 400),
+        _assistant("y" * 400),
+        _user("recent question"),
+    ]
+    strat = SummarizingCompaction(CompactionConfig(keep_recent_messages=1), ModelConfig(), None)
+    strat._summarizer = _StubSummarizer("short summary")  # type: ignore[assignment]
+    result = await strat.compact(msgs)
+    full_estimate = comp._estimate_tokens(comp._join_message_text(msgs))
+    assert result.tokens_after is not None
+    assert result.tokens_after > 0
+    assert result.tokens_after < full_estimate
+
+
+async def test_truncation_fallback_reports_nonnull_tokens_after() -> None:
+    # Summarizer error path still yields a non-null estimate over marker + tail. AC 2.
+    strat = SummarizingCompaction(CompactionConfig(keep_recent_messages=1), ModelConfig(), None)
+    stub = MagicMock()
+    stub.run = AsyncMock(side_effect=RuntimeError("boom"))
+    stub.run_sync = MagicMock()
+    strat._summarizer = stub  # type: ignore[assignment]
+    result = await strat.compact([_user("a" * 200), _assistant("b" * 200), _user("recent")])
+    assert result.tokens_after is not None
+    assert result.tokens_after > 0
+
+
+async def test_sliding_window_tokens_after_matches_retained_estimate() -> None:
+    # AC 3: SlidingWindowCompaction reports a non-null estimate over its retained content.
+    msgs: list[ModelMessage] = [_sys("s" * 40)] + [_user(f"u{i}" * 10) for i in range(6)]
+    result = await SlidingWindowCompaction(2).compact(msgs)
+    system, _middle, tail = _split_messages(msgs, 2)
+    assert result.tokens_after == comp._estimate_retained(system, result.summary, tail)
+    assert result.tokens_after is not None and result.tokens_after > 0
