@@ -5,11 +5,10 @@ import hashlib
 from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
-    SystemPromptPart,
     UserPromptPart,
 )
 
-from akgentic.llm.compaction import _drop_orphan_tool_results
+from akgentic.llm.compaction import _drop_orphan_tool_results, _is_system_message
 from akgentic.llm.event import (
     ContextObserver,
     LlmContextClearedEvent,
@@ -21,23 +20,6 @@ from akgentic.llm.event import (
     ToolCallEvent,
     ToolReturnEvent,
 )
-
-
-def _is_system_message(msg: ModelMessage) -> bool:
-    """Check if a message is a system message.
-
-    System messages contain SystemPromptPart and should be preserved
-    during sliding window operations.
-
-    Args:
-        msg: Message to check
-
-    Returns:
-        True if message is a system message
-    """
-    return isinstance(msg, ModelRequest) and any(
-        isinstance(part, SystemPromptPart) for part in msg.parts
-    )
 
 
 class ContextManager:
