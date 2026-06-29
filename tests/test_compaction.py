@@ -24,6 +24,7 @@ from pydantic_ai.messages import (
 )
 
 import akgentic.llm.compaction as comp
+import akgentic.llm.context as ctx
 from akgentic.llm.compaction import (
     COMPACTION_STRATEGIES,
     CompactionResult,
@@ -37,10 +38,13 @@ from akgentic.llm.compaction import (
     _format_response_part,
     _has_tool_call,
     _has_tool_return,
+    _is_system_message,
     _split_messages,
     create_compaction,
 )
 from akgentic.llm.config import CompactionConfig, ModelConfig
+from akgentic.llm.context import ContextManager
+from akgentic.llm.event import LlmContextCompactedEvent, LlmMessageEvent
 
 # ---------------------------------------------------------------------------
 # Message builders
@@ -560,3 +564,184 @@ async def test_sliding_window_tokens_after_matches_retained_estimate() -> None:
     system, _middle, tail = _split_messages(msgs, 2)
     assert result.tokens_after == comp._estimate_retained(system, result.summary, tail)
     assert result.tokens_after is not None and result.tokens_after > 0
+
+
+# ---------------------------------------------------------------------------
+# Story 12-6 — single is-system predicate across split + fold (ADR-010 §9)
+# ---------------------------------------------------------------------------
+
+
+def _mixed(sys_text: str, user_text: str) -> ModelRequest:
+    """The /clear-then-operator-action shape: one ModelRequest with system + user parts."""
+    return ModelRequest(
+        parts=[SystemPromptPart(content=sys_text), UserPromptPart(content=user_text)]
+    )
+
+
+def _mixed_history() -> list[ModelMessage]:
+    """Mixed system+user head, then a tool pair the boundary guard keeps in the tail.
+
+    With ``keep_recent=2`` the split is: system=[m0]; middle=[m1, m2];
+    tail=[m3(call), m4(return), m5] (the guard pulls the m3 call back to pair with m4).
+    """
+    return [
+        _mixed("backstory", "first user turn"),  # m0 — mixed system+user (never-fold)
+        _user("u1"),  # m1 — summarizable middle
+        _assistant("a1"),  # m2 — summarizable middle
+        _calls(("workspace_write", "c1")),  # m3 — tool call (boundary-guarded into tail)
+        _returns(("workspace_write", "c1")),  # m4 — its tool return
+        _user("u2"),  # m5 — recent tail
+    ]
+
+
+def _compacted_12_6(summary: str, replaced: int) -> LlmContextCompactedEvent:
+    return LlmContextCompactedEvent(
+        run_id=None,
+        strategy_id="sliding_window",
+        summary=summary,
+        replaced_message_count=replaced,
+        summarizer_prompt_version="v1",
+        tokens_before=None,
+        tokens_after=None,
+    )
+
+
+class _Story126Recorder:
+    """Observer recording every emitted domain event in order."""
+
+    def __init__(self) -> None:
+        self.events: list[object] = []
+
+    def notify_event(self, event: object) -> None:
+        self.events.append(event)
+
+
+def _shape_12_6(messages: list[ModelMessage]) -> list[tuple[str, tuple[tuple[str, object], ...]]]:
+    """Timestamp-independent projection: (message type, ((part type, content), ...))."""
+    return [
+        (
+            type(m).__name__,
+            tuple((type(p).__name__, getattr(p, "content", None)) for p in m.parts),
+        )
+        for m in messages
+    ]
+
+
+def test_split_exempts_mixed_system_user_message() -> None:
+    """AC1: the any-part rule pulls a mixed system+user ModelRequest into system_prompts."""
+    history = _mixed_history()
+    system, middle, tail = _split_messages(history, 2)
+    assert system == [history[0]]  # mixed message exempt
+    assert middle == [history[1], history[2]]  # only the summarizable middle counts
+    assert tail == [history[3], history[4], history[5]]  # tool pair kept verbatim
+
+
+@pytest.mark.parametrize(
+    ("msg", "is_system"),
+    [
+        (_sys("pure system"), True),
+        (_mixed("sys", "user"), True),
+        (_user("just user"), False),
+        (ModelRequest(parts=[]), False),  # any([]) is False — non-system on both sides
+    ],
+    ids=["pure-system", "mixed-system-user", "no-system", "empty-parts"],
+)
+def test_is_system_predicate_single_source_and_parity(
+    msg: ModelMessage, is_system: bool
+) -> None:
+    """AC6: one predicate object, shared by both call sites; split partition agrees with it."""
+    # Single source of truth: context delegates to compaction's predicate (same object).
+    assert ctx._is_system_message is _is_system_message
+    assert _is_system_message(msg) is is_system
+    # The _split_messages system partition agrees with the never-fold classifier.
+    fillers: list[ModelMessage] = [_user(f"f{i}") for i in range(4)]
+    system, _middle, _tail = _split_messages([msg, *fillers], 2)
+    assert any(m is msg for m in system) is is_system
+
+
+async def test_mixed_message_exempt_on_split_and_fold() -> None:
+    """AC2/AC3: count and fold cover the same middle; the tool pair survives intact."""
+    history = _mixed_history()
+    keep = 2
+
+    sliding = await SlidingWindowCompaction(keep).compact(history)
+    summ_strat = SummarizingCompaction(
+        CompactionConfig(keep_recent_messages=keep), ModelConfig(), None
+    )
+    summ_strat._summarizer = _StubSummarizer("SUM")  # type: ignore[assignment]
+    summ = await summ_strat.compact(history)
+
+    # Both strategies exempt the mixed message — the count is len(middle)=2, not 3.
+    assert sliding.replaced_message_count == 2
+    assert summ.replaced_message_count == 2
+
+    event = _compacted_12_6(sliding.summary, sliding.replaced_message_count)
+    folded = ContextManager.fold_compaction(history, event)
+
+    assert len(folded) == 5
+    assert folded[0] is history[0]  # mixed message never folded
+    summary_msg = folded[1]
+    assert isinstance(summary_msg, ModelRequest)
+    assert isinstance(summary_msg.parts[0], UserPromptPart)
+    assert summary_msg.parts[0].content.startswith("[Conversation summary]")
+    assert folded[2] is history[3]  # tool_call intact
+    assert folded[3] is history[4]  # tool_return intact
+    assert folded[4] is history[5]
+
+    # AC3: no orphan — the call/return pair is whole, so _drop_orphan removes nothing.
+    assert _drop_orphan_tool_results(folded) == folded
+    assert comp._tool_call_issued_ids(folded[2]) == {"c1"}
+    assert comp._tool_result_call_ids(folded[3]) == {"c1"}
+
+
+async def test_mixed_message_live_compact_equals_sequence_replay() -> None:
+    """AC4: live ContextManager.compact equals the sequence-order event-log replay fold."""
+    history = _mixed_history()
+    sliding = await SlidingWindowCompaction(2).compact(history)
+    event = _compacted_12_6(sliding.summary, sliding.replaced_message_count)
+
+    live = ContextManager()
+    recorder = _Story126Recorder()
+    live.subscribe(recorder)
+    for m in history:
+        live.add_message(m)
+    live.compact(event)
+
+    # Sequence-order replay: LlmMessageEvent -> append; LlmContextCompactedEvent -> fold.
+    replay: list[ModelMessage] = []
+    for emitted in recorder.events:
+        if isinstance(emitted, LlmContextCompactedEvent):
+            replay = ContextManager.fold_compaction(replay, emitted)
+        elif isinstance(emitted, LlmMessageEvent):
+            replay.append(emitted.message)
+
+    assert _shape_12_6(replay) == _shape_12_6(live.messages)
+    # The mixed message and the tool pair survived in the reconstructed context.
+    assert len(live.messages) == 5
+    assert live.messages[2] is history[3] and live.messages[3] is history[4]
+
+
+async def test_no_system_history_still_folds_exact_count() -> None:
+    """AC5: a history with no SystemPromptPart still folds exactly replaced_message_count."""
+    history: list[ModelMessage] = [_user(f"u{i}") for i in range(5)]
+    sliding = await SlidingWindowCompaction(2).compact(history)
+    assert sliding.replaced_message_count == 3  # middle = first 3 of 5, keep_recent=2
+
+    event = _compacted_12_6(sliding.summary, sliding.replaced_message_count)
+    folded = ContextManager.fold_compaction(history, event)
+    # summary + last two originals
+    assert len(folded) == 3
+    assert folded[1] is history[3]
+    assert folded[2] is history[4]
+
+
+async def test_pure_system_head_still_exempt() -> None:
+    """AC5: a pure-system ModelRequest is still never summarized, counted, or folded."""
+    sys_msg = _sys("pure")
+    history: list[ModelMessage] = [sys_msg, *[_user(f"u{i}") for i in range(4)]]
+    sliding = await SlidingWindowCompaction(2).compact(history)
+    assert sliding.replaced_message_count == 2  # 4 non-system, keep 2 -> middle is 2
+
+    event = _compacted_12_6(sliding.summary, sliding.replaced_message_count)
+    folded = ContextManager.fold_compaction(history, event)
+    assert folded[0] is sys_msg  # pure-system head never folded

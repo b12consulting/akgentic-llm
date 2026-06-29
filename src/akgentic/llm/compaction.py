@@ -93,11 +93,18 @@ def _extract_text_from_part(part: Any) -> str:
     return str(part)
 
 
-def _is_system_prompt_message(msg: ModelMessage) -> bool:
-    """Return True if the message is a pure system-prompt injection."""
+def _is_system_message(msg: ModelMessage) -> bool:
+    """Return True if *msg* is a ``ModelRequest`` with **any** ``SystemPromptPart``.
+
+    The single canonical "a compaction must never fold this" predicate, shared by
+    ``_split_messages`` (strategy split) and ``context.fold_compaction`` /
+    ``context._apply_window`` (mechanical fold). The ``any``-part rule classifies a
+    mixed system+user ``ModelRequest`` (the /clear-then-operator-action shape) as
+    system on both sides, so the count and the fold cover identical messages.
+    """
     if not isinstance(msg, ModelRequest):
         return False
-    return all(isinstance(p, SystemPromptPart) for p in msg.parts)
+    return any(isinstance(p, SystemPromptPart) for p in msg.parts)
 
 
 def _is_tool_result_part(part: Any) -> TypeGuard[ToolReturnPart | RetryPromptPart]:
@@ -145,8 +152,9 @@ def _split_messages(
 ) -> tuple[list[ModelMessage], list[ModelMessage], list[ModelMessage]]:
     """Split messages into (system_prompts, summarizable_middle, recent_tail).
 
-    * ``system_prompts`` — ALL system-prompt-only ``ModelRequest``s from anywhere in
-      the conversation (durable context that must never be summarized away).
+    * ``system_prompts`` — every ``ModelRequest`` carrying any ``SystemPromptPart``
+      from anywhere in the conversation (durable context that must never be
+      summarized away), classified with the shared ``_is_system_message`` predicate.
     * ``summarizable_middle`` — the bulk of the conversation that can be summarized.
     * ``recent_tail`` — the last *keep_recent* non-system messages (kept verbatim).
 
@@ -156,12 +164,12 @@ def _split_messages(
     symmetric guard pulls a trailing ``ModelResponse`` from middle when its issued ids
     are answered by tool-results already in tail.
     """
-    # 1. Extract ALL system-prompt-only messages from anywhere in the list so injected
+    # 1. Extract every system-bearing message from anywhere in the list so injected
     #    context (memory notes, anchors, restart markers) is never summarized away.
     system_prompts: list[ModelMessage] = []
     rest: list[ModelMessage] = []
     for msg in messages:
-        if _is_system_prompt_message(msg):
+        if _is_system_message(msg):
             system_prompts.append(msg)
         else:
             rest.append(msg)
