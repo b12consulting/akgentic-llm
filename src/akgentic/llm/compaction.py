@@ -3,9 +3,9 @@
 Defines the async ``CompactionStrategy`` Protocol, the frozen ``CompactionResult``,
 a public mutable ``COMPACTION_STRATEGIES`` registry with a ``create_compaction``
 resolver (registry id, else a dotted FQCN via stdlib ``importlib``), and three
-built-in strategies. ``SummarizingCompaction`` is a faithful port of sdworx-core's
-``utils/history_summarization.py`` algorithm, adapted to akgentic: the summarizer is
-``await``-ed (never ``run_sync``) and reuses the agent's shared httpx client.
+built-in strategies. ``SummarizingCompaction`` implements an LLM history-summarization
+algorithm: the summarizer is ``await``-ed (never ``run_sync``) and reuses the agent's
+shared httpx client.
 
 Imports no akgentic sibling package — the FQCN escape hatch uses stdlib ``importlib``.
 """
@@ -71,7 +71,7 @@ class CompactionStrategy(Protocol):
 
 
 # ---------------------------------------------------------------------------
-# Message-classification helpers (ported verbatim from sdworx)
+# Message-classification helpers
 # ---------------------------------------------------------------------------
 
 
@@ -244,7 +244,7 @@ def _drop_orphan_tool_results(messages: list[ModelMessage]) -> list[ModelMessage
 
 
 # ---------------------------------------------------------------------------
-# Summary instructions + formatting helpers (ported verbatim from sdworx)
+# Summary instructions + formatting helpers
 # ---------------------------------------------------------------------------
 
 _SUMMARY_INSTRUCTIONS = """\
@@ -381,7 +381,7 @@ class SlidingWindowCompaction:
 
 
 class SummarizingCompaction:
-    """Faithful sdworx port: summarize the middle via an awaited LLM.
+    """Summarize the middle via an awaited LLM.
 
     Falls back to a count-based truncation marker (never raises) when the summarizer
     errors. Built from ``model_cfg`` on the agent's shared httpx client; the summarizer

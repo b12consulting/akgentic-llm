@@ -1,4 +1,4 @@
-"""Tests for the compaction strategy seam, registry, and sdworx port (Story 12-2)."""
+"""Tests for the compaction strategy seam, registry, and summarizer (Story 12-2)."""
 
 from __future__ import annotations
 
