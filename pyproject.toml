@@ -30,6 +30,9 @@ dev = [
     "mypy>=1.8.0",
     "ruff>=0.1.0",
     "types-PyYAML>=6.0",
+    # Test-only: several test modules import akgentic.core. akgentic-llm itself
+    # must not depend on core, so it stays out of [project.dependencies].
+    "akgentic-core>=1.5.0",
 ]
 
 [build-system]
