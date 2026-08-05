@@ -1,0 +1,185 @@
+name: Publish to PyPI
+
+# Publishes this distribution to TestPyPI or PyPI using Trusted Publishing
+# (OIDC). No API token is stored: PyPI verifies this workflow's identity at
+# upload time and mints a short-lived one.
+#
+# PyPI-side setup, once per index, BEFORE the first publish:
+#   PyPI -> Publishing -> "Add a new pending publisher"
+#     Owner:            b12consulting
+#     Repository name:  akgentic-llm
+#     Workflow name:    publish-pypi.yml   <- this file's name; renaming it
+#                                             breaks the publisher config
+#     Environment:      pypi               (or testpypi on TestPyPI)
+#
+# Each package lives in its own repository, so the (repository, workflow,
+# environment) triple is already unique per project — every publisher can be
+# registered up front, with no serialized one-at-a-time bootstrap.
+#
+# Name and version are read from pyproject.toml, so bump the version first.
+# PyPI never allows re-uploading a version: a botched upload burns that
+# number permanently.
+#
+# Copying this to a sibling package: only the "Repository name" comment above
+# needs editing — every step derives the project name from pyproject.toml.
+#
+# This file differs from akgentic-core's by one step: the akgentic dependency
+# floor check below. core declares no akgentic dependencies and cannot acquire
+# any (it sits at the bottom of the module boundary), so the step would be
+# permanently inert there.
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Index to publish to"
+        type: choice
+        options:
+          - testpypi
+          - pypi
+        default: testpypi
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    # Gates the upload behind the environment's protection rules, and is part
+    # of the identity PyPI checks. Must match the publisher's Environment.
+    environment: ${{ inputs.target }}
+    permissions:
+      # Declaring any permissions block zeroes every scope not listed, so
+      # checkout needs contents:read stated explicitly here.
+      contents: read
+      # Required for the OIDC exchange — without it the action cannot prove
+      # which workflow it is.
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.1.0
+        with:
+          version: "latest"
+
+      - name: Set up Python 3.12
+        run: uv python install 3.12
+
+      - name: Read name and version from pyproject.toml
+        id: dist
+        run: |
+          NAME=$(grep -m1 -E '^name = ' pyproject.toml | sed -E 's/name = "(.*)"/\1/')
+          VERSION=$(grep -m1 -E '^version = ' pyproject.toml | sed -E 's/version = "(.*)"/\1/')
+          echo "Distribution: $NAME $VERSION"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      # Fail loudly on an unbumped version rather than skip it silently. This
+      # repo publishes one deliberate release per run, so a version that is
+      # already on the index is a forgotten bump, not a no-op. Runs before the
+      # build so the failure is immediate.
+      - name: Verify version is not already on the index
+        env:
+          NAME: ${{ steps.dist.outputs.name }}
+          VERSION: ${{ steps.dist.outputs.version }}
+          HOST: ${{ inputs.target == 'testpypi' && 'test.pypi.org' || 'pypi.org' }}
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' \
+            "https://${HOST}/pypi/${NAME}/${VERSION}/json")
+          if [ "$code" = "200" ]; then
+            echo "::error::${NAME} ${VERSION} is already on ${HOST}. Bump the version in pyproject.toml."
+            exit 1
+          fi
+          echo "${NAME} ${VERSION} is free on ${HOST} (HTTP ${code})."
+
+      # This package declares akgentic-* floors, and nothing sequences the seven
+      # package repositories against each other: each publishes on its own
+      # dispatch. Publishing while a declared floor is missing from the index
+      # produces a distribution that cannot be installed, and PyPI metadata is
+      # immutable — that version number is then burned for good.
+      #
+      # PyPI only. A TestPyPI run rehearses packaging, not resolvability, and the
+      # sibling packages are not mirrored there.
+      - name: Verify akgentic dependency floors are on PyPI
+        if: inputs.target == 'pypi'
+        run: |
+          python3 <<'PY'
+          import re
+          import sys
+          import tomllib
+          import urllib.error
+          import urllib.request
+
+          with open("pyproject.toml", "rb") as fh:
+              project = tomllib.load(fh)["project"]
+
+          own = project["name"]
+          requirements = list(project.get("dependencies", []))
+          for extra in project.get("optional-dependencies", {}).values():
+              requirements.extend(extra)
+
+          # akgentic-tool[docs]>=1.6.0  ->  ("akgentic-tool", "1.6.0")
+          pattern = re.compile(r"^(akgentic-[a-z-]+)(?:\[[^\]]*\])?\s*>=\s*([^\s,;]+)")
+
+          # Every distinct (name, floor) pair, not the highest floor per package:
+          # comparing versions correctly needs more than string ordering, and
+          # checking each declared floor is both simpler and stricter.
+          floors = {
+              (match.group(1), match.group(2))
+              for requirement in requirements
+              if (match := pattern.match(requirement.strip())) and match.group(1) != own
+          }
+
+          if not floors:
+              print("No akgentic dependency floors declared — nothing to check.")
+              sys.exit(0)
+
+          missing = []
+          for name, floor in sorted(floors):
+              url = f"https://pypi.org/pypi/{name}/{floor}/json"
+              try:
+                  with urllib.request.urlopen(url, timeout=30) as response:
+                      ok = response.status == 200
+              except urllib.error.HTTPError as exc:
+                  if exc.code != 404:
+                      raise
+                  ok = False
+              print(f"  {'ok  ' if ok else 'MISS'} {name}>={floor}")
+              if not ok:
+                  missing.append(f"{name}>={floor}")
+
+          if missing:
+              print(
+                  "::error::Declared floors are not on PyPI: "
+                  + ", ".join(missing)
+                  + ". Publish those packages first — this distribution would be "
+                  "uninstallable, and the version could not be reused."
+              )
+              sys.exit(1)
+
+          print(f"All {len(floors)} akgentic dependency floors are published.")
+          PY
+
+      - name: Build sdist and wheel
+        run: uv build --out-dir dist/
+
+      - name: Check metadata
+        run: uvx twine check dist/*
+
+      - name: Verify exactly one sdist and one wheel
+        run: |
+          ls -1 dist/
+          count=$(ls -1 dist/ | wc -l)
+          if [ "$count" -ne 2 ]; then
+            echo "::error::Expected 2 files (sdist + wheel), found $count"
+            exit 1
+          fi
+
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+          repository-url: >-
+            ${{ inputs.target == 'testpypi'
+                && 'https://test.pypi.org/legacy/'
+                || 'https://upload.pypi.org/legacy/' }}
+          print-hash: true
