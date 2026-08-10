@@ -165,6 +165,56 @@ class TestReactAgentInit:
         agent = ReactAgent(config=minimal_config, result_type=CustomResult)
         assert agent is not None
 
+    def test_init_with_capabilities_present_in_root_capability(self, minimal_config):
+        """A supplied capability is present in the constructed Agent's public capability surface."""
+        from pydantic_ai.capabilities import Capability
+
+        cap = Capability(id="custom-cap")
+        agent = ReactAgent(config=minimal_config, capabilities=[cap])
+        assert cap in agent.pydantic_agent.root_capability.capabilities
+
+    def test_capabilities_omitted_equals_explicit_empty_list(self, minimal_config):
+        """Omitting `capabilities` is behaviourally identical to passing `capabilities=[]`."""
+        agent_omitted = ReactAgent(config=minimal_config)
+        agent_explicit_empty = ReactAgent(config=minimal_config, capabilities=[])
+        assert (
+            agent_omitted.pydantic_agent.root_capability.capabilities
+            == agent_explicit_empty.pydantic_agent.root_capability.capabilities
+        )
+
+
+class TestReactAgentCapabilityHook:
+    """AC8: a supplied capability's before_model_request hook fires during a real run()."""
+
+    @pytest.mark.asyncio
+    async def test_before_model_request_hook_fires_during_run(self, minimal_config):
+        """The capability chain runs for real — not just accepted into the signature."""
+        from pydantic_ai.capabilities import AbstractCapability
+        from pydantic_ai.messages import ModelResponse, TextPart
+        from pydantic_ai.models.function import AgentInfo, FunctionModel
+
+        class _RecordingCapability(AbstractCapability):
+            """Minimal capability recording whether before_model_request fired."""
+
+            def __init__(self) -> None:
+                self.invoked = False
+
+            async def before_model_request(self, ctx, request_context):
+                self.invoked = True
+                return request_context
+
+        cap = _RecordingCapability()
+        agent = ReactAgent(config=minimal_config, capabilities=[cap])
+
+        def stub_model(messages: list, info: AgentInfo) -> ModelResponse:
+            return ModelResponse(parts=[TextPart(content="ok")])
+
+        with agent.pydantic_agent.override(model=FunctionModel(stub_model)):
+            result = await agent.run("hello")
+
+        assert cap.invoked is True
+        assert result == "ok"
+
 
 class TestReactAgentRun:
     """Test ReactAgent.run() method."""

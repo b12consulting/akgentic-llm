@@ -11,8 +11,10 @@ import asyncio
 import logging
 import re
 import uuid
+from collections.abc import Sequence
 from typing import Any
 
+from pydantic_ai import AgentCapability
 from pydantic_ai.messages import (
     ModelRequest,
     ModelResponse,
@@ -51,6 +53,7 @@ class MockReactAgent:
         toolsets: list[Any] | None = None,
         result_type: type[Any] = str,
         observer: ContextObserver | None = None,
+        capabilities: Sequence[AgentCapability[Any]] | None = None,
         event_loop: asyncio.AbstractEventLoop | None = None,
     ) -> None:
         """Mirror ``ReactAgent.__init__`` without building a model or provider.
@@ -59,6 +62,9 @@ class MockReactAgent:
         scenario is resolved from ``config`` and loaded eagerly.
 
         Args:
+            capabilities: Accepted and ignored, mirroring the ``event_loop``
+                accept-and-ignore pattern below — the mock never builds a
+                ``pydantic_ai.Agent``, so there is nothing to forward this to.
             event_loop: Deprecated — accepted and ignored. The mock creates and
                 owns its own loop (``self._loop``) for drop-in parity with
                 ``ReactAgent``; the passed loop is neither adopted nor used by
