@@ -20,6 +20,7 @@ call any LLM without coupling to a specific vendor or framework primitive.
   - [ReactAgentConfig](#reactagentconfig)
 - [Providers](#providers)
 - [ReactAgent API](#reactagent-api)
+- [Capabilities](#capabilities)
 - [Multimodal Prompts](#multimodal-prompts)
 - [Context Management](#context-management)
   - [ContextManager](#contextmanager)
@@ -267,6 +268,7 @@ class ReactAgent:
         toolsets: list[Any] | None = None,    # MCP server toolsets
         result_type: type[Any] = str,         # default output type
         observer: ContextObserver | None = None,
+        capabilities: Sequence[AgentCapability[Any]] | None = None,  # pydantic-ai AgentCapability sequence
         event_loop: asyncio.AbstractEventLoop | None = None,
     ) -> None: ...
 
@@ -292,6 +294,50 @@ class ReactAgent:
 
 `output_type` in `run()` overrides the construction-time `result_type` for that call only.
 Both are wrapped with `get_output_type()` to apply the provider-aware `NativeOutput` strategy.
+
+## Capabilities
+
+`capabilities` is an optional constructor argument on `ReactAgent` (accepted-and-ignored on
+`MockReactAgent`) — a sequence of pydantic-ai `AgentCapability` instances, forwarded unchanged
+to the wrapped `Agent(...)` as `capabilities or []`. Omitting it is behaviourally identical to
+today: `[]` is already `Agent`'s own default.
+
+**Why it exists.** [Context Compaction](#context-compaction) and
+[System Prompt Rendering Events](#system-prompt-rendering-events) now cover history
+summarization, orphan `role=tool` dropping, and system-prompt dedup — the things consumers
+used to reach capabilities for. What's left, and what `akgentic-llm` deliberately does not
+own, is **domain-specific history transformation** — e.g. injecting a deployment's
+source-reference block (ADR-011 §Division of responsibility). `capabilities` is the supported
+seam for that, replacing a workaround that reached three private attributes across two
+libraries.
+
+**Example** — `ProcessHistory` is a built-in pydantic-ai capability that wraps a plain
+message-transforming function via `before_model_request`, exactly the domain-specific-
+transformation use case ADR-011 names:
+
+```python
+from pydantic_ai.capabilities import ProcessHistory
+from akgentic.llm import ReactAgent, ReactAgentConfig, ModelConfig
+
+def inject_source_reference(messages):
+    """Domain-specific history transformation — not a framework concern."""
+    # ... prepend a deployment's source-reference block, etc.
+    return messages
+
+agent = ReactAgent(
+    config=ReactAgentConfig(model_cfg=ModelConfig(provider="openai", model="gpt-4o")),
+    capabilities=[ProcessHistory(processor=inject_source_reference)],
+)
+```
+
+**Ordering caveats — neither is guessable from the signature:**
+- A capability's `before_model_request` hook runs **after** compaction: `ContextManager`
+  rewrites messages first, the result is passed as `message_history`, and only then does the
+  capability chain run. A capability sees only the **post-compaction** history — it never sees
+  what compaction folded away.
+- The framework does **not** re-run its orphan `role=tool` fold after capabilities run. A
+  capability that reintroduces one — e.g. by splitting a tool call/return pair while injecting
+  content — produces a request OpenAI rejects.
 
 ## Multimodal Prompts
 
