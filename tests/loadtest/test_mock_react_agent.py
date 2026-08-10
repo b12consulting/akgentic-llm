@@ -111,6 +111,30 @@ def test_drop_in_surface() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Epic 13 — `capabilities` constructor-argument parity (accept-and-ignore)
+# ---------------------------------------------------------------------------
+
+
+def test_capabilities_accepted_and_ignored() -> None:
+    """`capabilities=[...]` constructs without error and does not change run() output."""
+    from pydantic_ai.capabilities import Capability
+
+    cap = Capability(id="custom-cap")
+
+    without_caps = MockReactAgent(config=_make_config("@Manager"))
+    with_caps = MockReactAgent(config=_make_config("@Manager"), capabilities=[cap])
+
+    out_without = without_caps.run_sync(
+        "sandpile please", deps=_Deps("@Manager"), output_type=_StructuredOutput
+    )
+    out_with = with_caps.run_sync(
+        "sandpile please", deps=_Deps("@Manager"), output_type=_StructuredOutput
+    )
+
+    assert out_with.messages == out_without.messages
+
+
+# ---------------------------------------------------------------------------
 # FR2 — zero tokens, no egress
 # ---------------------------------------------------------------------------
 

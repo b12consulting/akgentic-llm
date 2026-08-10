@@ -3,9 +3,10 @@
 import asyncio
 import logging
 import traceback
+from collections.abc import Sequence
 from typing import Any, cast
 
-from pydantic_ai import Agent, BinaryContent, UsageLimitExceeded
+from pydantic_ai import Agent, AgentCapability, BinaryContent, UsageLimitExceeded
 from pydantic_ai import UsageLimits as PydanticUsageLimits
 from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, ToolReturnPart
 
@@ -89,6 +90,7 @@ class ReactAgent:
         toolsets: list[Any] | None = None,
         result_type: type[Any] = str,
         observer: ContextObserver | None = None,
+        capabilities: Sequence[AgentCapability[Any]] | None = None,
         event_loop: asyncio.AbstractEventLoop | None = None,
     ) -> None:
         """Initialize REACT agent.
@@ -100,6 +102,18 @@ class ReactAgent:
             toolsets: List of toolsets (optional, e.g., MCP servers)
             result_type: Type for agent result validation (default: str)
             observer: Context observer to register automatically (optional)
+            capabilities: Optional sequence of pydantic-ai AgentCapability instances,
+                forwarded unchanged to the wrapped Agent(...) as `capabilities or []`.
+                Ordering is fixed: a capability's before_model_request hook runs AFTER
+                compaction — ContextManager rewrites messages first, the result is
+                passed as message_history, and only then does the capability chain
+                run. Two consequences, neither guessable from the signature:
+                - A capability sees only the POST-compaction history; it never sees
+                  what compaction folded away.
+                - The framework does not re-run its orphan role=tool fold after
+                  capabilities run. A capability that reintroduces one (e.g. by
+                  splitting a tool call/return pair while injecting content) will
+                  produce a request OpenAI rejects.
             event_loop: Deprecated — accepted and ignored. The agent creates and
                 owns its own loop (``self._loop``); the passed loop is neither
                 adopted nor used by ``run_sync``. Kept in the signature for one
@@ -162,6 +176,7 @@ class ReactAgent:
             end_strategy=config.runtime_cfg.end_strategy,
             output_type=wrapped_result_type,
             instrument=None,
+            capabilities=capabilities or [],
         )
 
     async def run(
