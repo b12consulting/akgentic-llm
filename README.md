@@ -203,13 +203,16 @@ Spans **every run the agent performs**, not one call.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `agent_request_limit` | `int \| None` | `None` | Max `run()` calls over the agent's lifetime |
-| `input_tokens_limit` | `int \| None` | `None` | Declared for shape symmetry — **never enforced** |
-| `output_tokens_limit` | `int \| None` | `None` | Declared for shape symmetry — **never enforced** |
-| `total_tokens_limit` | `int \| None` | `None` | Declared for shape symmetry — **never enforced** |
+| `input_tokens_limit` | `int \| None` | `None` | Max input tokens over the agent's lifetime |
+| `output_tokens_limit` | `int \| None` | `None` | Max output tokens over the agent's lifetime |
+| `total_tokens_limit` | `int \| None` | `None` | Max total tokens over the agent's lifetime |
 
-`agent_request_limit` is checked **before** each `run()` executes. Once the agent has
-used its budget, every further call raises `UsageLimitError` — the same class a run-tier
-breach raises — with a message of the form
+Both halves are checked **before** each `run()` executes — tokens first, so a token
+refusal costs no run budget — against counters the agent accumulates over its lifetime and
+recomputes from persisted usage events on restore.
+
+`agent_request_limit`: once the agent has used its budget, every further call raises
+`UsageLimitError` — the same class a run-tier breach raises — with a message of the form
 `Exceeded the agent_request_limit of 100 (run_count=100)`.
 
 Four consequences worth knowing before you set it:
@@ -229,13 +232,25 @@ Four consequences worth knowing before you set it:
   count reflects the runs that actually reached the model. Deliberate — a run that produced
   nothing consumed nothing.
 
-The three inherited token fields are never enforced at all — they exist only so both tiers
-have the same shape.
+The three token limits bound the agent's **lifetime** spend, summed across every run.
+Breaching one raises `UsageLimitError` with pydantic-ai's own message text — e.g.
+`Exceeded the total_tokens_limit of 1000000 (total_tokens=1000420)` — the same shape a
+run-tier breach produces, so nothing downstream has to parse text to tell the tiers apart.
+
+Two consequences here too:
+
+- **A run may overshoot the budget.** A run's token cost is unknown until it finishes, so
+  the limit governs where a run may *start*, not where it may end. The run that crosses the
+  line completes and returns normally; the next one is refused. Set the limit below the
+  spend you actually want to cap if the last run could be expensive.
+- **Resuming does not reset it**, for the same reason the run counter survives:
+  `restore_context()` sums the agent's persisted usage events. Unlike the counter, tokens
+  sum over *events* — a run with three model round-trips counts once but spends three times.
 
 ```python
 from akgentic.llm import AgentUsageLimits
 
-AgentUsageLimits(agent_request_limit=100)
+AgentUsageLimits(agent_request_limit=100, total_tokens_limit=1_000_000)
 ```
 
 Note that only `run_usage_limits` participates in the compaction-threshold check

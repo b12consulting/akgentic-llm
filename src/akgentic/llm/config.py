@@ -321,18 +321,23 @@ class RunUsageLimits(TokenUsageLimits):
 class AgentUsageLimits(TokenUsageLimits):
     """Agent-lifetime usage budget: bounds an agent across every run it performs.
 
-    agent_request_limit is enforced by a pre-flight check in ReactAgent.run(): the
-    budget is consumed BEFORE the call executes, so a run that fails partway still
-    counts. Breaching it raises UsageLimitError, the same class the run tier raises.
+    Both this tier's limits are enforced by pre-flight checks in ReactAgent.run(),
+    against counters ReactAgent accumulates over its whole lifetime (and reseeds from
+    replayed usage events on restore). Breaching either raises UsageLimitError, the
+    same class the run tier raises, with pydantic-ai's own message text.
 
-    TRAP: the inherited token fields are declared for shape symmetry with the run
-    tier and are never read — setting them changes nothing.
+    agent_request_limit is consumed BEFORE the call executes, so a run that fails
+    partway still counts.
+
+    TRAP: the inherited token limits bound where a run may START, not where it may
+    end — a run's cost is unknown until it completes, so the run that crosses the
+    line finishes and only the next one is refused.
 
     Attributes:
         agent_request_limit: Maximum ReactAgent.run() calls over the agent's lifetime
 
     Example:
-        >>> limits = AgentUsageLimits(agent_request_limit=100)
+        >>> limits = AgentUsageLimits(agent_request_limit=100, total_tokens_limit=1_000_000)
     """
 
     agent_request_limit: int | None = Field(
@@ -543,8 +548,8 @@ class ReactAgentConfig(BaseModel):
         model_cfg: LLM provider and model settings.
         runtime_cfg: Execution behavior and HTTP retry strategy.
         run_usage_limits: Per-run resource limits; the tier pydantic-ai enforces.
-        agent_usage_limits: Agent-lifetime resource limits; only agent_request_limit
-            is enforced (pre-flight in ReactAgent.run()), never the token fields.
+        agent_usage_limits: Agent-lifetime resource limits — runs and tokens, both
+            enforced pre-flight in ReactAgent.run().
         compaction_cfg: Context-compaction configuration.
         max_messages: Sliding-window size handed to ContextManager; None = unlimited.
 
@@ -589,7 +594,7 @@ class ReactAgentConfig(BaseModel):
 
     agent_usage_limits: AgentUsageLimits = Field(
         default_factory=AgentUsageLimits,
-        description="Agent-lifetime usage limits; only agent_request_limit is enforced",
+        description="Agent-lifetime usage limits, enforced pre-flight on every run",
     )
 
     compaction_cfg: CompactionConfig = Field(

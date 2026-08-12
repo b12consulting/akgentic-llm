@@ -419,8 +419,8 @@ class TestAgentUsageLimits:
         with pytest.raises(ValidationError):
             AgentUsageLimits(agent_request_limit=0)
 
-    def test_token_fields_declared_but_unenforced(self):
-        """Token fields exist for shape symmetry; nothing in the library reads them."""
+    def test_token_fields_carry_their_values(self):
+        """Token fields round-trip; ReactAgent enforces them pre-flight (test_agent.py)."""
         limits = AgentUsageLimits(input_tokens_limit=100, total_tokens_limit=200)
         assert limits.input_tokens_limit == 100
         assert limits.total_tokens_limit == 200

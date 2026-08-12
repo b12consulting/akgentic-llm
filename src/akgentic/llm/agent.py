@@ -9,6 +9,7 @@ from typing import Any, cast
 from pydantic_ai import Agent, AgentCapability, BinaryContent, UsageLimitExceeded
 from pydantic_ai import UsageLimits as PydanticUsageLimits
 from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, ToolReturnPart
+from pydantic_ai.usage import RunUsage
 
 from .compaction import CompactionResult, CompactionStrategy, create_compaction
 from .config import ReactAgentConfig, RunUsageLimits
@@ -138,6 +139,12 @@ class ReactAgent:
         # restore_context() recomputes it from the replayed LlmUsageEvents.
         self._run_count: int = 0
 
+        # Agent-lifetime token accumulator backing agent_usage_limits' token fields.
+        # Same lifecycle as _run_count (in memory, reseeded from the same replayed
+        # events). pydantic-ai's own RunUsage, so folding and comparison are both its
+        # code. NEVER handed to iter() — see _check_agent_token_budget.
+        self._agent_usage: RunUsage = RunUsage()
+
         # Create context manager (no max_messages by default)
         self._context = ContextManager()
 
@@ -206,12 +213,14 @@ class ReactAgent:
             Agent result output (type matches output_type if given, else result_type)
 
         Raises:
-            UsageLimitError: On either tier — the agent-lifetime budget rejecting this
-                call before it runs, or a run-tier limit breached by pydantic-ai
-                mid-run.
+            UsageLimitError: On either tier — the agent-lifetime budget (tokens or
+                runs) rejecting this call before it runs, or a run-tier limit
+                breached by pydantic-ai mid-run.
         """
         # Pre-flight: reject before spending anything (a rejected run must not even
-        # pay for compaction's summarizer call).
+        # pay for compaction's summarizer call). Tokens first, so a token rejection
+        # consumes no run budget.
+        self._check_agent_token_budget()
         self._check_and_consume_agent_budget()
         # Auto-compact (at most once per turn) BEFORE iter() snapshots the
         # history. iter() reads message_history once at entry and the loop only
@@ -225,6 +234,9 @@ class ReactAgent:
             # (new_messages() can return same messages across iterations)
             added_message_ids: set[int] = set()
 
+            # No `usage=` argument: pydantic-ai starts this run at zero so the run
+            # tier stays per-run. Handing it the lifetime accumulator would check
+            # the per-run cap against lifetime totals — silently, with no error.
             async with self._pydantic_agent.iter(
                 user_prompt=user_prompt,
                 deps=deps,
@@ -232,21 +244,25 @@ class ReactAgent:
                 message_history=self._context.messages,
                 output_type=get_output_type(self._config.model_cfg, output_type),
             ) as run:
-                async for _ in run:
-                    # new_messages() may return previously emitted messages
-                    # during tool call iterations - only add each once
-                    for message in run.new_messages():
-                        msg_id = id(message)
-                        if msg_id not in added_message_ids:
-                            added_message_ids.add(msg_id)
-                            self._context.add_message(message)
+                try:
+                    async for _ in run:
+                        # new_messages() may return previously emitted messages
+                        # during tool call iterations - only add each once
+                        for message in run.new_messages():
+                            msg_id = id(message)
+                            if msg_id not in added_message_ids:
+                                added_message_ids.add(msg_id)
+                                self._context.add_message(message)
 
-                # Record this run's effective system prompt rendering exactly
-                # once, after pydantic-ai's in-place dynamic re-evaluation and
-                # the new_messages() drain, before returning (ADR-004 §2).
-                self._record_run_system_prompt(run)
+                    # Record this run's effective system prompt rendering exactly
+                    # once, after pydantic-ai's in-place dynamic re-evaluation and
+                    # the new_messages() drain, before returning (ADR-004 §2).
+                    self._record_run_system_prompt(run)
 
-                return run.result.output if run.result else None
+                    return run.result.output if run.result else None
+                finally:
+                    # In `finally`: tokens a failed run burned were still burned.
+                    self._fold_run_usage(run)
 
         except UsageLimitExceeded as e:
             self._heal_unprocessed_tool_calls(traceback.format_exc())
@@ -254,6 +270,51 @@ class ReactAgent:
         except Exception:
             self._heal_unprocessed_tool_calls(traceback.format_exc())
             raise
+
+    def _check_agent_token_budget(self) -> None:
+        """Refuse to START a run once the agent-lifetime token budget is spent.
+
+        Builds a pydantic-ai ``UsageLimits`` from ``agent_usage_limits``' three token
+        fields and reuses its ``check_tokens()`` against the lifetime accumulator, so
+        an agent-tier breach reads exactly like a run-tier one and nothing downstream
+        has to parse text to tell the tiers apart. Unset limits (the default, all
+        ``None``) make the check a no-op.
+
+        **A run may overshoot the budget, by construction.** A run's token cost is
+        unknown until it completes, so this is "do not start a run once the budget is
+        spent", never "never exceed it": the last run admitted can carry the total
+        arbitrarily past the limit, and only the next one is refused.
+
+        The accumulator is compared here rather than handed to ``iter()`` because
+        ``iter()`` takes exactly one usage — passing the lifetime total would check
+        the *run* tier's limits against it and silently turn a per-run cap into a
+        lifetime one (ADR-013 §Out of scope, reopened for the token tier).
+
+        Raises:
+            UsageLimitError: If lifetime usage has already exceeded a token limit.
+        """
+        limits = self._config.agent_usage_limits
+        pydantic_limits = PydanticUsageLimits(
+            input_tokens_limit=limits.input_tokens_limit,
+            output_tokens_limit=limits.output_tokens_limit,
+            total_tokens_limit=limits.total_tokens_limit,
+        )
+        try:
+            pydantic_limits.check_tokens(self._agent_usage)
+        except UsageLimitExceeded as e:
+            raise UsageLimitError(str(e)) from e
+
+    def _fold_run_usage(self, run: Any) -> None:
+        """Add one completed run's token usage to the agent-lifetime accumulator.
+
+        ``run.usage`` is a **property** on pydantic-ai's ``AgentRun``; calling it
+        emits a deprecation warning. Called from a ``finally``, so a run that failed
+        partway still contributes what it spent — the provider billed it either way.
+
+        Args:
+            run: The pydantic-ai run object yielded by ``iter()``.
+        """
+        self._agent_usage.incr(run.usage)
 
     def _check_and_consume_agent_budget(self) -> None:
         """Spend one unit of the agent-lifetime run budget, or refuse to run.
@@ -604,9 +665,9 @@ class ReactAgent:
         compose (the later fold consumes the earlier synthetic summary) with the
         fold applied exactly once per event (FR16).
 
-        The same list also reseeds the agent-lifetime run counter, so a resumed
-        agent carries the budget it already spent instead of a fresh one
-        (ADR-013 §D3).
+        The same list also reseeds both agent-lifetime budgets — the run counter
+        and the token accumulator — so a resumed agent carries the budget it
+        already spent instead of a fresh one (ADR-013 §D3).
 
         Args:
             events: List of event-like objects (typically ``EventMessage``
@@ -626,21 +687,22 @@ class ReactAgent:
                 messages = []
         self._context.restore(messages)
         self._seed_system_prompt_from_events(events)
-        self._seed_run_count_from_events(events)
+        self._seed_agent_budget_from_events(events)
 
-    def _seed_run_count_from_events(self, events: list[Any]) -> None:
-        """Recompute the agent-lifetime run budget from replayed usage events.
+    def _seed_agent_budget_from_events(self, events: list[Any]) -> None:
+        """Recompute both agent-lifetime budgets from replayed usage events.
 
-        Counts **distinct runs**, never events: one ``run()`` emits one
-        ``LlmUsageEvent`` per ``ModelResponse``, so a run with three tool-call
-        round-trips contributes three events under one ``run_id``.
-        ``aggregate_usage`` does that grouping — ``by_run=True`` is what
-        populates ``runs`` at all, and without it this seeds zero every time.
+        One ``aggregate_usage`` pass seeds the run counter and the token
+        accumulator: the run count is the number of **distinct runs**, never of
+        events (one ``run()`` emits one ``LlmUsageEvent`` per ``ModelResponse``, so
+        a run with three tool-call round-trips contributes three events under one
+        ``run_id``), and the token totals sum those same runs. ``by_run=True`` is
+        what populates ``runs`` at all — without it both seeds are zero every time.
 
         Assignment, not accumulation, so replaying the same stream twice is
-        idempotent. A ``run()`` that failed before any ``ModelResponse`` left no
-        usage event and is invisible here; that is deliberate (ADR-013 §Out of
-        scope) — it consumed no model resources.
+        idempotent and a shorter stream lowers the value. A ``run()`` that failed
+        before any ``ModelResponse`` left no usage event and is invisible here; that
+        is deliberate (ADR-013 §Out of scope) — it consumed no model resources.
 
         Args:
             events: The same event-like list passed to ``restore_context``.
@@ -648,7 +710,12 @@ class ReactAgent:
         usage = [
             e.event for e in events if hasattr(e, "event") and isinstance(e.event, LlmUsageEvent)
         ]
-        self._run_count = len(aggregate_usage(usage, by_run=True).runs)
+        summary = aggregate_usage(usage, by_run=True)
+        self._run_count = len(summary.runs)
+        self._agent_usage = RunUsage(
+            input_tokens=sum(r.total_input_tokens for r in summary.runs),
+            output_tokens=sum(r.total_output_tokens for r in summary.runs),
+        )
 
     def _seed_system_prompt_from_events(self, events: list[Any]) -> None:
         """Seed the dedup hash from the latest persisted ``LlmSystemPromptEvent``.
