@@ -675,8 +675,11 @@ class ReactAgentConfig(BaseModel):
 
         When auto-compaction is live, the effective threshold must sit strictly below every
         set token limit; otherwise pydantic-ai raises UsageLimitExceeded first and the
-        auto-trigger is dead code. Reads the RUN tier only — the agent tier's token fields
-        are never enforced, so they cannot pre-empt the trigger.
+        auto-trigger is dead code. Reads the RUN tier only, by choice: the agent tier's
+        token limits are enforced too, and one set below the threshold does leave the
+        auto-trigger unreachable — the agent refuses the run before compaction can fire.
+        Rejecting that here would change which configs are constructible, so it stays a
+        documented consequence rather than a validation error.
         """
         context_length = self.model_cfg.context_length
         if not (self.compaction_cfg.auto_trigger and context_length is not None):

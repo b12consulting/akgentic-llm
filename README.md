@@ -254,8 +254,10 @@ AgentUsageLimits(agent_request_limit=100, total_tokens_limit=1_000_000)
 ```
 
 Note that only `run_usage_limits` participates in the compaction-threshold check
-(see [Context compaction](#context-compaction)); a token limit set on the agent tier
-cannot make the auto-trigger unreachable.
+(see [Context compaction](#context-compaction)). The check is deliberately not widened to
+the agent tier, so an `agent_usage_limits` token limit below the compaction threshold still
+constructs — but it does make the auto-trigger unreachable at runtime, because the agent
+refuses the run before compaction can fire.
 
 #### Migrating from the pre-split surface
 
