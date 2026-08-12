@@ -703,15 +703,32 @@ class TestReactAgentRunCountRestore:
         agent.restore_context(events)
         assert agent._run_count == 1
 
-    def test_empty_event_list_leaves_zero(self):
-        """Test restoring nothing leaves the budget untouched."""
+    def test_empty_event_list_seeds_zero(self):
+        """Test restoring nothing seeds zero — on a fresh agent and on a spent one.
+
+        The second half is what makes this bite. A fresh agent reads ``0``
+        whether or not seeding ran at all, so asserting only that proves
+        nothing; driving the counter above zero first turns the assertion into
+        a real one. It also pins **assignment** over a high-water mark (AC #6):
+        ``max(self._run_count, ...)`` satisfies every other test in this class.
+        """
         agent = ReactAgent(config=_agent_limit_config(10))
         agent.restore_context([])
         assert agent._run_count == 0
 
-    def test_events_without_usage_leave_zero(self):
-        """Test non-usage events and objects with no .event payload are ignored."""
+        agent.restore_context([FakeEventMessage(event=_usage_event(rid)) for rid in ("r1", "r2")])
+        assert agent._run_count == 2
+        agent.restore_context([])
+        assert agent._run_count == 0
+
+    def test_events_without_usage_seed_zero(self):
+        """Test non-usage events and objects with no .event payload are ignored.
+
+        Seeded above zero first, for the same reason: this distinguishes "the
+        ignore path assigns zero" from "the counter was simply never touched".
+        """
         agent = ReactAgent(config=_agent_limit_config(10))
+        agent.restore_context([FakeEventMessage(event=_usage_event(rid)) for rid in ("r1", "r2")])
         msg = ModelRequest(parts=[UserPromptPart(content="hello")])
         events = [
             FakeEventMessage(event=LlmMessageEvent(message=msg)),
