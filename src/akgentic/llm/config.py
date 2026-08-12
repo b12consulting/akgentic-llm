@@ -48,6 +48,10 @@ class ModelConfig(BaseModel):
         context_length: Model context window in tokens; the budget that auto-triggers
             compaction. None = compaction off. Distinct from max_tokens (the output cap).
         reasoning_effort: Reasoning effort for o1/o3-style models ('low', 'medium', 'high')
+        fallback_models: Models tried in order after this one on API failure. The chain is
+            flat (an entry may not declare its own fallbacks) and homogeneous (every entry
+            must agree with this config on native structured-output support), both enforced
+            at construction. Only this config's context_length governs the compaction budget.
 
     Example:
         >>> # OpenAI GPT-4o with moderate creativity
@@ -71,6 +75,17 @@ class ModelConfig(BaseModel):
         ...     provider="openai",
         ...     model="o1",
         ...     reasoning_effort="high"
+        ... )
+        >>>
+        >>> # A fallback chain: gpt-4o first, then Claude, then Azure. All three
+        >>> # support native structured output, so the chain is homogeneous.
+        >>> config = ModelConfig(
+        ...     provider="openai",
+        ...     model="gpt-4o",
+        ...     fallback_models=[
+        ...         ModelConfig(provider="anthropic", model="claude-sonnet-4-5"),
+        ...         ModelConfig(provider="azure", model="gpt-4o-mini"),
+        ...     ],
         ... )
     """
 
@@ -102,6 +117,97 @@ class ModelConfig(BaseModel):
     reasoning_effort: Literal["low", "medium", "high"] | None = Field(
         default=None, description="Reasoning effort for o1/o3 models"
     )
+
+    fallback_models: list["ModelConfig"] = Field(
+        default_factory=list,
+        description=(
+            "Models tried in order after this one on API failure (rate limits, 5xx, "
+            "auth errors, timeouts). Empty = no fallback (default)."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _reject_nested_fallback_models(self) -> "ModelConfig":
+        """Flat-chain: a fallback entry may not declare fallbacks of its own.
+
+        pydantic-ai's FallbackModel takes (default_model, *fallback_models) and stores a
+        flat list, never a tree, so a nested chain would have to be silently flattened at
+        build time. Rejecting it here turns that silent flatten into a clear error and
+        bounds both the homogeneity check and the primary-governs-config rule to one level.
+        """
+        if any(entry.fallback_models for entry in self.fallback_models):
+            raise ValueError(
+                "fallback_models entries cannot themselves declare fallback_models; "
+                "the chain is flat — list every model on the primary config"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _reject_heterogeneous_output_support(self) -> "ModelConfig":
+        """Homogeneous-support: every entry must agree with the primary on native output.
+
+        The structured-output wrapper is chosen from the provider alone, once, before any
+        request is sent. An entry whose support differs makes that wrapper wrong for
+        whichever model actually serves the response — a corruption that only surfaces
+        when the primary fails, which is exactly when nobody is watching.
+        """
+        if not self.fallback_models:
+            return self
+        primary = _supports_native_output(self)
+        mismatched = [
+            f"{entry.provider}/{entry.model}"
+            for entry in self.fallback_models
+            if _supports_native_output(entry) != primary
+        ]
+        if mismatched:
+            raise ValueError(
+                f"fallback_models must all match the primary's "
+                f"supports_native_output={primary}; mismatched entries: "
+                f"{', '.join(mismatched)}"
+            )
+        return self
+
+
+def _supports_native_output(config: ModelConfig) -> bool:
+    """Check if provider supports native structured output via NativeOutput wrapper.
+
+    Providers with native support (via function calling or tool use APIs):
+    - openai: GPT-4o, o1 series, etc.
+    - azure: Azure OpenAI Service
+    - anthropic: Claude 3.5 Sonnet, etc.
+    - nvidia: Only for models with "openai" prefix (e.g., "openai/gpt-oss-120b")
+
+    Providers without native support (use prompt-based extraction):
+    - google-gla: Google Gemini models
+    - mistral: Mistral AI models
+    - nvidia: Non-OpenAI models (e.g., "meta/llama-3.1-70b-instruct")
+
+    Defined here rather than in providers.py so ModelConfig's fallback-chain validator can
+    call it: providers.py already imports ModelConfig from this module, so importing the
+    predicate back would cycle. providers.py re-imports it — this is its one definition.
+
+    Args:
+        config: LLM model configuration.
+
+    Returns:
+        True if the provider supports native structured output, False otherwise.
+
+    Example:
+        >>> config = ModelConfig(provider="openai", model="gpt-4o")
+        >>> _supports_native_output(config)
+        True
+        >>> config = ModelConfig(provider="google-gla", model="gemini-2.0-flash")
+        >>> _supports_native_output(config)
+        False
+        >>> config = ModelConfig(provider="nvidia", model="openai/gpt-oss-120b")
+        >>> _supports_native_output(config)
+        True
+    """
+    if config.provider in ("openai", "azure", "anthropic"):
+        return True
+    if config.provider == "nvidia":
+        return config.model.startswith("openai")
+    return False
 
 
 class CompactionConfig(BaseModel):

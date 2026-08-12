@@ -38,7 +38,7 @@ from pydantic_ai.retries import AsyncTenacityTransport, RetryConfig, wait_retry_
 from pydantic_ai.settings import ModelSettings
 from tenacity import retry_if_exception, stop_after_attempt, wait_random_exponential
 
-from .config import ModelConfig
+from .config import ModelConfig, _supports_native_output
 
 T = TypeVar("T")
 
@@ -79,44 +79,6 @@ def _is_retryable_http_error(exc: BaseException) -> bool:
         return False
     status = exc.response.status_code
     return status == 429 or 500 <= status < 600
-
-
-def _supports_native_output(config: ModelConfig) -> bool:
-    """Check if provider supports native structured output via NativeOutput wrapper.
-
-    Providers with native support (via function calling or tool use APIs):
-    - openai: GPT-4o, o1 series, etc.
-    - azure: Azure OpenAI Service
-    - anthropic: Claude 3.5 Sonnet, etc.
-    - nvidia: Only for models with "openai" prefix (e.g., "openai/gpt-oss-120b")
-
-    Providers without native support (use prompt-based extraction):
-    - google-gla: Google Gemini models
-    - mistral: Mistral AI models
-    - nvidia: Non-OpenAI models (e.g., "meta/llama-3.1-70b-instruct")
-
-    Args:
-        config: LLM model configuration.
-
-    Returns:
-        True if the provider supports native structured output, False otherwise.
-
-    Example:
-        >>> config = ModelConfig(provider="openai", model="gpt-4o")
-        >>> _supports_native_output(config)
-        True
-        >>> config = ModelConfig(provider="google-gla", model="gemini-2.0-flash")
-        >>> _supports_native_output(config)
-        False
-        >>> config = ModelConfig(provider="nvidia", model="openai/gpt-oss-120b")
-        >>> _supports_native_output(config)
-        True
-    """
-    if config.provider in ("openai", "azure", "anthropic"):
-        return True
-    if config.provider == "nvidia":
-        return config.model.startswith("openai")
-    return False
 
 
 def get_output_type(

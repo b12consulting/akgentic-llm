@@ -797,7 +797,8 @@ blocked from merging until all steps are green.
 src/akgentic/llm/
     __init__.py     # Public API exports
     agent.py        # ReactAgent, UsageLimitError, UserPrompt type alias
-    config.py       # ModelConfig, UsageLimits, HttpClientConfig, RuntimeConfig, ReactAgentConfig
+    config.py       # ModelConfig, UsageLimits, HttpClientConfig, RuntimeConfig, ReactAgentConfig,
+                    #   _supports_native_output()
     context.py      # ContextManager, ContextSnapshot
     event.py        # LlmMessageEvent, LlmUsageEvent, LlmCheckpoint*Event,
                     #   LlmSystemPromptEvent, SystemPromptPartSnapshot,
@@ -807,7 +808,7 @@ src/akgentic/llm/
     pricing.yaml    # Externalized per-1M-token pricing table (Anthropic + OpenAI)
     prompts.py      # PromptTemplate, current_datetime_prompt, json_output_reminder_prompt
     providers.py    # create_model(), create_http_client(), get_output_type(),
-                    #   create_model_settings(), _supports_native_output()
+                    #   create_model_settings()
 tests/              # Tests organised by module
 ```
 

@@ -8,6 +8,8 @@ from pydantic import BaseModel
 from pydantic_ai import NativeOutput
 from pydantic_ai.retries import AsyncTenacityTransport
 
+from akgentic.llm import config as config_module
+from akgentic.llm import providers
 from akgentic.llm.config import ModelConfig
 from akgentic.llm.providers import (
     _is_retryable_http_error,
@@ -82,6 +84,16 @@ class TestSupportsNativeOutput:
         """Mistral provider does not support native output."""
         config = ModelConfig(provider="mistral", model="mistral-large-latest")
         assert _supports_native_output(config) is False
+
+    def test_single_definition_lives_in_config_module(self) -> None:
+        """providers re-exports config's function object; a stale copy would fail this — AC 7.
+
+        The predicate lives in config.py so ModelConfig's fallback-chain validators can
+        call it without providers.py -> config.py -> providers.py cycling. Identity, not
+        behaviour: a duplicated body left behind in providers.py passes every other test
+        in this class and only diverges later, silently.
+        """
+        assert providers._supports_native_output is config_module._supports_native_output
 
 
 # ---------------------------------------------------------------------------
