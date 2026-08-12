@@ -1,6 +1,7 @@
 """Unit tests for ReactAgent implementation."""
 
 from dataclasses import dataclass
+from typing import TypeVar, get_type_hints
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -481,6 +482,50 @@ class TestReactAgentToolDecorator:
 
         # Verify decorator returned a callable
         assert callable(search_tool)
+
+    def test_decorators_preserve_the_decorated_function_type(self, minimal_config):
+        """`@agent.tool` / `@agent.system_prompt` must not erase the function's type.
+
+        A wrapper annotated ``(func: Any) -> Any`` silently retypes every
+        registered function to ``Any``, so mypy stops checking all of its
+        callers — a regression no behavioural test can observe. It has to be
+        checked at runtime rather than with ``assert_type``, because CI
+        type-checks ``src/`` only; an ``assert_type`` under ``tests/`` is a
+        no-op nothing would ever read.
+
+        Two assertions, together equivalent to the static claim:
+
+        1. The same type variable goes in and comes out, so a caller keeps the
+           signature it registered. Reverting either wrapper to ``-> Any``
+           fails here.
+        2. The premise that annotation rests on still holds — pydantic-ai hands
+           back the original function object rather than a wrapper. If a future
+           version starts wrapping, ``-> F`` becomes a lie and this goes red.
+        """
+        for method in (ReactAgent.tool, ReactAgent.system_prompt):
+            hints = get_type_hints(method)
+            assert isinstance(hints["func"], TypeVar)
+            assert hints["return"] is hints["func"]
+
+        class MyDeps:
+            pass
+
+        agent = ReactAgent(config=minimal_config, deps_type=MyDeps)
+
+        from pydantic_ai import RunContext
+
+        def search_tool(ctx: RunContext[MyDeps], query: str) -> list[str]:
+            """Search for items matching query.
+
+            Args:
+                query: The search query string
+
+            Returns:
+                List of matching items
+            """
+            return [f"Result: {query}"]
+
+        assert agent.tool(search_tool) is search_tool
 
 
 class TestReactAgentUsageLimits:

@@ -3,12 +3,19 @@
 import asyncio
 import logging
 import traceback
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Any, cast
 
 from pydantic_ai import Agent, AgentCapability, BinaryContent, UsageLimitExceeded
 from pydantic_ai import UsageLimits as PydanticUsageLimits
-from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, ToolReturnPart
+from pydantic_ai.agent import AgentRun
+from pydantic_ai.messages import (
+    ModelMessage,
+    ModelRequest,
+    ModelRequestPart,
+    ModelResponse,
+    ToolReturnPart,
+)
 from pydantic_ai.usage import RunUsage
 
 from .compaction import CompactionResult, CompactionStrategy, create_compaction
@@ -304,7 +311,7 @@ class ReactAgent:
         except UsageLimitExceeded as e:
             raise UsageLimitError(str(e)) from e
 
-    def _fold_run_usage(self, run: Any) -> None:
+    def _fold_run_usage(self, run: AgentRun[Any, Any]) -> None:
         """Add one completed run's token usage to the agent-lifetime accumulator.
 
         ``run.usage`` is a **property** on pydantic-ai's ``AgentRun``; calling it
@@ -373,7 +380,7 @@ class ReactAgent:
             return f"{preamble}\n\n{user_prompt}"
         return [preamble, *user_prompt]
 
-    def _record_run_system_prompt(self, run: Any) -> None:
+    def _record_run_system_prompt(self, run: AgentRun[Any, Any]) -> None:
         """Record the completed run's effective system prompt rendering once.
 
         Derives the run's ``run_id`` from its own messages — the same value
@@ -613,10 +620,10 @@ class ReactAgent:
         if not isinstance(last, ModelResponse) or not last.tool_calls:
             return
 
-        # list[Any] rather than list[ToolReturnPart] to satisfy mypy strict
-        # mode: ModelRequest.parts is a union type and narrowing to the
-        # concrete part type triggers an assignment-variance error.
-        error_parts: list[Any] = [
+        # Annotated with the union ModelRequest.parts itself declares, not the
+        # concrete ToolReturnPart: list is invariant, so only the exact element
+        # type is assignable.
+        error_parts: list[ModelRequestPart] = [
             ToolReturnPart(
                 tool_name=call.tool_name,
                 content=f"Error: tool call aborted due to failure: {error_detail}",
@@ -649,7 +656,7 @@ class ReactAgent:
         """
         self._context.subscribe(observer)
 
-    def restore_context(self, events: list[Any]) -> None:
+    def restore_context(self, events: list[object]) -> None:
         """Restore LLM conversation context as an ordered fold over persisted events.
 
         Folds ``events`` in persisted-sequence order into an accumulator:
@@ -689,7 +696,7 @@ class ReactAgent:
         self._seed_system_prompt_from_events(events)
         self._seed_agent_budget_from_events(events)
 
-    def _seed_agent_budget_from_events(self, events: list[Any]) -> None:
+    def _seed_agent_budget_from_events(self, events: list[object]) -> None:
         """Recompute both agent-lifetime budgets from replayed usage events.
 
         One ``aggregate_usage`` pass seeds the run counter and the token
@@ -717,7 +724,7 @@ class ReactAgent:
             output_tokens=sum(r.total_output_tokens for r in summary.runs),
         )
 
-    def _seed_system_prompt_from_events(self, events: list[Any]) -> None:
+    def _seed_system_prompt_from_events(self, events: list[object]) -> None:
         """Seed the dedup hash from the latest persisted ``LlmSystemPromptEvent``.
 
         Scans ``events`` for the **latest** ``LlmSystemPromptEvent`` (the last in
@@ -743,7 +750,7 @@ class ReactAgent:
         if latest is not None:
             self._context.seed_system_prompt_hash(latest.content_hash)
 
-    def system_prompt(self, func: Any) -> Any:
+    def system_prompt[F: Callable[..., Any]](self, func: F) -> F:
         """Register a custom dynamic system prompt.
 
         Convenience wrapper around pydantic-ai's @agent.system_prompt(dynamic=True).
@@ -757,14 +764,23 @@ class ReactAgent:
             func: System prompt function
 
         Returns:
-            Decorated function
+            The same function, with its own type preserved rather than erased.
         """
-        return self._pydantic_agent.system_prompt(dynamic=True)(func)
+        # cast, not `return func`: `_pydantic_agent` is Any-typed, so the call's
+        # result is Any (warn_return_any). pydantic-ai hands back the original
+        # function object, so the cast is a type-level claim only — the runtime
+        # value stays whatever pydantic-ai returned.
+        return cast(F, self._pydantic_agent.system_prompt(dynamic=True)(func))
 
-    def tool(self, func: Any) -> Any:
+    def tool[F: Callable[..., Any]](self, func: F) -> F:
         """Register a tool function.
 
         Convenience wrapper around pydantic-ai's @agent.tool().
+
+        Generic over the decorated function so its signature survives
+        registration: pydantic-ai's own ``tool()`` needs a stack of overloads to
+        avoid erasing it, and a wrapper returning ``Any`` would throw that away
+        again — leaving every caller of a registered tool unchecked.
 
         Example:
             >>> @agent.tool
@@ -775,9 +791,10 @@ class ReactAgent:
             func: Tool function
 
         Returns:
-            Decorated function
+            The same function, with its own type preserved rather than erased.
         """
-        return self._pydantic_agent.tool(func)
+        # cast for the same reason as system_prompt() above.
+        return cast(F, self._pydantic_agent.tool(func))
 
     @property
     def pydantic_agent(self) -> Agent[Any, Any]:
