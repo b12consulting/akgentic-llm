@@ -15,10 +15,10 @@ Examples:
 
     Configuration with usage limits:
 
-    >>> from akgentic.llm import ModelConfig, UsageLimits, ReactAgentConfig
+    >>> from akgentic.llm import ModelConfig, RunUsageLimits, ReactAgentConfig
     >>> config = ReactAgentConfig(
     ...     model=ModelConfig(provider="openai", model="gpt-4o"),
-    ...     usage_limits=UsageLimits(request_limit=10, total_tokens_limit=5000)
+    ...     run_usage_limits=RunUsageLimits(run_request_limit=10, total_tokens_limit=5000)
     ... )
 """
 
@@ -253,51 +253,17 @@ class CompactionConfig(BaseModel):
     )
 
 
-class UsageLimits(BaseModel):
-    """Usage limits for cost control and resource management.
+class TokenUsageLimits(BaseModel):
+    """Token budgets shared by both usage-limit tiers.
 
-    All limits are optional (None = unlimited) except for request_limit = 50 by default.
-    Limits are enforced cumulatively during agent execution. When exceeded,
-    raises UsageLimitError with details.
-
-    Token tracking is cumulative across all requests in a single agent run:
-    - input_tokens: Sum of all prompt/input tokens
-    - output_tokens: Sum of all completion/output tokens
-    - total_tokens: input_tokens + output_tokens
+    Internal base — callers construct RunUsageLimits or AgentUsageLimits, never this.
+    All limits are optional (None = unlimited) and cumulative over their tier's scope.
 
     Attributes:
-        request_limit: Maximum number of LLM API requests per agent run
-        tool_calls_limit: Maximum number of tool invocations per agent run
-        input_tokens_limit: Maximum cumulative input/prompt tokens across all requests
-        output_tokens_limit: Maximum cumulative output/completion tokens across all requests
-        total_tokens_limit: Maximum cumulative total tokens (input + output) across all requests
-
-    Example:
-        >>> # Basic limits: 10 requests, 5K total tokens
-        >>> limits = UsageLimits(
-        ...     request_limit=10,
-        ...     total_tokens_limit=5000
-        ... )
-        >>>
-        >>> # Strict limits for cost control
-        >>> limits = UsageLimits(
-        ...     request_limit=50,          # default: 50
-        ...     tool_calls_limit=20,       # default: None
-        ...     input_tokens_limit=10000,  # default: None
-        ...     output_tokens_limit=2000.  # default: None
-        ... )
-        >>>
-        >>> # Unlimited (default) except for request_limit (50 default)
-        >>> limits = UsageLimits(request_limit=None, total_tokens_limit=None)
+        input_tokens_limit: Maximum cumulative input/prompt tokens
+        output_tokens_limit: Maximum cumulative output/completion tokens
+        total_tokens_limit: Maximum cumulative total tokens (input + output)
     """
-
-    request_limit: int | None = Field(
-        default=50, gt=0, description="Maximum number of LLM requests per run"
-    )
-
-    tool_calls_limit: int | None = Field(
-        default=None, gt=0, description="Maximum number of tool calls per run"
-    )
 
     input_tokens_limit: int | None = Field(
         default=None, gt=0, description="Maximum input/prompt tokens"
@@ -310,6 +276,65 @@ class UsageLimits(BaseModel):
     total_tokens_limit: int | None = Field(
         default=None, gt=0, description="Maximum total tokens (input + output)"
     )
+
+
+class RunUsageLimits(TokenUsageLimits):
+    """Per-run usage budget: bounds a single ReactAgent.run() call.
+
+    Enforced by pydantic-ai, which raises UsageLimitExceeded mid-run when a limit is hit;
+    ReactAgent surfaces that as UsageLimitError. Token counts reset every run.
+
+    Attributes:
+        run_request_limit: Maximum LLM API requests in one run (50 = the default brake)
+        tool_calls_limit: Maximum tool invocations in one run
+
+    Example:
+        >>> # Basic limits: 10 requests, 5K total tokens
+        >>> limits = RunUsageLimits(run_request_limit=10, total_tokens_limit=5000)
+        >>>
+        >>> # Strict limits for cost control
+        >>> limits = RunUsageLimits(
+        ...     run_request_limit=50,      # default: 50
+        ...     tool_calls_limit=20,       # default: None
+        ...     input_tokens_limit=10000,  # default: None
+        ...     output_tokens_limit=2000,  # default: None
+        ... )
+        >>>
+        >>> # Unlimited, safety brake included
+        >>> limits = RunUsageLimits(run_request_limit=None, total_tokens_limit=None)
+    """
+
+    run_request_limit: int | None = Field(
+        default=50, gt=0, description="Maximum number of LLM requests per run"
+    )
+
+    tool_calls_limit: int | None = Field(
+        default=None, gt=0, description="Maximum number of tool calls per run"
+    )
+
+
+class AgentUsageLimits(TokenUsageLimits):
+    """Agent-lifetime usage budget: bounds an agent across every run it performs.
+
+    TRAP: nothing here is enforced yet. agent_request_limit is declared for the
+    pre-flight run counter that lands later on this epic, and the inherited token
+    fields are declared for shape symmetry with the run tier and are never read.
+
+    Attributes:
+        agent_request_limit: Maximum ReactAgent.run() calls over the agent's lifetime
+
+    Example:
+        >>> limits = AgentUsageLimits(agent_request_limit=100)
+    """
+
+    agent_request_limit: int | None = Field(
+        default=None, gt=0, description="Maximum number of runs over the agent's lifetime"
+    )
+
+
+# Deprecated alias of the run tier, kept so pre-split callers still resolve the name.
+# The deprecation machinery (warnings, request_limit mapping) lands in the next commit.
+UsageLimits = RunUsageLimits
 
 
 class HttpClientConfig(BaseModel):
@@ -441,7 +466,8 @@ class ReactAgentConfig(BaseModel):
     Attributes:
         model_cfg: LLM provider and model settings.
         runtime_cfg: Execution behavior and HTTP retry strategy.
-        usage_limits: Resource limits for cost control.
+        run_usage_limits: Per-run resource limits; the tier pydantic-ai enforces.
+        agent_usage_limits: Agent-lifetime resource limits; not enforced yet.
         compaction_cfg: Context-compaction configuration.
         max_messages: Sliding-window size handed to ContextManager; None = unlimited.
 
@@ -458,8 +484,8 @@ class ReactAgentConfig(BaseModel):
         ...         model="claude-3-5-sonnet-20241022",
         ...         temperature=0.7
         ...     ),
-        ...     usage_limits=UsageLimits(
-        ...         request_limit=10,
+        ...     run_usage_limits=RunUsageLimits(
+        ...         run_request_limit=10,
         ...         total_tokens_limit=50000
         ...     ),
         ...     runtime_cfg=RuntimeConfig(
@@ -475,8 +501,13 @@ class ReactAgentConfig(BaseModel):
         default_factory=RuntimeConfig, description="Runtime behavior configuration"
     )
 
-    usage_limits: UsageLimits = Field(
-        default_factory=UsageLimits, description="Usage limits for cost control"
+    run_usage_limits: RunUsageLimits = Field(
+        default_factory=RunUsageLimits, description="Per-run usage limits for cost control"
+    )
+
+    agent_usage_limits: AgentUsageLimits = Field(
+        default_factory=AgentUsageLimits,
+        description="Agent-lifetime usage limits (declared, not yet enforced)",
     )
 
     compaction_cfg: CompactionConfig = Field(
@@ -509,17 +540,18 @@ class ReactAgentConfig(BaseModel):
 
         When auto-compaction is live, the effective threshold must sit strictly below every
         set token limit; otherwise pydantic-ai raises UsageLimitExceeded first and the
-        auto-trigger is dead code.
+        auto-trigger is dead code. Reads the RUN tier only — the agent tier's token fields
+        are never enforced, so they cannot pre-empt the trigger.
         """
         context_length = self.model_cfg.context_length
         if not (self.compaction_cfg.auto_trigger and context_length is not None):
             return self
         threshold = int(context_length * self.compaction_cfg.trigger_ratio)
         for name in ("input_tokens_limit", "total_tokens_limit"):
-            limit = getattr(self.usage_limits, name)
+            limit = getattr(self.run_usage_limits, name)
             if limit is not None and threshold >= limit:
                 raise ValueError(
                     f"compaction threshold {threshold} must be strictly below "
-                    f"usage_limits.{name} ({limit})"
+                    f"run_usage_limits.{name} ({limit})"
                 )
         return self

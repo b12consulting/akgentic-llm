@@ -11,7 +11,7 @@ from pydantic_ai import UsageLimits as PydanticUsageLimits
 from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, ToolReturnPart
 
 from .compaction import CompactionResult, CompactionStrategy, create_compaction
-from .config import ReactAgentConfig, UsageLimits
+from .config import ReactAgentConfig, RunUsageLimits
 from .context import ContextManager
 from .event import (
     ContextObserver,
@@ -206,7 +206,7 @@ class ReactAgent:
         # appends, so compacting here takes effect for the whole turn.
         await self._maybe_compact()
         user_prompt = self._fold_pending_operator_actions(user_prompt)
-        pydantic_limits = self._to_pydantic_limits(self._config.usage_limits)
+        pydantic_limits = self._to_pydantic_limits(self._config.run_usage_limits)
 
         try:
             # Track messages added in THIS run to prevent duplicates
@@ -472,11 +472,14 @@ class ReactAgent:
             task.cancel()
         loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
 
-    def _to_pydantic_limits(self, limits: UsageLimits | None) -> PydanticUsageLimits | None:
-        """Convert config UsageLimits to pydantic-ai UsageLimits.
+    def _to_pydantic_limits(self, limits: RunUsageLimits | None) -> PydanticUsageLimits | None:
+        """Convert the config's run tier to pydantic-ai UsageLimits.
+
+        The agent tier is never consulted here: pydantic-ai bounds one run, and the
+        agent-lifetime budget is enforced outside the per-run conversion.
 
         Args:
-            limits: Config usage limits or None
+            limits: Config run-scoped usage limits or None
 
         Returns:
             Pydantic-ai usage limits or None
@@ -485,7 +488,7 @@ class ReactAgent:
             return None
 
         return PydanticUsageLimits(
-            request_limit=limits.request_limit,
+            request_limit=limits.run_request_limit,
             tool_calls_limit=limits.tool_calls_limit,
             input_tokens_limit=limits.input_tokens_limit,
             output_tokens_limit=limits.output_tokens_limit,

@@ -13,7 +13,8 @@ Quick Start:
 
 Key Concepts:
     - REACT pattern: Iterative agent execution with tool calls
-    - UsageLimits: Token/request budgets to control costs
+    - RunUsageLimits: Per-run token/request budget, enforced by pydantic-ai
+    - AgentUsageLimits: Agent-lifetime budget (declared, not yet enforced)
     - ContextManager: Message history tracking
     - PromptTemplate: Template-based prompts with parameter substitution
 """
@@ -27,11 +28,13 @@ from .compaction import (
     create_compaction,
 )
 from .config import (
+    AgentUsageLimits,
     CompactionConfig,
     HttpClientConfig,
     ModelConfig,
     ReactAgentConfig,
     RuntimeConfig,
+    RunUsageLimits,
     UsageLimits,
 )
 from .context import ContextManager
@@ -62,7 +65,9 @@ from .providers import create_http_client, create_model, create_model_settings, 
 __all__ = [
     # Configuration
     "ModelConfig",
-    "UsageLimits",
+    "RunUsageLimits",
+    "AgentUsageLimits",
+    "UsageLimits",  # deprecated alias of RunUsageLimits
     "RuntimeConfig",
     "HttpClientConfig",
     "ReactAgentConfig",

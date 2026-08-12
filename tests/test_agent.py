@@ -14,8 +14,8 @@ from akgentic.llm import (
     ModelConfig,
     ReactAgent,
     ReactAgentConfig,
+    RunUsageLimits,
     UsageLimitError,
-    UsageLimits,
     UserPrompt,
 )
 from akgentic.llm.compaction import SummarizingCompaction
@@ -72,7 +72,7 @@ def config_with_limits():
     """ReactAgentConfig with usage limits."""
     return ReactAgentConfig(
         model_cfg=ModelConfig(provider="openai", model="gpt-4o"),
-        usage_limits=UsageLimits(request_limit=5, total_tokens_limit=1000),
+        run_usage_limits=RunUsageLimits(run_request_limit=5, total_tokens_limit=1000),
     )
 
 
@@ -473,8 +473,9 @@ class TestReactAgentUsageLimits:
         """Test usage limits from config converted to pydantic-ai format."""
         agent = ReactAgent(config=config_with_limits)
         # Test that conversion happens without error
-        pydantic_limits = agent._to_pydantic_limits(config_with_limits.usage_limits)
+        pydantic_limits = agent._to_pydantic_limits(config_with_limits.run_usage_limits)
         assert pydantic_limits is not None
+        # run_request_limit maps onto pydantic-ai's request_limit
         assert pydantic_limits.request_limit == 5
         assert pydantic_limits.total_tokens_limit == 1000
 
@@ -1348,7 +1349,7 @@ class TestReactAgentConfigValidatorsAtConstruction:
             ReactAgentConfig(
                 model_cfg=ModelConfig(provider="openai", model="gpt-4o", context_length=1000),
                 compaction_cfg=CompactionConfig(auto_trigger=True, trigger_ratio=0.85),
-                usage_limits=UsageLimits(input_tokens_limit=800),  # 850 >= 800
+                run_usage_limits=RunUsageLimits(input_tokens_limit=800),  # 850 >= 800
             )
 
     def test_valid_config_builds_agent(self):
@@ -1356,7 +1357,7 @@ class TestReactAgentConfigValidatorsAtConstruction:
         config = ReactAgentConfig(
             model_cfg=ModelConfig(provider="openai", model="gpt-4o", context_length=10_000),
             compaction_cfg=CompactionConfig(auto_trigger=True, trigger_ratio=0.85),
-            usage_limits=UsageLimits(input_tokens_limit=50_000),
+            run_usage_limits=RunUsageLimits(input_tokens_limit=50_000),
         )
         agent = ReactAgent(config=config)
         assert agent is not None

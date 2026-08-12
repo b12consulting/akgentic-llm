@@ -5,11 +5,13 @@ from pydantic import ValidationError
 
 from akgentic.llm import config as config_module
 from akgentic.llm.config import (
+    AgentUsageLimits,
     CompactionConfig,
     ModelConfig,
     ReactAgentConfig,
     RuntimeConfig,
-    UsageLimits,
+    RunUsageLimits,
+    TokenUsageLimits,
 )
 
 
@@ -311,19 +313,19 @@ class TestModelConfigFallbackModels:
         assert ModelConfig(provider="openai", model="gpt-4o").fallback_models == []
 
 
-class TestUsageLimits:
-    """Test UsageLimits model."""
+class TestRunUsageLimits:
+    """Test RunUsageLimits model — the per-run tier."""
 
     def test_all_limits_none(self):
         """Test limits can be None (unlimited)."""
-        limits = UsageLimits(
-            request_limit=None,
+        limits = RunUsageLimits(
+            run_request_limit=None,
             tool_calls_limit=None,
             input_tokens_limit=None,
             output_tokens_limit=None,
             total_tokens_limit=None,
         )
-        assert limits.request_limit is None
+        assert limits.run_request_limit is None
         assert limits.tool_calls_limit is None
         assert limits.input_tokens_limit is None
         assert limits.output_tokens_limit is None
@@ -331,46 +333,127 @@ class TestUsageLimits:
 
     def test_specific_limits(self):
         """Test setting specific limits."""
-        limits = UsageLimits(request_limit=10, total_tokens_limit=5000)
-        assert limits.request_limit == 10
+        limits = RunUsageLimits(run_request_limit=10, total_tokens_limit=5000)
+        assert limits.run_request_limit == 10
         assert limits.total_tokens_limit == 5000
 
     def test_all_limits_set(self):
         """Test all limits can be set."""
-        limits = UsageLimits(
-            request_limit=100,
+        limits = RunUsageLimits(
+            run_request_limit=100,
             tool_calls_limit=50,
             input_tokens_limit=2000,
             output_tokens_limit=1000,
             total_tokens_limit=3000,
         )
-        assert limits.request_limit == 100
+        assert limits.run_request_limit == 100
         assert limits.tool_calls_limit == 50
         assert limits.input_tokens_limit == 2000
         assert limits.output_tokens_limit == 1000
         assert limits.total_tokens_limit == 3000
 
-    def test_default_request_limit(self):
-        """Test default request_limit is 50."""
-        limits = UsageLimits()
-        assert limits.request_limit == 50
+    def test_default_run_request_limit(self):
+        """Test default run_request_limit is 50 — the same brake the pre-split tier had."""
+        limits = RunUsageLimits()
+        assert limits.run_request_limit == 50
 
     def test_invalid_negative_limit(self):
         """Test negative limits raise error."""
         with pytest.raises(ValidationError):
-            UsageLimits(request_limit=-1)
+            RunUsageLimits(run_request_limit=-1)
 
     def test_invalid_zero_limit(self):
         """Test zero limits raise error."""
         with pytest.raises(ValidationError):
-            UsageLimits(total_tokens_limit=0)
+            RunUsageLimits(total_tokens_limit=0)
 
     def test_serialization(self):
         """Test model serialization."""
-        limits = UsageLimits(request_limit=10, total_tokens_limit=5000)
+        limits = RunUsageLimits(run_request_limit=10, total_tokens_limit=5000)
         data = limits.model_dump()
-        assert data["request_limit"] == 10
+        assert data["run_request_limit"] == 10
         assert data["total_tokens_limit"] == 5000
+
+    def test_field_set(self):
+        """Exact field set — a field landing on the wrong tier must fail here."""
+        assert set(RunUsageLimits.model_fields) == {
+            "run_request_limit",
+            "tool_calls_limit",
+            "input_tokens_limit",
+            "output_tokens_limit",
+            "total_tokens_limit",
+        }
+
+    def test_carries_no_agent_request_limit(self):
+        """The run tier does not carry the agent tier's counter."""
+        assert "agent_request_limit" not in RunUsageLimits.model_fields
+
+
+class TestAgentUsageLimits:
+    """Test AgentUsageLimits model — the agent-lifetime tier."""
+
+    def test_field_set(self):
+        """Exact field set: agent_request_limit plus the three inherited token fields."""
+        assert set(AgentUsageLimits.model_fields) == {
+            "agent_request_limit",
+            "input_tokens_limit",
+            "output_tokens_limit",
+            "total_tokens_limit",
+        }
+
+    def test_carries_no_run_tier_fields(self):
+        """tool_calls_limit and run_request_limit belong to the run tier only."""
+        assert "tool_calls_limit" not in AgentUsageLimits.model_fields
+        assert "run_request_limit" not in AgentUsageLimits.model_fields
+
+    def test_agent_request_limit_defaults_to_none(self):
+        """Unlimited by default — no lifetime brake unless one is asked for."""
+        assert AgentUsageLimits().agent_request_limit is None
+
+    def test_agent_request_limit_set(self):
+        """The lifetime counter accepts a positive value."""
+        assert AgentUsageLimits(agent_request_limit=3).agent_request_limit == 3
+
+    def test_invalid_zero_agent_request_limit(self):
+        """Zero is rejected (gt=0)."""
+        with pytest.raises(ValidationError):
+            AgentUsageLimits(agent_request_limit=0)
+
+    def test_token_fields_declared_but_unenforced(self):
+        """Token fields exist for shape symmetry; nothing in the library reads them."""
+        limits = AgentUsageLimits(input_tokens_limit=100, total_tokens_limit=200)
+        assert limits.input_tokens_limit == 100
+        assert limits.total_tokens_limit == 200
+
+
+class TestTokenUsageLimits:
+    """Test TokenUsageLimits — the token-only base shared by both tiers."""
+
+    def test_field_set(self):
+        """The base carries exactly the three token fields and nothing else."""
+        assert set(TokenUsageLimits.model_fields) == {
+            "input_tokens_limit",
+            "output_tokens_limit",
+            "total_tokens_limit",
+        }
+
+    def test_request_names_are_not_fields(self):
+        """Neither request-count spelling is a field on the base."""
+        assert "request_limit" not in TokenUsageLimits.model_fields
+        assert "run_request_limit" not in TokenUsageLimits.model_fields
+        assert "tool_calls_limit" not in TokenUsageLimits.model_fields
+
+    def test_defaults_are_none(self):
+        """All three token limits default to unlimited."""
+        limits = TokenUsageLimits()
+        assert limits.input_tokens_limit is None
+        assert limits.output_tokens_limit is None
+        assert limits.total_tokens_limit is None
+
+    def test_both_tiers_are_subclasses(self):
+        """Both tiers inherit the token budget."""
+        assert issubclass(RunUsageLimits, TokenUsageLimits)
+        assert issubclass(AgentUsageLimits, TokenUsageLimits)
 
 
 class TestAgentRuntimeConfig:
@@ -437,7 +520,7 @@ class TestReactAgentConfig:
 
         config = ReactAgentConfig(
             model_cfg=ModelConfig(provider="openai", model="gpt-4o", temperature=0.7),
-            usage_limits=UsageLimits(request_limit=10, total_tokens_limit=5000),
+            run_usage_limits=RunUsageLimits(run_request_limit=10, total_tokens_limit=5000),
             runtime_cfg=RuntimeConfig(retries=5, http_client_config=HttpClientConfig(timeout=60.0)),
         )
         assert config.model_cfg.provider == "openai"
@@ -445,8 +528,8 @@ class TestReactAgentConfig:
         assert config.runtime_cfg.retries == 5
         assert config.runtime_cfg.http_client_config.timeout == 60.0
         assert config.model_cfg.temperature == 0.7
-        assert config.usage_limits.request_limit == 10  # type: ignore
-        assert config.usage_limits.total_tokens_limit == 5000  # type: ignore
+        assert config.run_usage_limits.run_request_limit == 10
+        assert config.run_usage_limits.total_tokens_limit == 5000
         assert config.runtime_cfg.retries == 5
 
     def test_defaults(self):
@@ -454,10 +537,18 @@ class TestReactAgentConfig:
         config = ReactAgentConfig()
         assert config.model_cfg.provider == "openai"
         assert config.model_cfg.model == "gpt-5.2"
-        assert config.usage_limits is not None
-        assert config.usage_limits.request_limit == 50
+        assert config.run_usage_limits is not None
+        assert config.run_usage_limits.run_request_limit == 50
+        assert config.agent_usage_limits is not None
+        assert config.agent_usage_limits.agent_request_limit is None
         assert config.runtime_cfg.retries == 3
         assert config.runtime_cfg.http_client_config.timeout == 120.0
+
+    def test_usage_limits_is_not_a_declared_field(self):
+        """The pre-split field name no longer exists as a model field."""
+        assert "usage_limits" not in ReactAgentConfig.model_fields
+        assert "run_usage_limits" in ReactAgentConfig.model_fields
+        assert "agent_usage_limits" in ReactAgentConfig.model_fields
 
     def test_minimal_config(self):
         """Test minimal configuration."""
@@ -467,19 +558,19 @@ class TestReactAgentConfig:
         assert config.model_cfg.provider == "anthropic"
         assert config.model_cfg.model == "claude-3-5-sonnet-20241022"
         # Defaults should be set
-        assert config.usage_limits is not None
-        assert config.usage_limits.request_limit == 50
+        assert config.run_usage_limits is not None
+        assert config.run_usage_limits.run_request_limit == 50
         assert config.runtime_cfg is not None
 
     def test_serialization(self):
         """Test model serialization."""
         config = ReactAgentConfig(
             model_cfg=ModelConfig(provider="openai", model="gpt-4o"),
-            usage_limits=UsageLimits(request_limit=10),
+            run_usage_limits=RunUsageLimits(run_request_limit=10),
         )
         data = config.model_dump()
         assert data["model_cfg"]["provider"] == "openai"
-        assert data["usage_limits"]["request_limit"] == 10
+        assert data["run_usage_limits"]["run_request_limit"] == 10
 
     def test_json_serialization(self):
         """Test JSON serialization."""
@@ -636,7 +727,7 @@ class TestReactAgentCompactionConfig:
         with pytest.raises(ValidationError):
             ReactAgentConfig(
                 model_cfg=ModelConfig(context_length=1000),
-                usage_limits=UsageLimits(input_tokens_limit=850),
+                run_usage_limits=RunUsageLimits(input_tokens_limit=850),
             )
 
     def test_threshold_at_or_above_total_limit_rejected(self):
@@ -644,14 +735,14 @@ class TestReactAgentCompactionConfig:
         with pytest.raises(ValidationError):
             ReactAgentConfig(
                 model_cfg=ModelConfig(context_length=1000),
-                usage_limits=UsageLimits(total_tokens_limit=800),
+                run_usage_limits=RunUsageLimits(total_tokens_limit=800),
             )
 
     def test_threshold_strictly_below_both_accepted(self):
         """threshold strictly below both limits constructs — AC 9."""
         config = ReactAgentConfig(
             model_cfg=ModelConfig(context_length=1000),
-            usage_limits=UsageLimits(input_tokens_limit=2000, total_tokens_limit=3000),
+            run_usage_limits=RunUsageLimits(input_tokens_limit=2000, total_tokens_limit=3000),
         )
         assert config.model_cfg.context_length == 1000
 
@@ -662,17 +753,30 @@ class TestReactAgentCompactionConfig:
 
     def test_threshold_skipped_when_context_length_none(self):
         """context_length=None skips the threshold check regardless of limits — AC 9."""
-        config = ReactAgentConfig(usage_limits=UsageLimits(input_tokens_limit=1))
-        assert config.usage_limits.input_tokens_limit == 1
+        config = ReactAgentConfig(run_usage_limits=RunUsageLimits(input_tokens_limit=1))
+        assert config.run_usage_limits.input_tokens_limit == 1
 
     def test_threshold_skipped_when_auto_trigger_false(self):
         """auto_trigger=False skips the threshold check regardless of limits — AC 9."""
         config = ReactAgentConfig(
             model_cfg=ModelConfig(context_length=1000),
             compaction_cfg=CompactionConfig(auto_trigger=False),
-            usage_limits=UsageLimits(input_tokens_limit=1),
+            run_usage_limits=RunUsageLimits(input_tokens_limit=1),
         )
         assert config.compaction_cfg.auto_trigger is False
+
+    def test_agent_tier_token_limits_do_not_arm_the_threshold_validator(self):
+        """The validator reads the RUN tier only — an agent-tier limit never trips it.
+
+        Same numbers that raise on run_usage_limits (threshold 850 >= 850) construct
+        cleanly here, which pins the validator to one tier rather than to the values.
+        """
+        config = ReactAgentConfig(
+            model_cfg=ModelConfig(context_length=1000),
+            agent_usage_limits=AgentUsageLimits(input_tokens_limit=850, total_tokens_limit=800),
+        )
+        assert config.agent_usage_limits.input_tokens_limit == 850
+        assert config.agent_usage_limits.total_tokens_limit == 800
 
 
 class TestCompactionBudgetIsPrimaryOnly:
@@ -698,7 +802,7 @@ class TestCompactionBudgetIsPrimaryOnly:
                         )
                     ],
                 ),
-                usage_limits=UsageLimits(input_tokens_limit=850),
+                run_usage_limits=RunUsageLimits(input_tokens_limit=850),
             )
 
     def test_primary_threshold_still_accepted_despite_huge_fallback_window(self):
@@ -714,7 +818,7 @@ class TestCompactionBudgetIsPrimaryOnly:
                     )
                 ],
             ),
-            usage_limits=UsageLimits(input_tokens_limit=2000, total_tokens_limit=3000),
+            run_usage_limits=RunUsageLimits(input_tokens_limit=2000, total_tokens_limit=3000),
         )
         assert config.model_cfg.context_length == 1000
         assert config.model_cfg.fallback_models[0].context_length == 2_000_000
