@@ -337,6 +337,29 @@ class AgentUsageLimits(TokenUsageLimits):
     )
 
 
+def _fold_pre_split_request_limit(data: dict[str, Any], owner: str) -> dict[str, Any]:
+    """Fold a pre-split ``request_limit`` key onto ``run_request_limit``.
+
+    Shared by the UsageLimits shim and the ReactAgentConfig keyword shim, which has to
+    reach inside a mapping value: a dict routed to ``run_usage_limits`` is validated as
+    RunUsageLimits, where ``request_limit`` is an unknown key that Pydantic drops in
+    silence — accepted-and-discarded, the one failure mode the shim exists to prevent.
+
+    Raises:
+        ValueError: if both spellings are present; which wins would depend on order.
+    """
+    if "request_limit" not in data:
+        return data
+    if "run_request_limit" in data:
+        raise ValueError(
+            f"{owner} received both request_limit (deprecated) and run_request_limit; "
+            "which one wins would depend on argument order — pass only run_request_limit"
+        )
+    mapped = dict(data)
+    mapped["run_request_limit"] = mapped.pop("request_limit")
+    return mapped
+
+
 class UsageLimits(RunUsageLimits):
     """DEPRECATED alias of RunUsageLimits, the run tier.
 
@@ -355,25 +378,21 @@ class UsageLimits(RunUsageLimits):
 
         Runs before field validation, so ``request_limit`` never reaches Pydantic as an
         unexpected keyword. Non-dict input (model_validate of an instance) passes through.
+
+        The both-spellings ValueError is raised BEFORE the warning: under
+        ``-W error::DeprecationWarning`` a warning emitted first would propagate in place
+        of the error, hiding what the caller actually got wrong.
         """
         if not isinstance(data, dict):
             return data
+        folded = _fold_pre_split_request_limit(data, "UsageLimits")
         warnings.warn(
             f"UsageLimits is deprecated and will be removed in {_SHIM_REMOVAL_RELEASE}; "
             "use RunUsageLimits(run_request_limit=...) instead",
             DeprecationWarning,
             stacklevel=3,
         )
-        if "request_limit" not in data:
-            return data
-        if "run_request_limit" in data:
-            raise ValueError(
-                "UsageLimits received both request_limit (deprecated) and run_request_limit; "
-                "which one wins would depend on argument order — pass only run_request_limit"
-            )
-        mapped = dict(data)
-        mapped["run_request_limit"] = mapped.pop("request_limit")
-        return mapped
+        return folded
 
     @property
     def request_limit(self) -> int | None:
@@ -587,6 +606,10 @@ class ReactAgentConfig(BaseModel):
         Runs before field validation, so ``usage_limits`` never reaches Pydantic as an
         unexpected keyword. The value must actually land on ``run_usage_limits``:
         accepting it and discarding it would leave the agent on a budget nobody chose.
+
+        A mapping value gets the same treatment one level down, because it is validated
+        as RunUsageLimits — where a pre-split ``request_limit`` key would be dropped in
+        silence, which is the same failure with an extra layer of indirection.
         """
         if not isinstance(data, dict) or "usage_limits" not in data:
             return data
@@ -596,14 +619,17 @@ class ReactAgentConfig(BaseModel):
                 "run_usage_limits; which one wins would depend on argument order — "
                 "pass only run_usage_limits"
             )
+        mapped = dict(data)
+        value = mapped.pop("usage_limits")
+        if isinstance(value, dict):
+            value = _fold_pre_split_request_limit(value, "ReactAgentConfig(usage_limits=...)")
         warnings.warn(
             f"ReactAgentConfig(usage_limits=...) is deprecated and will be removed in "
             f"{_SHIM_REMOVAL_RELEASE}; use run_usage_limits=... instead",
             DeprecationWarning,
             stacklevel=3,
         )
-        mapped = dict(data)
-        mapped["run_usage_limits"] = mapped.pop("usage_limits")
+        mapped["run_usage_limits"] = value
         return mapped
 
     @property
@@ -635,7 +661,7 @@ class ReactAgentConfig(BaseModel):
         return self
 
     @model_validator(mode="after")
-    def _reject_threshold_above_usage_limits(self) -> "ReactAgentConfig":
+    def _reject_threshold_above_run_usage_limits(self) -> "ReactAgentConfig":
         """Threshold-vs-usage-limit: keep the auto-trigger reachable before usage limits bite.
 
         When auto-compaction is live, the effective threshold must sit strictly below every

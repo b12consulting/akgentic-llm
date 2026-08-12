@@ -103,6 +103,19 @@ class TestDeprecatedUsageLimitsClass:
         with pytest.raises(ValueError):
             UsageLimits(request_limit=10, run_request_limit=10)
 
+    def test_both_spellings_raise_before_the_deprecation_warning(self):
+        """The ValueError must not be pre-empted by the deprecation warning.
+
+        Downstream projects routinely run with ``-W error::DeprecationWarning`` to hunt
+        deprecated usage. If the warning fires first, that turns into the raised
+        exception and the caller never sees the message telling them what is actually
+        wrong with their call.
+        """
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", DeprecationWarning)
+            with pytest.raises(ValueError):
+                UsageLimits(request_limit=10, run_request_limit=20)
+
     def test_is_a_run_usage_limits(self):
         """Subclassing is what lets an old instance satisfy the new annotation."""
         with pytest.warns(DeprecationWarning):
@@ -244,6 +257,51 @@ class TestDeprecatedUsageLimitsField:
         """The class docstring schedules the shim's deletion."""
         assert ReactAgentConfig.__doc__ is not None
         assert REMOVAL_RELEASE in ReactAgentConfig.__doc__
+
+    def test_read_accessor_docstring_names_the_removal_release(self):
+        """The accessor schedules its own deletion, not only the class docstring."""
+        doc = ReactAgentConfig.usage_limits.__doc__
+        assert doc is not None
+        assert REMOVAL_RELEASE in doc
+
+    def test_mapping_value_maps_the_inner_pre_split_spelling(self):
+        """A dict under the old keyword keeps its budget too.
+
+        The dict is validated as RunUsageLimits, where ``request_limit`` is an unknown
+        key that Pydantic drops in silence. Warning about the outer keyword while losing
+        the inner value is the accepted-and-discarded failure with one more layer of
+        indirection — the caller is told the shim handled their input, and it did not.
+        """
+        with pytest.warns(DeprecationWarning):
+            config = ReactAgentConfig(usage_limits={"request_limit": 10})
+        assert config.run_usage_limits.run_request_limit == 10
+
+    def test_mapping_value_with_both_spellings_rejected(self):
+        """Ambiguity one level down is still ambiguity."""
+        with pytest.raises(ValueError):
+            ReactAgentConfig(usage_limits={"request_limit": 10, "run_request_limit": 20})
+
+    def test_both_names_raise_before_the_deprecation_warning(self):
+        """As on the class shim: the error must survive -W error::DeprecationWarning."""
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", DeprecationWarning)
+            with pytest.raises(ValueError):
+                ReactAgentConfig(
+                    usage_limits=RunUsageLimits(run_request_limit=10),
+                    run_usage_limits=RunUsageLimits(run_request_limit=20),
+                )
+
+    def test_assignment_through_the_deprecated_name_is_not_shimmed(self):
+        """The accessor is read-only, and says so by failing rather than by shadowing.
+
+        Only the constructor keyword and the attribute read are preserved. What matters
+        is that a write fails loudly instead of parking the value on a shadow attribute
+        that ``run_usage_limits`` would never see.
+        """
+        config = ReactAgentConfig(run_usage_limits=RunUsageLimits(run_request_limit=10))
+        with pytest.raises((AttributeError, ValueError)):
+            config.usage_limits = RunUsageLimits(run_request_limit=99)
+        assert config.run_usage_limits.run_request_limit == 10
 
 
 class TestRealConsumerCallShape:

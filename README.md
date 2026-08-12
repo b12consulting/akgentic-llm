@@ -235,7 +235,7 @@ cannot make the auto-trigger unreachable.
 | `ReactAgentConfig(usage_limits=...)` | `ReactAgentConfig(run_usage_limits=...)` |
 | `config.usage_limits` | `config.run_usage_limits` |
 
-Two things the shim deliberately does **not** do:
+Three things the shim deliberately does **not** do:
 
 - **Passing both names raises `ValueError`.** `ReactAgentConfig(usage_limits=a, run_usage_limits=b)`
   is rejected rather than resolved, because which one won would otherwise depend on the
@@ -243,6 +243,8 @@ Two things the shim deliberately does **not** do:
 - **Serialization keys are not preserved.** `model_dump()` emits `run_usage_limits` and
   `run_request_limit`. Code that round-trips config through JSON and keys off the old
   names must be updated now; only the constructor keyword and the attribute read are shimmed.
+- **Assignment is not shimmed.** `config.usage_limits = ...` raises — the deprecated names
+  are read-only views over the real fields. Assign to `run_usage_limits` instead.
 
 ### RuntimeConfig
 
