@@ -67,7 +67,7 @@ __all__ = [
     "ModelConfig",
     "RunUsageLimits",
     "AgentUsageLimits",
-    "UsageLimits",  # deprecated alias of RunUsageLimits
+    "UsageLimits",  # DEPRECATED alias of RunUsageLimits — removed in 2.0.0
     "RuntimeConfig",
     "HttpClientConfig",
     "ReactAgentConfig",

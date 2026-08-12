@@ -222,6 +222,28 @@ Note that only `run_usage_limits` participates in the compaction-threshold check
 (see [Context compaction](#context-compaction)); a token limit set on the agent tier
 cannot make the auto-trigger unreachable.
 
+#### Migrating from the pre-split surface
+
+> **Deprecated in 1.7.0, removed in 2.0.0.** The pre-split `UsageLimits` class and the
+> `ReactAgentConfig(usage_limits=...)` keyword still work and still carry your values
+> through to `run_usage_limits`, but every use emits a `DeprecationWarning`.
+
+| Before | After |
+|--------|-------|
+| `UsageLimits(request_limit=10)` | `RunUsageLimits(run_request_limit=10)` |
+| `limits.request_limit` | `limits.run_request_limit` |
+| `ReactAgentConfig(usage_limits=...)` | `ReactAgentConfig(run_usage_limits=...)` |
+| `config.usage_limits` | `config.run_usage_limits` |
+
+Two things the shim deliberately does **not** do:
+
+- **Passing both names raises `ValueError`.** `ReactAgentConfig(usage_limits=a, run_usage_limits=b)`
+  is rejected rather than resolved, because which one won would otherwise depend on the
+  order you wrote them in. The same applies to `UsageLimits(request_limit=..., run_request_limit=...)`.
+- **Serialization keys are not preserved.** `model_dump()` emits `run_usage_limits` and
+  `run_request_limit`. Code that round-trips config through JSON and keys off the old
+  names must be updated now; only the constructor keyword and the attribute read are shimmed.
+
 ### RuntimeConfig
 
 | Field | Type | Default | Description |

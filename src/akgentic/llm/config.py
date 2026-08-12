@@ -22,9 +22,14 @@ Examples:
     ... )
 """
 
-from typing import Literal
+import warnings
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
+
+# Release that deletes the pre-split usage-limits shim. Named in every deprecation
+# warning and docstring below so removing it is a scheduled task, not a hunt.
+_SHIM_REMOVAL_RELEASE = "akgentic-llm 2.0.0"
 
 
 class ModelConfig(BaseModel):
@@ -332,9 +337,58 @@ class AgentUsageLimits(TokenUsageLimits):
     )
 
 
-# Deprecated alias of the run tier, kept so pre-split callers still resolve the name.
-# The deprecation machinery (warnings, request_limit mapping) lands in the next commit.
-UsageLimits = RunUsageLimits
+class UsageLimits(RunUsageLimits):
+    """DEPRECATED alias of RunUsageLimits, the run tier.
+
+    Accepts the pre-split ``request_limit=`` spelling and maps it onto
+    ``run_request_limit``; ``.request_limit`` reads back through to the same field.
+    Removed in akgentic-llm 2.0.0 — migrate to ``RunUsageLimits(run_request_limit=...)``.
+
+    ``request_limit`` is a read accessor, never a field: a second storage slot would
+    reintroduce the split-brain state the rename exists to remove.
+    """
+
+    @model_validator(mode="before")
+    @classmethod
+    def _map_pre_split_request_limit(cls, data: Any) -> Any:
+        """Warn on construction and fold ``request_limit`` into ``run_request_limit``.
+
+        Runs before field validation, so ``request_limit`` never reaches Pydantic as an
+        unexpected keyword. Non-dict input (model_validate of an instance) passes through.
+        """
+        if not isinstance(data, dict):
+            return data
+        warnings.warn(
+            f"UsageLimits is deprecated and will be removed in {_SHIM_REMOVAL_RELEASE}; "
+            "use RunUsageLimits(run_request_limit=...) instead",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+        if "request_limit" not in data:
+            return data
+        if "run_request_limit" in data:
+            raise ValueError(
+                "UsageLimits received both request_limit (deprecated) and run_request_limit; "
+                "which one wins would depend on argument order — pass only run_request_limit"
+            )
+        mapped = dict(data)
+        mapped["run_request_limit"] = mapped.pop("request_limit")
+        return mapped
+
+    @property
+    def request_limit(self) -> int | None:
+        """DEPRECATED read accessor for ``run_request_limit``.
+
+        Removed in akgentic-llm 2.0.0. Reflects the underlying field regardless of
+        which spelling set it.
+        """
+        warnings.warn(
+            f"UsageLimits.request_limit is deprecated and will be removed in "
+            f"{_SHIM_REMOVAL_RELEASE}; read run_request_limit instead",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.run_request_limit
 
 
 class HttpClientConfig(BaseModel):
@@ -471,6 +525,11 @@ class ReactAgentConfig(BaseModel):
         compaction_cfg: Context-compaction configuration.
         max_messages: Sliding-window size handed to ContextManager; None = unlimited.
 
+    Deprecated:
+        ``usage_limits`` survives as a constructor keyword and a read accessor for
+        ``run_usage_limits``. Both warn, and both are removed in akgentic-llm 2.0.0.
+        Passing ``usage_limits`` and ``run_usage_limits`` together raises ValueError.
+
     Example:
         >>> # Minimal configuration with defaults
         >>> config = ReactAgentConfig(
@@ -519,6 +578,47 @@ class ReactAgentConfig(BaseModel):
         ge=0,
         description="Sliding-window size handed to ContextManager; None = unlimited",
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _map_pre_split_usage_limits(cls, data: Any) -> Any:
+        """Warn on the deprecated ``usage_limits=`` keyword and route it to the run tier.
+
+        Runs before field validation, so ``usage_limits`` never reaches Pydantic as an
+        unexpected keyword. The value must actually land on ``run_usage_limits``:
+        accepting it and discarding it would leave the agent on a budget nobody chose.
+        """
+        if not isinstance(data, dict) or "usage_limits" not in data:
+            return data
+        if "run_usage_limits" in data:
+            raise ValueError(
+                "ReactAgentConfig received both usage_limits (deprecated) and "
+                "run_usage_limits; which one wins would depend on argument order — "
+                "pass only run_usage_limits"
+            )
+        warnings.warn(
+            f"ReactAgentConfig(usage_limits=...) is deprecated and will be removed in "
+            f"{_SHIM_REMOVAL_RELEASE}; use run_usage_limits=... instead",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+        mapped = dict(data)
+        mapped["run_usage_limits"] = mapped.pop("usage_limits")
+        return mapped
+
+    @property
+    def usage_limits(self) -> RunUsageLimits:
+        """DEPRECATED read accessor for ``run_usage_limits``.
+
+        Removed in akgentic-llm 2.0.0. Returns the run tier itself, not a copy.
+        """
+        warnings.warn(
+            f"ReactAgentConfig.usage_limits is deprecated and will be removed in "
+            f"{_SHIM_REMOVAL_RELEASE}; read run_usage_limits instead",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.run_usage_limits
 
     @model_validator(mode="after")
     def _reject_window_with_auto_compaction(self) -> "ReactAgentConfig":
