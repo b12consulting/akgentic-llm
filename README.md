@@ -207,10 +207,22 @@ Spans **every run the agent performs**, not one call.
 | `output_tokens_limit` | `int \| None` | `None` | Declared for shape symmetry — **never enforced** |
 | `total_tokens_limit` | `int \| None` | `None` | Declared for shape symmetry — **never enforced** |
 
-> **Not yet enforced.** `agent_request_limit` is declared here but no code reads it yet;
-> the pre-flight run counter that enforces it lands later on this epic. Setting it today
-> changes nothing. The three inherited token fields are never enforced at all — they exist
-> only so both tiers have the same shape.
+`agent_request_limit` is checked **before** each `run()` executes. Once the agent has
+used its budget, every further call raises `UsageLimitError` — the same class a run-tier
+breach raises — with a message of the form
+`Exceeded the agent_request_limit of 100 (run_count=100)`.
+
+Two consequences worth knowing before you set it:
+
+- **A run that fails still counts.** The budget is consumed before the call executes, not
+  after it returns — including when the call ends in a *run-tier* `UsageLimitError`. An
+  agent stuck in a failing loop therefore still runs out of lifetime budget, which is the
+  point: both limits mean "this agent is burning too many turns".
+- **The counter is in memory, not persisted.** It counts runs *consumed*; a rejected call
+  consumes nothing, so repeated rejections do not inflate it.
+
+The three inherited token fields are never enforced at all — they exist only so both tiers
+have the same shape.
 
 ```python
 from akgentic.llm import AgentUsageLimits
@@ -286,7 +298,7 @@ config = ReactAgentConfig(
         total_tokens_limit=50_000,
     ),
     agent_usage_limits=AgentUsageLimits(
-        agent_request_limit=100,  # declared, not yet enforced
+        agent_request_limit=100,  # max run() calls over this agent's lifetime
     ),
     runtime_cfg=RuntimeConfig(
         end_strategy="exhaustive",

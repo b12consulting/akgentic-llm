@@ -1,7 +1,7 @@
 """Unit tests for ReactAgent implementation."""
 
 from dataclasses import dataclass
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from pydantic_ai import BinaryContent
@@ -9,6 +9,7 @@ from pydantic_ai.exceptions import UsageLimitExceeded
 from pydantic_ai.messages import ModelRequest, SystemPromptPart, UserPromptPart
 
 from akgentic.llm import (
+    AgentUsageLimits,
     CompactionConfig,
     CompactionResult,
     ModelConfig,
@@ -484,6 +485,154 @@ class TestReactAgentUsageLimits:
         agent = ReactAgent(config=minimal_config)
         pydantic_limits = agent._to_pydantic_limits(None)
         assert pydantic_limits is None
+
+    def test_agent_tier_is_not_converted_to_pydantic_limits(self):
+        """Test the agent tier never leaks into the per-run pydantic-ai limits."""
+        config = ReactAgentConfig(
+            model_cfg=ModelConfig(provider="openai", model="gpt-4o"),
+            run_usage_limits=RunUsageLimits(run_request_limit=5),
+            agent_usage_limits=AgentUsageLimits(agent_request_limit=1),
+        )
+        agent = ReactAgent(config=config)
+        pydantic_limits = agent._to_pydantic_limits(config.run_usage_limits)
+        # 5 (run tier), never 1 (agent tier) — the tiers must not be conflated
+        assert pydantic_limits.request_limit == 5
+
+
+class _StubRun:
+    """Stand-in for pydantic-ai's iter() run object: yields nothing, calls no model."""
+
+    def __init__(self, *args, **kwargs):
+        self.result = MagicMock(output="ok")
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_):
+        return False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        raise StopAsyncIteration
+
+    def new_messages(self):
+        return []
+
+
+def _agent_limit_config(limit):
+    """Config carrying only an agent-tier run budget."""
+    return ReactAgentConfig(
+        model_cfg=ModelConfig(provider="openai", model="gpt-4o"),
+        agent_usage_limits=AgentUsageLimits(agent_request_limit=limit),
+    )
+
+
+class TestReactAgentRunCountEnforcement:
+    """Test the agent-lifetime run budget: pre-flight, check-then-consume."""
+
+    def test_fresh_agent_starts_at_zero(self, minimal_config):
+        """Test a newly constructed agent has consumed no runs."""
+        agent = ReactAgent(config=minimal_config)
+        assert agent._run_count == 0
+
+    def test_runs_up_to_the_limit_succeed(self):
+        """Test calls 1..N execute and consume exactly N."""
+        agent = ReactAgent(config=_agent_limit_config(2))
+        with patch.object(agent._pydantic_agent, "iter", side_effect=_StubRun):
+            agent.run_sync("first")
+            agent.run_sync("second")
+        assert agent._run_count == 2
+
+    def test_run_past_the_limit_raises_and_does_not_consume(self):
+        """Test call N+1 is rejected and leaves the counter pinned at the limit."""
+        agent = ReactAgent(config=_agent_limit_config(2))
+        with patch.object(agent._pydantic_agent, "iter", side_effect=_StubRun):
+            agent.run_sync("first")
+            agent.run_sync("second")
+            with pytest.raises(UsageLimitError) as exc_info:
+                agent.run_sync("third")
+        # The rejected call never executed, so it consumed nothing: runs consumed,
+        # never runs attempted.
+        assert agent._run_count == 2
+        assert str(exc_info.value) == "Exceeded the agent_request_limit of 2 (run_count=2)"
+
+    def test_rejection_leaves_context_untouched(self):
+        """Test a rejected run does not reach the tool-call healing path."""
+        agent = ReactAgent(config=_agent_limit_config(1))
+        with patch.object(agent._pydantic_agent, "iter", side_effect=_StubRun):
+            agent.run_sync("first")
+            with pytest.raises(UsageLimitError):
+                agent.run_sync("second")
+        assert agent.context.messages == []
+
+    def test_rejection_happens_before_compaction(self):
+        """Test the budget check precedes compaction: a rejected run costs nothing."""
+        agent = ReactAgent(config=_agent_limit_config(1))
+        with patch.object(agent._pydantic_agent, "iter", side_effect=_StubRun):
+            agent.run_sync("first")
+        with patch.object(agent, "_maybe_compact", new=AsyncMock()) as compact:
+            with pytest.raises(UsageLimitError):
+                agent.run_sync("second")
+        compact.assert_not_called()
+
+    def test_counter_advances_when_the_wrapped_call_raises(self):
+        """Test a run that fails partway has already been counted."""
+        agent = ReactAgent(config=_agent_limit_config(3))
+        with patch.object(agent._pydantic_agent, "iter", side_effect=RuntimeError("boom")):
+            with pytest.raises(RuntimeError):
+                agent.run_sync("first")
+        assert agent._run_count == 1
+
+    def test_counter_advances_when_the_run_tier_limit_fires(self):
+        """Test a run-tier breach still consumes the agent-tier budget."""
+        agent = ReactAgent(config=_agent_limit_config(3))
+        breach = UsageLimitExceeded("The next request would exceed the request_limit of 1")
+        with patch.object(agent._pydantic_agent, "iter", side_effect=breach):
+            with pytest.raises(UsageLimitError) as exc_info:
+                agent.run_sync("first")
+        assert agent._run_count == 1
+        assert "request_limit of 1" in str(exc_info.value)
+
+    def test_repeated_run_tier_failures_exhaust_the_agent_tier(self):
+        """Test the two tiers interact: a run-level loop cannot spin forever."""
+        agent = ReactAgent(config=_agent_limit_config(2))
+        breach = UsageLimitExceeded("The next request would exceed the request_limit of 1")
+        with patch.object(agent._pydantic_agent, "iter", side_effect=breach):
+            for _ in range(2):
+                with pytest.raises(UsageLimitError) as run_tier:
+                    agent.run_sync("burn a turn")
+                assert "The next request would exceed" in str(run_tier.value)
+            with pytest.raises(UsageLimitError) as agent_tier:
+                agent.run_sync("one turn too many")
+        assert str(agent_tier.value) == "Exceeded the agent_request_limit of 2 (run_count=2)"
+
+    def test_unset_limit_never_blocks(self, minimal_config):
+        """Test agent_request_limit=None (the default) blocks nothing but still counts."""
+        assert minimal_config.agent_usage_limits.agent_request_limit is None
+        agent = ReactAgent(config=minimal_config)
+        with patch.object(agent._pydantic_agent, "iter", side_effect=_StubRun):
+            for _ in range(5):
+                agent.run_sync("unbounded")
+        assert agent._run_count == 5
+
+    async def test_async_run_enforces_the_same_budget(self):
+        """Test the async entry point holds the budget (run_sync only delegates to it)."""
+        agent = ReactAgent(config=_agent_limit_config(1))
+        with patch.object(agent._pydantic_agent, "iter", side_effect=_StubRun):
+            await agent.run("first")
+            with pytest.raises(UsageLimitError):
+                await agent.run("second")
+        assert agent._run_count == 1
+
+    def test_run_count_is_not_persisted_config_state(self):
+        """Test the counter is runtime-only: no config field, nothing serialized."""
+        assert "_run_count" not in ReactAgentConfig.model_fields
+        assert "run_count" not in ReactAgentConfig.model_fields
+        dumped = _agent_limit_config(2).model_dump()
+        assert "_run_count" not in dumped
+        assert "run_count" not in dumped
 
 
 class TestReactAgentMultimodalPrompt:

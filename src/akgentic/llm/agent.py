@@ -131,6 +131,11 @@ class ReactAgent:
         self._deps_type = deps_type
         self._result_type = result_type
 
+        # Agent-lifetime run counter backing agent_usage_limits.agent_request_limit.
+        # In memory only: never a Pydantic field, never persisted, recomputed from
+        # replayed usage events on restore.
+        self._run_count: int = 0
+
         # Create context manager (no max_messages by default)
         self._context = ContextManager()
 
@@ -199,8 +204,13 @@ class ReactAgent:
             Agent result output (type matches output_type if given, else result_type)
 
         Raises:
-            UsageLimitError: If usage limits exceeded
+            UsageLimitError: On either tier — the agent-lifetime budget rejecting this
+                call before it runs, or a run-tier limit breached by pydantic-ai
+                mid-run.
         """
+        # Pre-flight: reject before spending anything (a rejected run must not even
+        # pay for compaction's summarizer call).
+        self._check_and_consume_agent_budget()
         # Auto-compact (at most once per turn) BEFORE iter() snapshots the
         # history. iter() reads message_history once at entry and the loop only
         # appends, so compacting here takes effect for the whole turn.
@@ -242,6 +252,30 @@ class ReactAgent:
         except Exception:
             self._heal_unprocessed_tool_calls(traceback.format_exc())
             raise
+
+    def _check_and_consume_agent_budget(self) -> None:
+        """Spend one unit of the agent-lifetime run budget, or refuse to run.
+
+        Check-then-consume: the counter advances **before** the call executes, so a
+        ``run()`` that fails partway — including one that raises the run-tier
+        ``UsageLimitError`` — has already been counted. That ordering is deliberate:
+        an agent whose run-tier limit fires repeatedly must also exhaust its
+        agent-tier budget, since both mean "this agent is burning too many turns"
+        (ADR-013 §D2). Do not move the increment after the call.
+
+        The rejection itself does not consume, so the counter reports runs consumed,
+        never runs attempted, and the message stays stable under repeated rejection.
+        ``agent_request_limit=None`` never blocks.
+
+        Raises:
+            UsageLimitError: If the agent has already used its lifetime run budget.
+        """
+        limit = self._config.agent_usage_limits.agent_request_limit
+        if limit is not None and self._run_count >= limit:
+            raise UsageLimitError(
+                f"Exceeded the agent_request_limit of {limit} (run_count={self._run_count})"
+            )
+        self._run_count += 1
 
     def _fold_pending_operator_actions(self, user_prompt: UserPrompt) -> UserPrompt:
         """Prepend any buffered pre-first-run operator actions to the run prompt.
