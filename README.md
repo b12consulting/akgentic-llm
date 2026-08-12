@@ -212,14 +212,16 @@ used its budget, every further call raises `UsageLimitError` — the same class 
 breach raises — with a message of the form
 `Exceeded the agent_request_limit of 100 (run_count=100)`.
 
-Two consequences worth knowing before you set it:
+Three consequences worth knowing before you set it:
 
 - **A run that fails still counts.** The budget is consumed before the call executes, not
   after it returns — including when the call ends in a *run-tier* `UsageLimitError`. An
   agent stuck in a failing loop therefore still runs out of lifetime budget, which is the
   point: both limits mean "this agent is burning too many turns".
-- **The counter is in memory, not persisted.** It counts runs *consumed*; a rejected call
-  consumes nothing, so repeated rejections do not inflate it.
+- **It counts runs *consumed*, never runs attempted.** A rejected call consumes nothing,
+  so repeated rejections leave the count — and the error message — unchanged.
+- **The counter is in memory, not persisted.** It lives on the agent instance and is
+  never written to a state snapshot, so a fresh instance starts with a full budget.
 
 The three inherited token fields are never enforced at all — they exist only so both tiers
 have the same shape.

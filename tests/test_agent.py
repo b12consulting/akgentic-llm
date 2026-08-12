@@ -486,8 +486,13 @@ class TestReactAgentUsageLimits:
         pydantic_limits = agent._to_pydantic_limits(None)
         assert pydantic_limits is None
 
-    def test_agent_tier_is_not_converted_to_pydantic_limits(self):
-        """Test the agent tier never leaks into the per-run pydantic-ai limits."""
+    def test_converter_reads_the_limits_object_it_is_handed(self):
+        """Test the converter reads its argument's request limit, not the agent tier.
+
+        Narrow by construction: _to_pydantic_limits takes the tier as a parameter, so
+        this pins the conversion only. Which tier run() hands it is the part that can
+        actually regress — see test_run_hands_the_run_tier_to_pydantic_ai.
+        """
         config = ReactAgentConfig(
             model_cfg=ModelConfig(provider="openai", model="gpt-4o"),
             run_usage_limits=RunUsageLimits(run_request_limit=5),
@@ -495,7 +500,6 @@ class TestReactAgentUsageLimits:
         )
         agent = ReactAgent(config=config)
         pydantic_limits = agent._to_pydantic_limits(config.run_usage_limits)
-        # 5 (run tier), never 1 (agent tier) — the tiers must not be conflated
         assert pydantic_limits.request_limit == 5
 
 
@@ -558,14 +562,39 @@ class TestReactAgentRunCountEnforcement:
         assert agent._run_count == 2
         assert str(exc_info.value) == "Exceeded the agent_request_limit of 2 (run_count=2)"
 
-    def test_rejection_leaves_context_untouched(self):
-        """Test a rejected run does not reach the tool-call healing path."""
+    def test_rejection_does_not_reach_the_tool_call_healing_path(self):
+        """Test a rejected run never routes through _heal_unprocessed_tool_calls.
+
+        Asserted on the call, not on resulting context: healing is a no-op on an
+        empty context, so an emptiness check would pass even from inside the try.
+        """
         agent = ReactAgent(config=_agent_limit_config(1))
         with patch.object(agent._pydantic_agent, "iter", side_effect=_StubRun):
             agent.run_sync("first")
+        with patch.object(agent, "_heal_unprocessed_tool_calls") as heal:
             with pytest.raises(UsageLimitError):
                 agent.run_sync("second")
-        assert agent.context.messages == []
+        heal.assert_not_called()
+
+    def test_run_hands_the_run_tier_to_pydantic_ai(self):
+        """Test run() converts the run tier for pydantic-ai, never the agent tier."""
+        config = ReactAgentConfig(
+            model_cfg=ModelConfig(provider="openai", model="gpt-4o"),
+            run_usage_limits=RunUsageLimits(run_request_limit=5),
+            agent_usage_limits=AgentUsageLimits(agent_request_limit=1),
+        )
+        agent = ReactAgent(config=config)
+        captured = {}
+
+        def capture(**kwargs):
+            captured.update(kwargs)
+            return _StubRun()
+
+        with patch.object(agent._pydantic_agent, "iter", side_effect=capture):
+            agent.run_sync("only run")
+        # 5 (run tier), never 1 (agent tier): differently valued so this distinguishes
+        # "reads the run tier" from "reads whichever tier is set".
+        assert captured["usage_limits"].request_limit == 5
 
     def test_rejection_happens_before_compaction(self):
         """Test the budget check precedes compaction: a rejected run costs nothing."""

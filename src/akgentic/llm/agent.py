@@ -132,8 +132,8 @@ class ReactAgent:
         self._result_type = result_type
 
         # Agent-lifetime run counter backing agent_usage_limits.agent_request_limit.
-        # In memory only: never a Pydantic field, never persisted, recomputed from
-        # replayed usage events on restore.
+        # In memory only: never a Pydantic field, never persisted. TRAP: restore does
+        # not recompute it yet, so a restored agent resumes with a full budget.
         self._run_count: int = 0
 
         # Create context manager (no max_messages by default)
