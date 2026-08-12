@@ -797,8 +797,8 @@ blocked from merging until all steps are green.
 src/akgentic/llm/
     __init__.py     # Public API exports
     agent.py        # ReactAgent, UsageLimitError, UserPrompt type alias
-    config.py       # ModelConfig, UsageLimits, HttpClientConfig, RuntimeConfig, ReactAgentConfig,
-                    #   _supports_native_output()
+    config.py       # ModelConfig, CompactionConfig, UsageLimits, HttpClientConfig,
+                    #   RuntimeConfig, ReactAgentConfig, _supports_native_output()
     context.py      # ContextManager, ContextSnapshot
     event.py        # LlmMessageEvent, LlmUsageEvent, LlmCheckpoint*Event,
                     #   LlmSystemPromptEvent, SystemPromptPartSnapshot,
