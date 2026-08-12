@@ -656,7 +656,7 @@ class ReactAgent:
         """
         self._context.subscribe(observer)
 
-    def restore_context(self, events: list[EventMessage]) -> None:
+    def restore_context(self, events: Sequence[EventMessage]) -> None:
         """Restore LLM conversation context as an ordered fold over persisted events.
 
         Folds ``events`` in persisted-sequence order into an accumulator:
@@ -676,8 +676,17 @@ class ReactAgent:
         and the token accumulator — so a resumed agent carries the budget it
         already spent instead of a fresh one (ADR-013 §D3).
 
+        Accepts a ``Sequence`` rather than a ``list`` because ``list`` is
+        **invariant**: a caller holding a ``list`` of its own envelope type
+        cannot pass it here even when that type satisfies the Protocol.
+        ``akgentic-agent`` hit exactly that — it forwards
+        ``list[akgentic.core.messages.EventMessage]`` and needed a
+        ``type: ignore`` to do it. ``Sequence`` is covariant, so the call
+        type-checks. Only iteration and ``reversed()`` are used, both of which
+        ``Sequence`` provides.
+
         Args:
-            events: List of event-like objects (typically ``EventMessage``
+            events: Sequence of event-like objects (typically ``EventMessage``
                 instances from ``akgentic-core``). Each is expected to carry a
                 ``.event`` payload.
         """
@@ -694,7 +703,7 @@ class ReactAgent:
         self._seed_system_prompt_from_events(events)
         self._seed_agent_budget_from_events(events)
 
-    def _seed_agent_budget_from_events(self, events: list[EventMessage]) -> None:
+    def _seed_agent_budget_from_events(self, events: Sequence[EventMessage]) -> None:
         """Recompute both agent-lifetime budgets from replayed usage events.
 
         One ``aggregate_usage`` pass seeds the run counter and the token
@@ -720,7 +729,7 @@ class ReactAgent:
             output_tokens=sum(r.total_output_tokens for r in summary.runs),
         )
 
-    def _seed_system_prompt_from_events(self, events: list[EventMessage]) -> None:
+    def _seed_system_prompt_from_events(self, events: Sequence[EventMessage]) -> None:
         """Seed the dedup hash from the latest persisted ``LlmSystemPromptEvent``.
 
         Scans ``events`` for the **latest** ``LlmSystemPromptEvent`` (the last in
