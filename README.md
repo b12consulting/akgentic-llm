@@ -267,6 +267,12 @@ its own `fallback_models`), and every entry must agree with the primary on nativ
 support, because that wrapper is chosen once from the primary's provider before any request is sent.
 `context_length` stays primary-only: a fallback firing mid-run does not change the compaction budget.
 
+Every entry is built eagerly, when the agent is constructed — not lazily, on the first failure. That
+is what makes a bad entry fail loudly and early, but it also means each entry's credentials and
+environment must be present up front: the example below does not construct without
+`AZURE_OPENAI_ENDPOINT`, even while the OpenAI primary is perfectly healthy. All entries share the
+one `http_client` passed to `create_model()`.
+
 ```python
 ModelConfig(
     provider="openai",
@@ -277,6 +283,10 @@ ModelConfig(
     ],
 )
 ```
+
+A chain declared on `ReactAgentConfig.model_cfg` also reaches the compaction summarizer, which
+builds its model through the same `create_model()` and falls back to `model_cfg` when
+`CompactionConfig.summary_model_cfg` is unset.
 
 ## ReactAgent API
 

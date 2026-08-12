@@ -989,6 +989,39 @@ class TestCreateModelFallbackChain:
         mock_openai_provider.assert_called_once_with(http_client=mock_client)
         mock_anthropic_provider.assert_called_once_with(http_client=mock_client)
 
+    @patch.dict("os.environ", {"AZURE_OPENAI_ENDPOINT": "https://acme.openai.azure.com"})
+    @patch("pydantic_ai.providers.azure.AzureProvider")
+    @patch("pydantic_ai.providers.anthropic.AnthropicProvider")
+    @patch("pydantic_ai.providers.openai.OpenAIProvider")
+    @patch("pydantic_ai.models.anthropic.AnthropicModel")
+    @patch("pydantic_ai.models.openai.OpenAIChatModel")
+    def test_third_entry_also_gets_the_caller_http_client(
+        self,
+        mock_openai_cls,
+        mock_anthropic_cls,
+        mock_openai_provider,
+        mock_anthropic_provider,
+        mock_azure_provider,
+    ) -> None:
+        """Every entry, not just the first — the deepest link of a 3-model chain too.
+
+        A two-entry chain cannot distinguish "the loop passes the client" from "the
+        loop passes it to the first iteration only"; the azure entry is last and uses
+        a different provider class, so it pins the whole comprehension.
+        """
+        mock_openai_cls.side_effect = lambda **kwargs: _named_model(**kwargs)
+        mock_anthropic_cls.side_effect = lambda **kwargs: _named_model(**kwargs)
+        mock_client = MagicMock(spec=httpx.AsyncClient)
+
+        create_model(self._acme_chain(), http_client=mock_client)
+
+        mock_openai_provider.assert_called_once_with(http_client=mock_client)
+        mock_anthropic_provider.assert_called_once_with(http_client=mock_client)
+        mock_azure_provider.assert_called_once_with(
+            azure_endpoint="https://acme.openai.azure.com",
+            http_client=mock_client,
+        )
+
     @patch("akgentic.llm.providers.create_http_client")
     @patch("pydantic_ai.providers.anthropic.AnthropicProvider")
     @patch("pydantic_ai.providers.openai.OpenAIProvider")

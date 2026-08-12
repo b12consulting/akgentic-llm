@@ -530,6 +530,11 @@ def create_model(
         5xx and API-layer timeouts. An empty chain (the default) returns the
         primary model unwrapped.
 
+        Every entry is built eagerly here, not on the first primary failure, so a
+        misconfigured entry fails at construction rather than mid-run. The cost is
+        that each entry's environment must already be satisfied: an ``azure`` entry
+        needs ``AZURE_OPENAI_ENDPOINT`` even while the primary is healthy.
+
     Args:
         config: LLM model configuration.
         http_client: Optional async HTTP client with retry logic. If None,
@@ -542,7 +547,8 @@ def create_model(
 
     Raises:
         ValueError: If the provider of the primary model or of any fallback
-            entry is not supported.
+            entry is not supported, or if a provider factory rejects that
+            entry's environment (for example a missing ``AZURE_OPENAI_ENDPOINT``).
 
     Example:
         >>> from akgentic.llm import ModelConfig, create_model
