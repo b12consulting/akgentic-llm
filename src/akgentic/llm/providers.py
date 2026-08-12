@@ -34,11 +34,12 @@ from typing import TYPE_CHECKING, Any, TypeVar, cast
 import httpx
 from pydantic_ai import NativeOutput
 from pydantic_ai.models import Model
+from pydantic_ai.models.fallback import FallbackModel
 from pydantic_ai.retries import AsyncTenacityTransport, RetryConfig, wait_retry_after
 from pydantic_ai.settings import ModelSettings
 from tenacity import retry_if_exception, stop_after_attempt, wait_random_exponential
 
-from .config import ModelConfig
+from .config import ModelConfig, _supports_native_output
 
 T = TypeVar("T")
 
@@ -79,44 +80,6 @@ def _is_retryable_http_error(exc: BaseException) -> bool:
         return False
     status = exc.response.status_code
     return status == 429 or 500 <= status < 600
-
-
-def _supports_native_output(config: ModelConfig) -> bool:
-    """Check if provider supports native structured output via NativeOutput wrapper.
-
-    Providers with native support (via function calling or tool use APIs):
-    - openai: GPT-4o, o1 series, etc.
-    - azure: Azure OpenAI Service
-    - anthropic: Claude 3.5 Sonnet, etc.
-    - nvidia: Only for models with "openai" prefix (e.g., "openai/gpt-oss-120b")
-
-    Providers without native support (use prompt-based extraction):
-    - google-gla: Google Gemini models
-    - mistral: Mistral AI models
-    - nvidia: Non-OpenAI models (e.g., "meta/llama-3.1-70b-instruct")
-
-    Args:
-        config: LLM model configuration.
-
-    Returns:
-        True if the provider supports native structured output, False otherwise.
-
-    Example:
-        >>> config = ModelConfig(provider="openai", model="gpt-4o")
-        >>> _supports_native_output(config)
-        True
-        >>> config = ModelConfig(provider="google-gla", model="gemini-2.0-flash")
-        >>> _supports_native_output(config)
-        False
-        >>> config = ModelConfig(provider="nvidia", model="openai/gpt-oss-120b")
-        >>> _supports_native_output(config)
-        True
-    """
-    if config.provider in ("openai", "azure", "anthropic"):
-        return True
-    if config.provider == "nvidia":
-        return config.model.startswith("openai")
-    return False
 
 
 def get_output_type(
@@ -509,6 +472,37 @@ _PROVIDER_FACTORIES = {
 }
 
 
+def _build_single_model(
+    config: ModelConfig,
+    http_client: httpx.AsyncClient,
+) -> Model:
+    """Build one pydantic-ai model from one configuration.
+
+    Shared by the primary model and by every fallback entry, so an unsupported
+    provider fails identically wherever it appears in the chain.
+
+    Args:
+        config: LLM model configuration for this single model.
+        http_client: Async HTTP client with retry logic.
+
+    Returns:
+        Configured pydantic-ai Model instance.
+
+    Raises:
+        ValueError: If provider is not supported.
+    """
+    factory = _PROVIDER_FACTORIES.get(config.provider)
+    if factory is None:
+        supported = ", ".join(_PROVIDER_FACTORIES.keys())
+        raise ValueError(
+            f"Unsupported provider: {config.provider}. Supported providers: {supported}"
+        )
+
+    # The provider factory callables are typed loosely (resolve to `object`);
+    # each genuinely returns a pydantic-ai `Model` at runtime.
+    return cast(Model, factory(config, http_client))
+
+
 def create_model(
     config: ModelConfig,
     http_client: httpx.AsyncClient | None = None,
@@ -527,16 +521,34 @@ def create_model(
         - mistral: Mistral AI models
         - nvidia: NVIDIA NIM models
 
+    Fallback chain:
+        When ``config.fallback_models`` is non-empty, the primary model and every
+        entry of the chain are built the same way and handed to pydantic-ai's
+        ``FallbackModel`` in declaration order. ``FallbackModel`` is itself a
+        ``Model``, so nothing at the call site changes. ``fallback_on`` is left at
+        pydantic-ai's default, ``(ModelAPIError,)`` — rate limits, auth failures,
+        5xx and API-layer timeouts. An empty chain (the default) returns the
+        primary model unwrapped.
+
+        Every entry is built eagerly here, not on the first primary failure, so a
+        misconfigured entry fails at construction rather than mid-run. The cost is
+        that each entry's environment must already be satisfied: an ``azure`` entry
+        needs ``AZURE_OPENAI_ENDPOINT`` even while the primary is healthy.
+
     Args:
         config: LLM model configuration.
         http_client: Optional async HTTP client with retry logic. If None,
             creates a default client via ``create_http_client()``.
 
     Returns:
-        Configured pydantic-ai Model instance.
+        Configured pydantic-ai Model instance — a ``FallbackModel`` wrapping the
+        chain when ``config.fallback_models`` is non-empty, otherwise the primary
+        provider model itself.
 
     Raises:
-        ValueError: If provider is not supported.
+        ValueError: If the provider of the primary model or of any fallback
+            entry is not supported, or if a provider factory rejects that
+            entry's environment (for example a missing ``AZURE_OPENAI_ENDPOINT``).
 
     Example:
         >>> from akgentic.llm import ModelConfig, create_model
@@ -560,13 +572,9 @@ def create_model(
     if http_client is None:
         http_client = create_http_client()
 
-    factory = _PROVIDER_FACTORIES.get(config.provider)
-    if factory is None:
-        supported = ", ".join(_PROVIDER_FACTORIES.keys())
-        raise ValueError(
-            f"Unsupported provider: {config.provider}. Supported providers: {supported}"
-        )
+    primary = _build_single_model(config, http_client)
+    if not config.fallback_models:
+        return primary
 
-    # The provider factory callables are typed loosely (resolve to `object`);
-    # each genuinely returns a pydantic-ai `Model` at runtime.
-    return cast(Model, factory(config, http_client))
+    fallbacks = [_build_single_model(entry, http_client) for entry in config.fallback_models]
+    return FallbackModel(primary, *fallbacks)

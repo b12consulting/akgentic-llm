@@ -44,9 +44,10 @@ call any LLM without coupling to a specific vendor or framework primitive.
   history across calls, deduplicates messages across tool-call iterations, and translates
   pydantic-ai's `UsageLimitExceeded` into a framework-local `UsageLimitError`
 - **Provider abstraction** — `create_model()` dispatches to one of six provider factories
-  (OpenAI, Azure, Anthropic, Google, Mistral, NVIDIA); `get_output_type()` wraps output types
-  with `NativeOutput` for providers that support structured output, falls back to prompt-based
-  extraction for those that don't
+  (OpenAI, Azure, Anthropic, Google, Mistral, NVIDIA), wrapping the result in pydantic-ai's
+  `FallbackModel` when `ModelConfig.fallback_models` is non-empty; `get_output_type()` wraps
+  output types with `NativeOutput` for providers that support structured output, falls back to
+  prompt-based extraction for those that don't
 - **HTTP retry** — `create_http_client()` configures `AsyncTenacityTransport` with exponential
   backoff, jitter, and `Retry-After` header support; fast-fails on 4xx (except 429)
 - **Context management** — `ContextManager` tracks message history across multiple `run()` calls,
@@ -255,6 +256,37 @@ ModelConfig(provider="nvidia", model="openai/gpt-oss-120b")
 # NVIDIA NIM — non-OpenAI model (no native output)
 ModelConfig(provider="nvidia", model="meta/llama-3.1-8b-instruct")
 ```
+
+### Fallback chain
+
+`ModelConfig.fallback_models` lists models tried in declaration order after the primary one on
+API failure (rate limits, 5xx, auth errors, timeouts). `create_model()` wraps the chain in
+pydantic-ai's `FallbackModel`; an empty list — the default — returns the primary model unwrapped.
+Two rules are enforced when the config is constructed: the chain is flat (an entry may not declare
+its own `fallback_models`), and every entry must agree with the primary on native structured-output
+support, because that wrapper is chosen once from the primary's provider before any request is sent.
+`context_length` stays primary-only: a fallback firing mid-run does not change the compaction budget.
+
+Every entry is built eagerly, when the agent is constructed — not lazily, on the first failure. That
+is what makes a bad entry fail loudly and early, but it also means each entry's credentials and
+environment must be present up front: the example below does not construct without
+`AZURE_OPENAI_ENDPOINT`, even while the OpenAI primary is perfectly healthy. All entries share the
+one `http_client` passed to `create_model()`.
+
+```python
+ModelConfig(
+    provider="openai",
+    model="gpt-5.2",
+    fallback_models=[
+        ModelConfig(provider="anthropic", model="claude-sonnet-4-5"),
+        ModelConfig(provider="azure", model="gpt-4o-mini"),
+    ],
+)
+```
+
+A chain declared on `ReactAgentConfig.model_cfg` also reaches the compaction summarizer, which
+builds its model through the same `create_model()` and falls back to `model_cfg` when
+`CompactionConfig.summary_model_cfg` is unset.
 
 ## ReactAgent API
 
@@ -797,7 +829,8 @@ blocked from merging until all steps are green.
 src/akgentic/llm/
     __init__.py     # Public API exports
     agent.py        # ReactAgent, UsageLimitError, UserPrompt type alias
-    config.py       # ModelConfig, UsageLimits, HttpClientConfig, RuntimeConfig, ReactAgentConfig
+    config.py       # ModelConfig, CompactionConfig, UsageLimits, HttpClientConfig,
+                    #   RuntimeConfig, ReactAgentConfig, _supports_native_output()
     context.py      # ContextManager, ContextSnapshot
     event.py        # LlmMessageEvent, LlmUsageEvent, LlmCheckpoint*Event,
                     #   LlmSystemPromptEvent, SystemPromptPartSnapshot,
@@ -807,7 +840,7 @@ src/akgentic/llm/
     pricing.yaml    # Externalized per-1M-token pricing table (Anthropic + OpenAI)
     prompts.py      # PromptTemplate, current_datetime_prompt, json_output_reminder_prompt
     providers.py    # create_model(), create_http_client(), get_output_type(),
-                    #   create_model_settings(), _supports_native_output()
+                    #   create_model_settings()
 tests/              # Tests organised by module
 ```
 

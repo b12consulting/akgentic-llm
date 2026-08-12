@@ -3,6 +3,7 @@
 import pytest
 from pydantic import ValidationError
 
+from akgentic.llm import config as config_module
 from akgentic.llm.config import (
     CompactionConfig,
     ModelConfig,
@@ -121,6 +122,193 @@ class TestModelConfig:
         restored = ModelConfig.model_validate(config.model_dump())
         assert restored.context_length == 64000
         assert restored == config
+
+
+class TestModelConfigFallbackModels:
+    """Test ModelConfig.fallback_models field and its construction-time guards.
+
+    AC 1, 2: field shape and round-trip. AC 3: nesting guard.
+    AC 4, 5, 6: homogeneous native-output-support guard. AC 8: empty-list short-circuit.
+    """
+
+    # --- AC 1: the field exists and defaults to empty ---
+
+    def test_fallback_models_defaults_to_empty(self):
+        """A bare ModelConfig has an empty fallback chain — AC 1."""
+        assert ModelConfig().fallback_models == []
+
+    def test_existing_construction_unchanged(self):
+        """An explicit config without fallbacks is unaffected by the new field — AC 1."""
+        config = ModelConfig(provider="openai", model="gpt-4o", temperature=0.7)
+        assert config.fallback_models == []
+        assert config.provider == "openai"
+        assert config.temperature == 0.7
+
+    # --- AC 2: a one-deep chain constructs and round-trips ---
+
+    def test_two_entry_chain_round_trips_in_order(self):
+        """Chain entries survive dump -> validate in the same order — AC 2."""
+        config = ModelConfig(
+            provider="openai",
+            model="gpt-4o",
+            fallback_models=[
+                ModelConfig(provider="anthropic", model="claude-haiku-4-5-20251001"),
+                ModelConfig(provider="azure", model="gpt-4o-mini"),
+            ],
+        )
+        restored = ModelConfig.model_validate(config.model_dump())
+        assert [m.model for m in restored.fallback_models] == [
+            "claude-haiku-4-5-20251001",
+            "gpt-4o-mini",
+        ]
+        assert restored == config
+
+    def test_chain_json_round_trips(self):
+        """The chain survives a JSON round-trip — no PrivateAttr, no custom encoder — AC 2."""
+        config = ModelConfig(
+            provider="openai",
+            model="gpt-4o",
+            fallback_models=[ModelConfig(provider="azure", model="gpt-4o-mini")],
+        )
+        assert ModelConfig.model_validate_json(config.model_dump_json()) == config
+
+    def test_fallback_models_is_a_public_pydantic_field(self):
+        """fallback_models is a declared field, not a PrivateAttr — AC 2."""
+        assert "fallback_models" in ModelConfig.model_fields
+        assert "fallback_models" not in ModelConfig.__private_attributes__
+
+    def test_no_arbitrary_types_allowed(self):
+        """ModelConfig declares no arbitrary_types_allowed — AC 2."""
+        assert not ModelConfig.model_config.get("arbitrary_types_allowed")
+
+    # --- AC 3: nesting is rejected ---
+
+    def test_nested_chain_rejected(self):
+        """An entry that declares its own fallback_models is rejected — AC 3."""
+        inner = ModelConfig(
+            provider="openai",
+            model="gpt-4o-mini",
+            fallback_models=[ModelConfig(provider="azure", model="gpt-4o")],
+        )
+        with pytest.raises(ValidationError, match="cannot themselves declare fallback_models"):
+            ModelConfig(provider="openai", model="gpt-4o", fallback_models=[inner])
+
+    def test_inner_config_alone_still_constructs(self):
+        """Only use *as an entry* fails; the inner config on its own is valid — AC 3."""
+        inner = ModelConfig(
+            provider="openai",
+            model="gpt-4o-mini",
+            fallback_models=[ModelConfig(provider="azure", model="gpt-4o")],
+        )
+        assert len(inner.fallback_models) == 1
+
+    def test_nesting_reported_before_heterogeneity(self):
+        """A chain that is both nested and heterogeneous reports the nesting rule — AC 3."""
+        inner = ModelConfig(
+            provider="mistral",
+            model="mistral-large-latest",
+            fallback_models=[ModelConfig(provider="google-gla", model="gemini-2.0-flash")],
+        )
+        with pytest.raises(ValidationError, match="cannot themselves declare fallback_models"):
+            ModelConfig(provider="openai", model="gpt-4o", fallback_models=[inner])
+
+    # --- AC 4: heterogeneous chains are rejected, error names the primary's value ---
+
+    def test_supporting_primary_with_non_supporting_fallback_rejected(self):
+        """Native-output primary + prompt-based fallback raises, naming True — AC 4."""
+        with pytest.raises(ValidationError, match="supports_native_output=True"):
+            ModelConfig(
+                provider="openai",
+                model="gpt-4o",
+                fallback_models=[ModelConfig(provider="mistral", model="mistral-large-latest")],
+            )
+
+    def test_non_supporting_primary_with_supporting_fallback_rejected(self):
+        """Prompt-based primary + native-output fallback raises, naming False — AC 4."""
+        with pytest.raises(ValidationError, match="supports_native_output=False"):
+            ModelConfig(
+                provider="google-gla",
+                model="gemini-2.0-flash",
+                fallback_models=[ModelConfig(provider="anthropic", model="claude-sonnet-4-5")],
+            )
+
+    def test_error_names_the_offending_entry(self):
+        """The rejection message identifies the mismatched entry — AC 4."""
+        with pytest.raises(ValidationError, match="mistral-large-latest"):
+            ModelConfig(
+                provider="openai",
+                model="gpt-4o",
+                fallback_models=[ModelConfig(provider="mistral", model="mistral-large-latest")],
+            )
+
+    def test_mismatch_in_second_position_rejected(self):
+        """A mismatch anywhere in the chain is caught, not just the first entry — AC 4."""
+        with pytest.raises(ValidationError, match="supports_native_output=True"):
+            ModelConfig(
+                provider="openai",
+                model="gpt-4o",
+                fallback_models=[
+                    ModelConfig(provider="anthropic", model="claude-sonnet-4-5"),
+                    ModelConfig(provider="google-gla", model="gemini-2.0-flash"),
+                ],
+            )
+
+    # --- AC 5: homogeneous chains across different providers construct ---
+
+    def test_homogeneous_supporting_chain_across_providers_accepted(self):
+        """openai -> anthropic -> azure all support native output — AC 5."""
+        config = ModelConfig(
+            provider="openai",
+            model="gpt-4o",
+            fallback_models=[
+                ModelConfig(provider="anthropic", model="claude-sonnet-4-5"),
+                ModelConfig(provider="azure", model="gpt-4o-mini"),
+            ],
+        )
+        assert [m.provider for m in config.fallback_models] == ["anthropic", "azure"]
+
+    def test_homogeneous_non_supporting_chain_across_providers_accepted(self):
+        """google-gla -> mistral: neither supports native output — AC 5."""
+        config = ModelConfig(
+            provider="google-gla",
+            model="gemini-2.0-flash",
+            fallback_models=[ModelConfig(provider="mistral", model="mistral-large-latest")],
+        )
+        assert config.fallback_models[0].provider == "mistral"
+
+    # --- AC 6: same provider, differing support, is rejected ---
+
+    def test_same_provider_differing_support_rejected(self):
+        """nvidia openai/* (supports) + nvidia meta/* (does not) raises — AC 6."""
+        with pytest.raises(ValidationError, match="supports_native_output=True"):
+            ModelConfig(
+                provider="nvidia",
+                model="openai/gpt-oss-120b",
+                fallback_models=[
+                    ModelConfig(provider="nvidia", model="meta/llama-3.1-70b-instruct")
+                ],
+            )
+
+    def test_same_provider_matching_support_accepted(self):
+        """Two nvidia openai/* models agree on support and construct — AC 6."""
+        config = ModelConfig(
+            provider="nvidia",
+            model="openai/gpt-oss-120b",
+            fallback_models=[ModelConfig(provider="nvidia", model="openai/gpt-oss-20b")],
+        )
+        assert config.fallback_models[0].model == "openai/gpt-oss-20b"
+
+    # --- AC 8: both validators short-circuit on the empty default ---
+
+    def test_empty_chain_skips_support_probe(self, monkeypatch):
+        """With no fallbacks the homogeneity validator never probes support — AC 8."""
+
+        def _boom(config: ModelConfig) -> bool:
+            raise AssertionError("support probe must not run for an empty fallback chain")
+
+        monkeypatch.setattr(config_module, "_supports_native_output", _boom)
+        assert ModelConfig().fallback_models == []
+        assert ModelConfig(provider="openai", model="gpt-4o").fallback_models == []
 
 
 class TestUsageLimits:
@@ -485,3 +673,48 @@ class TestReactAgentCompactionConfig:
             usage_limits=UsageLimits(input_tokens_limit=1),
         )
         assert config.compaction_cfg.auto_trigger is False
+
+
+class TestCompactionBudgetIsPrimaryOnly:
+    """The compaction threshold reads the PRIMARY model's context_length only.
+
+    A fallback firing mid-run does not change the compaction budget for the rest of
+    that run. Regression pin on existing behaviour — story 14-1 changes no production
+    code for this. Both fallback entries below share the primary's native-output
+    support so these cases exercise the budget rule, not the homogeneity guard.
+    """
+
+    def test_primary_threshold_still_rejected_despite_tiny_fallback_window(self):
+        """A tiny fallback context_length does not rescue an over-limit primary threshold."""
+        with pytest.raises(ValidationError, match="compaction threshold"):
+            ReactAgentConfig(
+                model_cfg=ModelConfig(
+                    provider="openai",
+                    model="gpt-4o",
+                    context_length=1000,
+                    fallback_models=[
+                        ModelConfig(
+                            provider="anthropic", model="claude-sonnet-4-5", context_length=10
+                        )
+                    ],
+                ),
+                usage_limits=UsageLimits(input_tokens_limit=850),
+            )
+
+    def test_primary_threshold_still_accepted_despite_huge_fallback_window(self):
+        """A huge fallback context_length does not push a safe primary threshold over."""
+        config = ReactAgentConfig(
+            model_cfg=ModelConfig(
+                provider="openai",
+                model="gpt-4o",
+                context_length=1000,
+                fallback_models=[
+                    ModelConfig(
+                        provider="anthropic", model="claude-sonnet-4-5", context_length=2_000_000
+                    )
+                ],
+            ),
+            usage_limits=UsageLimits(input_tokens_limit=2000, total_tokens_limit=3000),
+        )
+        assert config.model_cfg.context_length == 1000
+        assert config.model_cfg.fallback_models[0].context_length == 2_000_000
