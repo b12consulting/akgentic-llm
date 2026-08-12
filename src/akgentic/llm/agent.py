@@ -23,6 +23,7 @@ from .config import ReactAgentConfig, RunUsageLimits
 from .context import ContextManager
 from .event import (
     ContextObserver,
+    EventMessage,
     LlmContextClearedEvent,
     LlmContextCompactedEvent,
     LlmMessageEvent,
@@ -144,7 +145,7 @@ class ReactAgent:
         # Agent-lifetime run counter backing agent_usage_limits.agent_request_limit.
         # In memory only: never a Pydantic field, never persisted. Not lost on resume —
         # restore_context() recomputes it from the replayed LlmUsageEvents.
-        self._run_count: int = 0
+        self._agent_run_count: int = 0
 
         # Agent-lifetime token accumulator backing agent_usage_limits' token fields.
         # Same lifecycle as _run_count (in memory, reseeded from the same replayed
@@ -341,11 +342,11 @@ class ReactAgent:
             UsageLimitError: If the agent has already used its lifetime run budget.
         """
         limit = self._config.agent_usage_limits.agent_request_limit
-        if limit is not None and self._run_count >= limit:
+        if limit is not None and self._agent_run_count >= limit:
             raise UsageLimitError(
-                f"Exceeded the agent_request_limit of {limit} (run_count={self._run_count})"
+                f"Exceeded the agent_request_limit of {limit} (run_count={self._agent_run_count})"
             )
-        self._run_count += 1
+        self._agent_run_count += 1
 
     def _fold_pending_operator_actions(self, user_prompt: UserPrompt) -> UserPrompt:
         """Prepend any buffered pre-first-run operator actions to the run prompt.
@@ -633,9 +634,7 @@ class ReactAgent:
             for call in last.tool_calls
         ]
 
-        logger.warning(
-            "Healing %d unprocessed tool call(s) after error", len(error_parts)
-        )
+        logger.warning("Healing %d unprocessed tool call(s) after error", len(error_parts))
         self._context.add_message(ModelRequest(parts=error_parts))
 
     # API wrapper methods
@@ -657,7 +656,7 @@ class ReactAgent:
         """
         self._context.subscribe(observer)
 
-    def restore_context(self, events: list[object]) -> None:
+    def restore_context(self, events: list[EventMessage]) -> None:
         """Restore LLM conversation context as an ordered fold over persisted events.
 
         Folds ``events`` in persisted-sequence order into an accumulator:
@@ -684,8 +683,6 @@ class ReactAgent:
         """
         messages: list[ModelMessage] = []
         for e in events:
-            if not hasattr(e, "event"):
-                continue
             payload = e.event
             if isinstance(payload, LlmMessageEvent):
                 messages.append(payload.message)
@@ -697,7 +694,7 @@ class ReactAgent:
         self._seed_system_prompt_from_events(events)
         self._seed_agent_budget_from_events(events)
 
-    def _seed_agent_budget_from_events(self, events: list[object]) -> None:
+    def _seed_agent_budget_from_events(self, events: list[EventMessage]) -> None:
         """Recompute both agent-lifetime budgets from replayed usage events.
 
         One ``aggregate_usage`` pass seeds the run counter and the token
@@ -715,17 +712,15 @@ class ReactAgent:
         Args:
             events: The same event-like list passed to ``restore_context``.
         """
-        usage = [
-            e.event for e in events if hasattr(e, "event") and isinstance(e.event, LlmUsageEvent)
-        ]
+        usage = [e.event for e in events if isinstance(e.event, LlmUsageEvent)]
         summary = aggregate_usage(usage, by_run=True)
-        self._run_count = len(summary.runs)
+        self._agent_run_count = len(summary.runs)
         self._agent_usage = RunUsage(
             input_tokens=sum(r.total_input_tokens for r in summary.runs),
             output_tokens=sum(r.total_output_tokens for r in summary.runs),
         )
 
-    def _seed_system_prompt_from_events(self, events: list[object]) -> None:
+    def _seed_system_prompt_from_events(self, events: list[EventMessage]) -> None:
         """Seed the dedup hash from the latest persisted ``LlmSystemPromptEvent``.
 
         Scans ``events`` for the **latest** ``LlmSystemPromptEvent`` (the last in
@@ -741,11 +736,7 @@ class ReactAgent:
             events: The same event-like list passed to ``restore_context``.
         """
         latest = next(
-            (
-                e.event
-                for e in reversed(events)
-                if hasattr(e, "event") and isinstance(e.event, LlmSystemPromptEvent)
-            ),
+            (e.event for e in reversed(events) if isinstance(e.event, LlmSystemPromptEvent)),
             None,
         )
         if latest is not None:

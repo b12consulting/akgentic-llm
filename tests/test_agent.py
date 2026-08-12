@@ -633,7 +633,7 @@ class TestReactAgentRunCountEnforcement:
     def test_fresh_agent_starts_at_zero(self, minimal_config):
         """Test a newly constructed agent has consumed no runs."""
         agent = ReactAgent(config=minimal_config)
-        assert agent._run_count == 0
+        assert agent._agent_run_count == 0
 
     def test_runs_up_to_the_limit_succeed(self):
         """Test calls 1..N execute and consume exactly N."""
@@ -641,7 +641,7 @@ class TestReactAgentRunCountEnforcement:
         with patch.object(agent._pydantic_agent, "iter", side_effect=_StubRun):
             agent.run_sync("first")
             agent.run_sync("second")
-        assert agent._run_count == 2
+        assert agent._agent_run_count == 2
 
     def test_run_past_the_limit_raises_and_does_not_consume(self):
         """Test call N+1 is rejected and leaves the counter pinned at the limit."""
@@ -653,7 +653,7 @@ class TestReactAgentRunCountEnforcement:
                 agent.run_sync("third")
         # The rejected call never executed, so it consumed nothing: runs consumed,
         # never runs attempted.
-        assert agent._run_count == 2
+        assert agent._agent_run_count == 2
         assert str(exc_info.value) == "Exceeded the agent_request_limit of 2 (run_count=2)"
 
     def test_rejection_does_not_reach_the_tool_call_healing_path(self):
@@ -706,7 +706,7 @@ class TestReactAgentRunCountEnforcement:
         with patch.object(agent._pydantic_agent, "iter", side_effect=RuntimeError("boom")):
             with pytest.raises(RuntimeError):
                 agent.run_sync("first")
-        assert agent._run_count == 1
+        assert agent._agent_run_count == 1
 
     def test_counter_advances_when_the_run_tier_limit_fires(self):
         """Test a run-tier breach still consumes the agent-tier budget."""
@@ -715,7 +715,7 @@ class TestReactAgentRunCountEnforcement:
         with patch.object(agent._pydantic_agent, "iter", side_effect=breach):
             with pytest.raises(UsageLimitError) as exc_info:
                 agent.run_sync("first")
-        assert agent._run_count == 1
+        assert agent._agent_run_count == 1
         assert "request_limit of 1" in str(exc_info.value)
 
     def test_repeated_run_tier_failures_exhaust_the_agent_tier(self):
@@ -738,7 +738,7 @@ class TestReactAgentRunCountEnforcement:
         with patch.object(agent._pydantic_agent, "iter", side_effect=_StubRun):
             for _ in range(5):
                 agent.run_sync("unbounded")
-        assert agent._run_count == 5
+        assert agent._agent_run_count == 5
 
     async def test_async_run_enforces_the_same_budget(self):
         """Test the async entry point holds the budget (run_sync only delegates to it)."""
@@ -747,7 +747,7 @@ class TestReactAgentRunCountEnforcement:
             await agent.run("first")
             with pytest.raises(UsageLimitError):
                 await agent.run("second")
-        assert agent._run_count == 1
+        assert agent._agent_run_count == 1
 
     def test_run_count_is_not_persisted_config_state(self):
         """Test the counter is runtime-only: no config field, nothing serialized."""
@@ -780,7 +780,7 @@ class TestReactAgentRunCountRestore:
         agent = ReactAgent(config=_agent_limit_config(10))
         events = [FakeEventMessage(event=_usage_event(rid)) for rid in ("r1", "r2", "r3")]
         agent.restore_context(events)
-        assert agent._run_count == 3
+        assert agent._agent_run_count == 3
 
     def test_one_run_emitting_three_events_seeds_one(self):
         """Test a run with three tool-call round-trips counts once, not three times.
@@ -794,7 +794,7 @@ class TestReactAgentRunCountRestore:
         agent = ReactAgent(config=_agent_limit_config(10))
         events = [FakeEventMessage(event=_usage_event("same-run")) for _ in range(3)]
         agent.restore_context(events)
-        assert agent._run_count == 1
+        assert agent._agent_run_count == 1
 
     def test_empty_event_list_seeds_zero(self):
         """Test restoring nothing seeds zero — on a fresh agent and on a spent one.
@@ -807,15 +807,15 @@ class TestReactAgentRunCountRestore:
         """
         agent = ReactAgent(config=_agent_limit_config(10))
         agent.restore_context([])
-        assert agent._run_count == 0
+        assert agent._agent_run_count == 0
 
         agent.restore_context([FakeEventMessage(event=_usage_event(rid)) for rid in ("r1", "r2")])
-        assert agent._run_count == 2
+        assert agent._agent_run_count == 2
         agent.restore_context([])
-        assert agent._run_count == 0
+        assert agent._agent_run_count == 0
 
     def test_events_without_usage_seed_zero(self):
-        """Test non-usage events and objects with no .event payload are ignored.
+        """Test envelopes carrying non-usage payloads are ignored.
 
         Seeded above zero first, for the same reason: this distinguishes "the
         ignore path assigns zero" from "the counter was simply never touched".
@@ -830,10 +830,9 @@ class TestReactAgentRunCountRestore:
                     run_id="r1", tool_name="lookup", tool_call_id="c1", arguments="{}"
                 )
             ),
-            object(),
         ]
         agent.restore_context(events)
-        assert agent._run_count == 0
+        assert agent._agent_run_count == 0
 
     def test_restored_agent_at_its_limit_raises_on_the_next_run(self):
         """Test the seeded value is enforced, not merely stored.
@@ -861,7 +860,7 @@ class TestReactAgentRunCountRestore:
             agent.run_sync("the one run left")
             with pytest.raises(UsageLimitError):
                 agent.run_sync("one turn too many")
-        assert agent._run_count == 2
+        assert agent._agent_run_count == 2
 
     def test_restore_is_idempotent(self):
         """Test seeding assigns rather than accumulates: restoring twice is stable."""
@@ -869,11 +868,11 @@ class TestReactAgentRunCountRestore:
         events = [FakeEventMessage(event=_usage_event(rid)) for rid in ("r1", "r2")]
         agent.restore_context(events)
         agent.restore_context(events)
-        assert agent._run_count == 2
+        assert agent._agent_run_count == 2
 
     def test_never_restored_agent_starts_at_zero(self, minimal_config):
         """Test seeding runs on restore only — construction still yields zero."""
-        assert ReactAgent(config=minimal_config)._run_count == 0
+        assert ReactAgent(config=minimal_config)._agent_run_count == 0
 
     def test_seeding_leaves_the_message_fold_intact(self):
         """Test a mixed stream still restores exactly its LlmMessageEvent messages."""
@@ -889,7 +888,7 @@ class TestReactAgentRunCountRestore:
             ]
         )
         assert agent.context.messages == [msg1, msg2]
-        assert agent._run_count == 2
+        assert agent._agent_run_count == 2
 
 
 class TestReactAgentTokenBudgetEnforcement:
@@ -988,7 +987,7 @@ class TestReactAgentTokenBudgetEnforcement:
                 agent.run_sync("refused on tokens")
             with pytest.raises(UsageLimitError):
                 agent.run_sync("refused again")
-        assert agent._run_count == 1
+        assert agent._agent_run_count == 1
 
     def test_token_rejection_happens_before_compaction(self):
         """Test the token check precedes compaction: a refused run pays no summarizer."""
@@ -1062,7 +1061,7 @@ class TestReactAgentTokenBudgetRestore:
         """
         agent = ReactAgent(config=_agent_token_config(total_tokens_limit=1000))
         agent.restore_context([FakeEventMessage(event=_usage_event("same-run")) for _ in range(3)])
-        assert agent._run_count == 1
+        assert agent._agent_run_count == 1
         assert agent._agent_usage.total_tokens == 45
 
     def test_restored_agent_over_budget_raises_on_the_next_run(self):
@@ -1113,7 +1112,7 @@ class TestReactAgentTokenBudgetRestore:
         assert agent._agent_usage.total_tokens == 0
 
     def test_events_without_usage_seed_zero_tokens(self):
-        """Test non-usage events and objects with no .event payload are ignored."""
+        """Test envelopes carrying non-usage payloads are ignored."""
         agent = ReactAgent(config=_agent_token_config(total_tokens_limit=1000))
         agent.restore_context([FakeEventMessage(event=_usage_event(rid)) for rid in ("r1", "r2")])
         msg = ModelRequest(parts=[UserPromptPart(content="hello")])
@@ -1125,7 +1124,6 @@ class TestReactAgentTokenBudgetRestore:
                         run_id="r1", tool_name="lookup", tool_call_id="c1", arguments="{}"
                     )
                 ),
-                object(),
             ]
         )
         assert agent._agent_usage.total_tokens == 0
@@ -1446,7 +1444,6 @@ class TestReactAgentRestoreContext:
                 )
             ),
             FakeEventMessage(event="arbitrary string"),
-            "not even an event message",
         ]
 
         agent.restore_context(events)
