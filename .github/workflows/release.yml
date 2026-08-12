@@ -70,10 +70,51 @@ jobs:
       - name: Build wheel
         run: uv build --wheel --out-dir dist/
 
+      - name: Collect the commits in this release
+        id: commits
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # generate_release_notes below builds "What's Changed" from PULL
+          # REQUESTS only, so a release whose range is direct pushes renders an
+          # empty section -- akgentic-core v1.5.3 shipped an init_llm_context
+          # signature change that way, with notes showing only a compare link.
+          #
+          # Ask GitHub what it WOULD generate before creating the release. If it
+          # can list PRs, leave the body empty so the notes stay exactly as they
+          # are today. Only when it cannot do we supply the commit list, which
+          # the API pre-pends to the generated compare link.
+          NOTES=$(gh api --method POST \
+            "repos/$GITHUB_REPOSITORY/releases/generate-notes" \
+            -f tag_name="v$VERSION" --jq .body 2>/dev/null || true)
+          if printf '%s' "$NOTES" | grep -q "What's Changed"; then
+            echo "PR-based notes available -- leaving the release body empty."
+            exit 0
+          fi
+          echo "No PRs in range -- falling back to a commit list."
+          PREV=$(git describe --tags --abbrev=0 "v$VERSION^" 2>/dev/null || true)
+          if [ -n "$PREV" ]; then
+            RANGE="$PREV..v$VERSION"
+            HEADING="### Commits since $PREV"
+          else
+            RANGE="v$VERSION"
+            HEADING="### Commits"
+          fi
+          {
+            echo "body<<RELEASE_BODY_EOF"
+            echo "$HEADING"
+            echo
+            git log --no-merges --reverse --pretty=format:'- %s (`%h`)' "$RANGE"
+            echo
+            echo "RELEASE_BODY_EOF"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: "v${{ steps.version.outputs.version }}"
           name: "v${{ steps.version.outputs.version }}"
           files: dist/*.whl
+          body: ${{ steps.commits.outputs.body }}
           generate_release_notes: true
