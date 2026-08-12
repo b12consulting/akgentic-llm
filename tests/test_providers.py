@@ -6,6 +6,8 @@ import httpx
 import pytest
 from pydantic import BaseModel
 from pydantic_ai import NativeOutput
+from pydantic_ai.models import Model
+from pydantic_ai.models.fallback import FallbackModel
 from pydantic_ai.retries import AsyncTenacityTransport
 
 from akgentic.llm import config as config_module
@@ -823,3 +825,241 @@ class TestCreateModel:
         settings = mock_model_cls.call_args.kwargs["settings"]
         assert settings is not None
         assert settings["seed"] == 42
+
+
+# ---------------------------------------------------------------------------
+# create_model fallback-chain tests
+# ---------------------------------------------------------------------------
+
+
+def _named_model(**kwargs) -> MagicMock:
+    """Return a Model-shaped mock stamped with the model_name it was built for.
+
+    FallbackModel.__init__ runs every argument through ``infer_model``, which
+    accepts a ``Model`` instance or a ``provider:model`` string and raises on
+    anything else — hence ``spec=Model``. Stamping ``model_name`` ties each built
+    model back to the ModelConfig it came from, so chain order can be asserted
+    independently of the order the factories happened to be called in.
+    """
+    stub = MagicMock(spec=Model)
+    stub.model_name = kwargs["model_name"]
+    return stub
+
+
+class TestCreateModelFallbackChain:
+    """Tests for create_model's conditional FallbackModel wrapping."""
+
+    @staticmethod
+    def _acme_chain() -> ModelConfig:
+        """A homogeneous openai -> anthropic -> azure chain.
+
+        All three support native structured output, so ModelConfig's homogeneity
+        guard accepts the chain and these tests exercise create_model rather than
+        the validator.
+        """
+        return ModelConfig(
+            provider="openai",
+            model="acme-primary",
+            fallback_models=[
+                ModelConfig(provider="anthropic", model="acme-fallback-1"),
+                ModelConfig(provider="azure", model="acme-fallback-2"),
+            ],
+        )
+
+    @patch("pydantic_ai.providers.openai.OpenAIProvider")
+    @patch("pydantic_ai.models.openai.OpenAIChatModel")
+    def test_empty_chain_returns_primary_unwrapped(self, mock_model_cls, mock_provider_cls) -> None:
+        """The default empty chain returns the primary model itself, not a FallbackModel."""
+        mock_client = MagicMock(spec=httpx.AsyncClient)
+        config = ModelConfig(provider="openai", model="acme-primary")
+
+        result = create_model(config, http_client=mock_client)
+
+        assert result is mock_model_cls.return_value
+        assert not isinstance(result, FallbackModel)
+
+    @patch.dict("os.environ", {"AZURE_OPENAI_ENDPOINT": "https://acme.openai.azure.com"})
+    @patch("pydantic_ai.providers.azure.AzureProvider")
+    @patch("pydantic_ai.providers.anthropic.AnthropicProvider")
+    @patch("pydantic_ai.providers.openai.OpenAIProvider")
+    @patch("pydantic_ai.models.anthropic.AnthropicModel")
+    @patch("pydantic_ai.models.openai.OpenAIChatModel")
+    def test_non_empty_chain_returns_fallback_model(
+        self,
+        mock_openai_cls,
+        mock_anthropic_cls,
+        mock_openai_provider,
+        mock_anthropic_provider,
+        mock_azure_provider,
+    ) -> None:
+        """A non-empty chain returns a FallbackModel wrapping primary + every entry."""
+        mock_openai_cls.side_effect = lambda **kwargs: _named_model(**kwargs)
+        mock_anthropic_cls.side_effect = lambda **kwargs: _named_model(**kwargs)
+        mock_client = MagicMock(spec=httpx.AsyncClient)
+
+        result = create_model(self._acme_chain(), http_client=mock_client)
+
+        assert isinstance(result, FallbackModel)
+        assert len(result.models) == 3
+
+    @patch.dict("os.environ", {"AZURE_OPENAI_ENDPOINT": "https://acme.openai.azure.com"})
+    @patch("pydantic_ai.providers.azure.AzureProvider")
+    @patch("pydantic_ai.providers.anthropic.AnthropicProvider")
+    @patch("pydantic_ai.providers.openai.OpenAIProvider")
+    @patch("pydantic_ai.models.anthropic.AnthropicModel")
+    @patch("pydantic_ai.models.openai.OpenAIChatModel")
+    def test_chain_wrapped_in_declaration_order(
+        self,
+        mock_openai_cls,
+        mock_anthropic_cls,
+        mock_openai_provider,
+        mock_anthropic_provider,
+        mock_azure_provider,
+    ) -> None:
+        """FallbackModel.models follows the config's declaration order, primary first.
+
+        Each built model carries the model_name of the ModelConfig it came from, so
+        a reversed chain fails here — a count-only assertion would not catch it.
+        """
+        mock_openai_cls.side_effect = lambda **kwargs: _named_model(**kwargs)
+        mock_anthropic_cls.side_effect = lambda **kwargs: _named_model(**kwargs)
+        mock_client = MagicMock(spec=httpx.AsyncClient)
+
+        result = create_model(self._acme_chain(), http_client=mock_client)
+
+        assert isinstance(result, FallbackModel)
+        assert [model.model_name for model in result.models] == [
+            "acme-primary",
+            "acme-fallback-1",
+            "acme-fallback-2",
+        ]
+
+    @patch("pydantic_ai.providers.anthropic.AnthropicProvider")
+    @patch("pydantic_ai.providers.openai.OpenAIProvider")
+    @patch("pydantic_ai.models.anthropic.AnthropicModel")
+    @patch("pydantic_ai.models.openai.OpenAIChatModel")
+    def test_single_entry_chain_wraps_in_order(
+        self,
+        mock_openai_cls,
+        mock_anthropic_cls,
+        mock_openai_provider,
+        mock_anthropic_provider,
+    ) -> None:
+        """A one-entry chain still wraps, primary first."""
+        mock_openai_cls.side_effect = lambda **kwargs: _named_model(**kwargs)
+        mock_anthropic_cls.side_effect = lambda **kwargs: _named_model(**kwargs)
+        mock_client = MagicMock(spec=httpx.AsyncClient)
+        config = ModelConfig(
+            provider="openai",
+            model="acme-primary",
+            fallback_models=[ModelConfig(provider="anthropic", model="contoso-standby")],
+        )
+
+        result = create_model(config, http_client=mock_client)
+
+        assert isinstance(result, FallbackModel)
+        assert [model.model_name for model in result.models] == [
+            "acme-primary",
+            "contoso-standby",
+        ]
+
+    @patch("pydantic_ai.providers.anthropic.AnthropicProvider")
+    @patch("pydantic_ai.providers.openai.OpenAIProvider")
+    @patch("pydantic_ai.models.anthropic.AnthropicModel")
+    @patch("pydantic_ai.models.openai.OpenAIChatModel")
+    def test_every_entry_built_with_the_same_http_client(
+        self,
+        mock_openai_cls,
+        mock_anthropic_cls,
+        mock_openai_provider,
+        mock_anthropic_provider,
+    ) -> None:
+        """The caller's http_client reaches the primary's provider and the fallback's."""
+        mock_openai_cls.side_effect = lambda **kwargs: _named_model(**kwargs)
+        mock_anthropic_cls.side_effect = lambda **kwargs: _named_model(**kwargs)
+        mock_client = MagicMock(spec=httpx.AsyncClient)
+        config = ModelConfig(
+            provider="openai",
+            model="acme-primary",
+            fallback_models=[ModelConfig(provider="anthropic", model="contoso-standby")],
+        )
+
+        create_model(config, http_client=mock_client)
+
+        mock_openai_provider.assert_called_once_with(http_client=mock_client)
+        mock_anthropic_provider.assert_called_once_with(http_client=mock_client)
+
+    @patch("akgentic.llm.providers.create_http_client")
+    @patch("pydantic_ai.providers.anthropic.AnthropicProvider")
+    @patch("pydantic_ai.providers.openai.OpenAIProvider")
+    @patch("pydantic_ai.models.anthropic.AnthropicModel")
+    @patch("pydantic_ai.models.openai.OpenAIChatModel")
+    def test_auto_created_client_shared_across_the_chain(
+        self,
+        mock_openai_cls,
+        mock_anthropic_cls,
+        mock_openai_provider,
+        mock_anthropic_provider,
+        mock_create_client,
+    ) -> None:
+        """With http_client=None, one client is created and reused by every entry."""
+        mock_openai_cls.side_effect = lambda **kwargs: _named_model(**kwargs)
+        mock_anthropic_cls.side_effect = lambda **kwargs: _named_model(**kwargs)
+        mock_create_client.return_value = MagicMock(spec=httpx.AsyncClient)
+        config = ModelConfig(
+            provider="openai",
+            model="acme-primary",
+            fallback_models=[ModelConfig(provider="anthropic", model="contoso-standby")],
+        )
+
+        create_model(config)  # no http_client argument
+
+        mock_create_client.assert_called_once()
+        mock_openai_provider.assert_called_once_with(http_client=mock_create_client.return_value)
+        mock_anthropic_provider.assert_called_once_with(http_client=mock_create_client.return_value)
+
+    @patch("pydantic_ai.providers.openai.OpenAIProvider")
+    @patch("pydantic_ai.models.openai.OpenAIChatModel")
+    def test_unsupported_provider_in_fallback_entry_raises(
+        self, mock_model_cls, mock_provider_cls
+    ) -> None:
+        """An unsupported provider in a fallback entry raises the primary path's ValueError."""
+        mock_model_cls.side_effect = lambda **kwargs: _named_model(**kwargs)
+        mock_client = MagicMock(spec=httpx.AsyncClient)
+        config = ModelConfig(
+            provider="openai",
+            model="acme-primary",
+            fallback_models=[ModelConfig(provider="openai", model="contoso-standby")],
+        )
+        # ModelConfig validates provider via Literal; bypass on the fallback entry only
+        object.__setattr__(config.fallback_models[0], "provider", "unknown-provider")
+
+        with pytest.raises(ValueError) as exc_info:
+            create_model(config, http_client=mock_client)
+
+        assert "Unsupported provider: unknown-provider" in str(exc_info.value)
+        assert "Supported providers:" in str(exc_info.value)
+
+    def test_unsupported_provider_message_identical_in_both_positions(self) -> None:
+        """The fallback path's error is the primary path's error, not a variant of it."""
+        mock_client = MagicMock(spec=httpx.AsyncClient)
+
+        primary_only = ModelConfig(provider="openai", model="acme-primary")
+        object.__setattr__(primary_only, "provider", "unknown-provider")
+        with pytest.raises(ValueError) as primary_exc:
+            create_model(primary_only, http_client=mock_client)
+
+        with_fallback = ModelConfig(
+            provider="openai",
+            model="acme-primary",
+            fallback_models=[ModelConfig(provider="openai", model="contoso-standby")],
+        )
+        object.__setattr__(with_fallback.fallback_models[0], "provider", "unknown-provider")
+        with (
+            patch("pydantic_ai.providers.openai.OpenAIProvider"),
+            patch("pydantic_ai.models.openai.OpenAIChatModel"),
+        ):
+            with pytest.raises(ValueError) as fallback_exc:
+                create_model(with_fallback, http_client=mock_client)
+
+        assert str(fallback_exc.value) == str(primary_exc.value)

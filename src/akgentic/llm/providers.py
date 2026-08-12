@@ -34,6 +34,7 @@ from typing import TYPE_CHECKING, Any, TypeVar, cast
 import httpx
 from pydantic_ai import NativeOutput
 from pydantic_ai.models import Model
+from pydantic_ai.models.fallback import FallbackModel
 from pydantic_ai.retries import AsyncTenacityTransport, RetryConfig, wait_retry_after
 from pydantic_ai.settings import ModelSettings
 from tenacity import retry_if_exception, stop_after_attempt, wait_random_exponential
@@ -471,6 +472,37 @@ _PROVIDER_FACTORIES = {
 }
 
 
+def _build_single_model(
+    config: ModelConfig,
+    http_client: httpx.AsyncClient,
+) -> Model:
+    """Build one pydantic-ai model from one configuration.
+
+    Shared by the primary model and by every fallback entry, so an unsupported
+    provider fails identically wherever it appears in the chain.
+
+    Args:
+        config: LLM model configuration for this single model.
+        http_client: Async HTTP client with retry logic.
+
+    Returns:
+        Configured pydantic-ai Model instance.
+
+    Raises:
+        ValueError: If provider is not supported.
+    """
+    factory = _PROVIDER_FACTORIES.get(config.provider)
+    if factory is None:
+        supported = ", ".join(_PROVIDER_FACTORIES.keys())
+        raise ValueError(
+            f"Unsupported provider: {config.provider}. Supported providers: {supported}"
+        )
+
+    # The provider factory callables are typed loosely (resolve to `object`);
+    # each genuinely returns a pydantic-ai `Model` at runtime.
+    return cast(Model, factory(config, http_client))
+
+
 def create_model(
     config: ModelConfig,
     http_client: httpx.AsyncClient | None = None,
@@ -489,16 +521,28 @@ def create_model(
         - mistral: Mistral AI models
         - nvidia: NVIDIA NIM models
 
+    Fallback chain:
+        When ``config.fallback_models`` is non-empty, the primary model and every
+        entry of the chain are built the same way and handed to pydantic-ai's
+        ``FallbackModel`` in declaration order. ``FallbackModel`` is itself a
+        ``Model``, so nothing at the call site changes. ``fallback_on`` is left at
+        pydantic-ai's default, ``(ModelAPIError,)`` — rate limits, auth failures,
+        5xx and API-layer timeouts. An empty chain (the default) returns the
+        primary model unwrapped.
+
     Args:
         config: LLM model configuration.
         http_client: Optional async HTTP client with retry logic. If None,
             creates a default client via ``create_http_client()``.
 
     Returns:
-        Configured pydantic-ai Model instance.
+        Configured pydantic-ai Model instance — a ``FallbackModel`` wrapping the
+        chain when ``config.fallback_models`` is non-empty, otherwise the primary
+        provider model itself.
 
     Raises:
-        ValueError: If provider is not supported.
+        ValueError: If the provider of the primary model or of any fallback
+            entry is not supported.
 
     Example:
         >>> from akgentic.llm import ModelConfig, create_model
@@ -522,13 +566,9 @@ def create_model(
     if http_client is None:
         http_client = create_http_client()
 
-    factory = _PROVIDER_FACTORIES.get(config.provider)
-    if factory is None:
-        supported = ", ".join(_PROVIDER_FACTORIES.keys())
-        raise ValueError(
-            f"Unsupported provider: {config.provider}. Supported providers: {supported}"
-        )
+    primary = _build_single_model(config, http_client)
+    if not config.fallback_models:
+        return primary
 
-    # The provider factory callables are typed loosely (resolve to `object`);
-    # each genuinely returns a pydantic-ai `Model` at runtime.
-    return cast(Model, factory(config, http_client))
+    fallbacks = [_build_single_model(entry, http_client) for entry in config.fallback_models]
+    return FallbackModel(primary, *fallbacks)
