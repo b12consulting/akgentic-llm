@@ -1,21 +1,24 @@
 """Unit tests for ReactAgent implementation."""
 
 from dataclasses import dataclass
-from unittest.mock import MagicMock, patch
+from typing import TypeVar, get_type_hints
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from pydantic_ai import BinaryContent
 from pydantic_ai.exceptions import UsageLimitExceeded
 from pydantic_ai.messages import ModelRequest, SystemPromptPart, UserPromptPart
+from pydantic_ai.usage import RunUsage
 
 from akgentic.llm import (
+    AgentUsageLimits,
     CompactionConfig,
     CompactionResult,
     ModelConfig,
     ReactAgent,
     ReactAgentConfig,
+    RunUsageLimits,
     UsageLimitError,
-    UsageLimits,
     UserPrompt,
 )
 from akgentic.llm.compaction import SummarizingCompaction
@@ -24,6 +27,7 @@ from akgentic.llm.event import (
     LlmContextCompactedEvent,
     LlmMessageEvent,
     LlmSystemPromptEvent,
+    LlmUsageEvent,
     SystemPromptPartSnapshot,
     ToolCallEvent,
 )
@@ -49,6 +53,20 @@ def _over_budget_config() -> ReactAgentConfig:
     )
 
 
+class _ZeroUsageRun:
+    """Mixin giving a run double pydantic-ai's ``AgentRun.usage`` property.
+
+    ``usage`` is a property there, not a method, and every real run has one — the
+    agent folds it into its lifetime accumulator after each run. These doubles
+    report a run that spent nothing; the token-budget suites use ``_StubRun`` when
+    the spend matters.
+    """
+
+    @property
+    def usage(self) -> RunUsage:
+        return RunUsage()
+
+
 class MockObserver:
     """Mock observer for context notifications."""
 
@@ -72,7 +90,7 @@ def config_with_limits():
     """ReactAgentConfig with usage limits."""
     return ReactAgentConfig(
         model_cfg=ModelConfig(provider="openai", model="gpt-4o"),
-        usage_limits=UsageLimits(request_limit=5, total_tokens_limit=1000),
+        run_usage_limits=RunUsageLimits(run_request_limit=5, total_tokens_limit=1000),
     )
 
 
@@ -82,7 +100,7 @@ def mock_agent_iter():
 
     async def fake_iter(*args, **kwargs):
         # Create mock run object that supports async context manager
-        class MockRun:
+        class MockRun(_ZeroUsageRun):
             def __init__(self):
                 self.result = MagicMock(output="test result")
                 self._messages = [ModelRequest(parts=[UserPromptPart(content="test")])]
@@ -225,7 +243,7 @@ class TestReactAgentRun:
         agent = ReactAgent(config=minimal_config)
 
         # Create mock run object
-        class MockRun:
+        class MockRun(_ZeroUsageRun):
             def __init__(self):
                 self.result = MagicMock(output="test result")
                 self._new_messages = [ModelRequest(parts=[UserPromptPart(content="test")])]
@@ -259,7 +277,7 @@ class TestReactAgentRun:
         agent = ReactAgent(config=minimal_config)
 
         # Create mock run object
-        class MockRun:
+        class MockRun(_ZeroUsageRun):
             def __init__(self):
                 self.result = MagicMock(output="test result")
                 self._new_messages = [ModelRequest(parts=[UserPromptPart(content="test")])]
@@ -338,7 +356,7 @@ class TestReactAgentContextMethods:
         agent = ReactAgent(config=minimal_config)
 
         # Create mock run object
-        class MockRun:
+        class MockRun(_ZeroUsageRun):
             def __init__(self):
                 self.result = MagicMock(output="test result")
                 self._new_messages = [ModelRequest(parts=[UserPromptPart(content="test")])]
@@ -384,7 +402,7 @@ class TestReactAgentSyncMethod:
         agent = ReactAgent(config=minimal_config)
 
         # Create mock run object
-        class MockRun:
+        class MockRun(_ZeroUsageRun):
             def __init__(self):
                 self.result = MagicMock(output="test result")
                 self._new_messages = [ModelRequest(parts=[UserPromptPart(content="test")])]
@@ -465,6 +483,57 @@ class TestReactAgentToolDecorator:
         # Verify decorator returned a callable
         assert callable(search_tool)
 
+    def test_decorators_preserve_the_decorated_function_type(self, minimal_config):
+        """`@agent.tool` / `@agent.system_prompt` must not erase the function's type.
+
+        A wrapper annotated ``(func: Any) -> Any`` silently retypes every
+        registered function to ``Any``, so mypy stops checking all of its
+        callers — a regression no behavioural test can observe. It has to be
+        checked at runtime rather than with ``assert_type``, because CI
+        type-checks ``src/`` only; an ``assert_type`` under ``tests/`` is a
+        no-op nothing would ever read.
+
+        Two assertions, together equivalent to the static claim:
+
+        1. The same type variable goes in and comes out, so a caller keeps the
+           signature it registered. Reverting either wrapper to ``-> Any``
+           fails here.
+        2. The premise that annotation rests on still holds — pydantic-ai hands
+           back the original function object rather than a wrapper. If a future
+           version starts wrapping, ``-> F`` becomes a lie and this goes red.
+           Asserted for both wrappers: they reach pydantic-ai through different
+           code paths (``tool()`` versus the ``system_prompt(dynamic=True)``
+           closure), so one holding says nothing about the other.
+        """
+        for method in (ReactAgent.tool, ReactAgent.system_prompt):
+            hints = get_type_hints(method)
+            assert isinstance(hints["func"], TypeVar)
+            assert hints["return"] is hints["func"]
+
+        class MyDeps:
+            pass
+
+        agent = ReactAgent(config=minimal_config, deps_type=MyDeps)
+
+        from pydantic_ai import RunContext
+
+        def search_tool(ctx: RunContext[MyDeps], query: str) -> list[str]:
+            """Search for items matching query.
+
+            Args:
+                query: The search query string
+
+            Returns:
+                List of matching items
+            """
+            return [f"Result: {query}"]
+
+        def dynamic_prompt(ctx: RunContext[MyDeps]) -> str:
+            return "Dynamic system prompt"
+
+        assert agent.tool(search_tool) is search_tool
+        assert agent.system_prompt(dynamic_prompt) is dynamic_prompt
+
 
 class TestReactAgentUsageLimits:
     """Test usage limits conversion."""
@@ -473,8 +542,9 @@ class TestReactAgentUsageLimits:
         """Test usage limits from config converted to pydantic-ai format."""
         agent = ReactAgent(config=config_with_limits)
         # Test that conversion happens without error
-        pydantic_limits = agent._to_pydantic_limits(config_with_limits.usage_limits)
+        pydantic_limits = agent._to_pydantic_limits(config_with_limits.run_usage_limits)
         assert pydantic_limits is not None
+        # run_request_limit maps onto pydantic-ai's request_limit
         assert pydantic_limits.request_limit == 5
         assert pydantic_limits.total_tokens_limit == 1000
 
@@ -483,6 +553,589 @@ class TestReactAgentUsageLimits:
         agent = ReactAgent(config=minimal_config)
         pydantic_limits = agent._to_pydantic_limits(None)
         assert pydantic_limits is None
+
+    def test_converter_reads_the_limits_object_it_is_handed(self):
+        """Test the converter reads its argument's request limit, not the agent tier.
+
+        Narrow by construction: _to_pydantic_limits takes the tier as a parameter, so
+        this pins the conversion only. Which tier run() hands it is the part that can
+        actually regress — see test_run_hands_the_run_tier_to_pydantic_ai.
+        """
+        config = ReactAgentConfig(
+            model_cfg=ModelConfig(provider="openai", model="gpt-4o"),
+            run_usage_limits=RunUsageLimits(run_request_limit=5),
+            agent_usage_limits=AgentUsageLimits(agent_request_limit=1),
+        )
+        agent = ReactAgent(config=config)
+        pydantic_limits = agent._to_pydantic_limits(config.run_usage_limits)
+        assert pydantic_limits.request_limit == 5
+
+
+class _StubRun:
+    """Stand-in for pydantic-ai's iter() run object: yields nothing, calls no model.
+
+    ``usage`` is a property, not a method, matching pydantic-ai's ``AgentRun.usage``
+    (calling that one emits a deprecation warning). Spends nothing unless told to.
+    """
+
+    def __init__(self, *args, spent=None, **kwargs):
+        self.result = MagicMock(output="ok")
+        self._usage = spent if spent is not None else RunUsage()
+
+    @property
+    def usage(self):
+        return self._usage
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_):
+        return False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        raise StopAsyncIteration
+
+    def new_messages(self):
+        return []
+
+
+def _agent_limit_config(limit):
+    """Config carrying only an agent-tier run budget."""
+    return ReactAgentConfig(
+        model_cfg=ModelConfig(provider="openai", model="gpt-4o"),
+        agent_usage_limits=AgentUsageLimits(agent_request_limit=limit),
+    )
+
+
+def _agent_token_config(**token_limits):
+    """Config carrying only agent-tier TOKEN limits (no run budget)."""
+    return ReactAgentConfig(
+        model_cfg=ModelConfig(provider="openai", model="gpt-4o"),
+        agent_usage_limits=AgentUsageLimits(**token_limits),
+    )
+
+
+def _stub_run_spending(input_tokens, output_tokens=0):
+    """iter() side_effect returning a run that reports a fixed token spend."""
+
+    def factory(*args, **kwargs):
+        return _StubRun(spent=RunUsage(input_tokens=input_tokens, output_tokens=output_tokens))
+
+    return factory
+
+
+class TestReactAgentRunCountEnforcement:
+    """Test the agent-lifetime run budget: pre-flight, check-then-consume."""
+
+    def test_fresh_agent_starts_at_zero(self, minimal_config):
+        """Test a newly constructed agent has consumed no runs."""
+        agent = ReactAgent(config=minimal_config)
+        assert agent._agent_run_count == 0
+
+    def test_runs_up_to_the_limit_succeed(self):
+        """Test calls 1..N execute and consume exactly N."""
+        agent = ReactAgent(config=_agent_limit_config(2))
+        with patch.object(agent._pydantic_agent, "iter", side_effect=_StubRun):
+            agent.run_sync("first")
+            agent.run_sync("second")
+        assert agent._agent_run_count == 2
+
+    def test_run_past_the_limit_raises_and_does_not_consume(self):
+        """Test call N+1 is rejected and leaves the counter pinned at the limit."""
+        agent = ReactAgent(config=_agent_limit_config(2))
+        with patch.object(agent._pydantic_agent, "iter", side_effect=_StubRun):
+            agent.run_sync("first")
+            agent.run_sync("second")
+            with pytest.raises(UsageLimitError) as exc_info:
+                agent.run_sync("third")
+        # The rejected call never executed, so it consumed nothing: runs consumed,
+        # never runs attempted.
+        assert agent._agent_run_count == 2
+        assert str(exc_info.value) == "Exceeded the agent_request_limit of 2 (run_count=2)"
+
+    def test_rejection_does_not_reach_the_tool_call_healing_path(self):
+        """Test a rejected run never routes through _heal_unprocessed_tool_calls.
+
+        Asserted on the call, not on resulting context: healing is a no-op on an
+        empty context, so an emptiness check would pass even from inside the try.
+        """
+        agent = ReactAgent(config=_agent_limit_config(1))
+        with patch.object(agent._pydantic_agent, "iter", side_effect=_StubRun):
+            agent.run_sync("first")
+        with patch.object(agent, "_heal_unprocessed_tool_calls") as heal:
+            with pytest.raises(UsageLimitError):
+                agent.run_sync("second")
+        heal.assert_not_called()
+
+    def test_run_hands_the_run_tier_to_pydantic_ai(self):
+        """Test run() converts the run tier for pydantic-ai, never the agent tier."""
+        config = ReactAgentConfig(
+            model_cfg=ModelConfig(provider="openai", model="gpt-4o"),
+            run_usage_limits=RunUsageLimits(run_request_limit=5),
+            agent_usage_limits=AgentUsageLimits(agent_request_limit=1),
+        )
+        agent = ReactAgent(config=config)
+        captured = {}
+
+        def capture(**kwargs):
+            captured.update(kwargs)
+            return _StubRun()
+
+        with patch.object(agent._pydantic_agent, "iter", side_effect=capture):
+            agent.run_sync("only run")
+        # 5 (run tier), never 1 (agent tier): differently valued so this distinguishes
+        # "reads the run tier" from "reads whichever tier is set".
+        assert captured["usage_limits"].request_limit == 5
+
+    def test_rejection_happens_before_compaction(self):
+        """Test the budget check precedes compaction: a rejected run costs nothing."""
+        agent = ReactAgent(config=_agent_limit_config(1))
+        with patch.object(agent._pydantic_agent, "iter", side_effect=_StubRun):
+            agent.run_sync("first")
+        with patch.object(agent, "_maybe_compact", new=AsyncMock()) as compact:
+            with pytest.raises(UsageLimitError):
+                agent.run_sync("second")
+        compact.assert_not_called()
+
+    def test_counter_advances_when_the_wrapped_call_raises(self):
+        """Test a run that fails partway has already been counted."""
+        agent = ReactAgent(config=_agent_limit_config(3))
+        with patch.object(agent._pydantic_agent, "iter", side_effect=RuntimeError("boom")):
+            with pytest.raises(RuntimeError):
+                agent.run_sync("first")
+        assert agent._agent_run_count == 1
+
+    def test_counter_advances_when_the_run_tier_limit_fires(self):
+        """Test a run-tier breach still consumes the agent-tier budget."""
+        agent = ReactAgent(config=_agent_limit_config(3))
+        breach = UsageLimitExceeded("The next request would exceed the request_limit of 1")
+        with patch.object(agent._pydantic_agent, "iter", side_effect=breach):
+            with pytest.raises(UsageLimitError) as exc_info:
+                agent.run_sync("first")
+        assert agent._agent_run_count == 1
+        assert "request_limit of 1" in str(exc_info.value)
+
+    def test_repeated_run_tier_failures_exhaust_the_agent_tier(self):
+        """Test the two tiers interact: a run-level loop cannot spin forever."""
+        agent = ReactAgent(config=_agent_limit_config(2))
+        breach = UsageLimitExceeded("The next request would exceed the request_limit of 1")
+        with patch.object(agent._pydantic_agent, "iter", side_effect=breach):
+            for _ in range(2):
+                with pytest.raises(UsageLimitError) as run_tier:
+                    agent.run_sync("burn a turn")
+                assert "The next request would exceed" in str(run_tier.value)
+            with pytest.raises(UsageLimitError) as agent_tier:
+                agent.run_sync("one turn too many")
+        assert str(agent_tier.value) == "Exceeded the agent_request_limit of 2 (run_count=2)"
+
+    def test_unset_limit_never_blocks(self, minimal_config):
+        """Test agent_request_limit=None (the default) blocks nothing but still counts."""
+        assert minimal_config.agent_usage_limits.agent_request_limit is None
+        agent = ReactAgent(config=minimal_config)
+        with patch.object(agent._pydantic_agent, "iter", side_effect=_StubRun):
+            for _ in range(5):
+                agent.run_sync("unbounded")
+        assert agent._agent_run_count == 5
+
+    async def test_async_run_enforces_the_same_budget(self):
+        """Test the async entry point holds the budget (run_sync only delegates to it)."""
+        agent = ReactAgent(config=_agent_limit_config(1))
+        with patch.object(agent._pydantic_agent, "iter", side_effect=_StubRun):
+            await agent.run("first")
+            with pytest.raises(UsageLimitError):
+                await agent.run("second")
+        assert agent._agent_run_count == 1
+
+    def test_run_count_is_not_persisted_config_state(self):
+        """Test the counter is runtime-only: no config field, nothing serialized."""
+        assert "_run_count" not in ReactAgentConfig.model_fields
+        assert "run_count" not in ReactAgentConfig.model_fields
+        dumped = _agent_limit_config(2).model_dump()
+        assert "_run_count" not in dumped
+        assert "run_count" not in dumped
+
+
+def _usage_event(run_id: str) -> LlmUsageEvent:
+    """One model round-trip's usage record, tagged with the run it belongs to."""
+    return LlmUsageEvent(
+        run_id=run_id,
+        model_name="gpt-4o",
+        provider_name="openai",
+        input_tokens=10,
+        output_tokens=5,
+        cache_read_tokens=0,
+        cache_write_tokens=0,
+        requests=1,
+    )
+
+
+class TestReactAgentRunCountRestore:
+    """restore_context() recomputes the agent-lifetime run budget from replayed events."""
+
+    def test_three_distinct_runs_seed_three(self):
+        """Test one event per run over three runs seeds a count of three."""
+        agent = ReactAgent(config=_agent_limit_config(10))
+        events = [FakeEventMessage(event=_usage_event(rid)) for rid in ("r1", "r2", "r3")]
+        agent.restore_context(events)
+        assert agent._agent_run_count == 3
+
+    def test_one_run_emitting_three_events_seeds_one(self):
+        """Test a run with three tool-call round-trips counts once, not three times.
+
+        The discriminating test. One ``run()`` emits one ``LlmUsageEvent`` per
+        ``ModelResponse``, all sharing one ``run_id``. Two plausible-but-wrong
+        implementations fail here and only here: counting events seeds 3, and
+        aggregating without ``by_run=True`` leaves ``runs`` empty and seeds 0.
+        A fixture with one event per run passes under all three.
+        """
+        agent = ReactAgent(config=_agent_limit_config(10))
+        events = [FakeEventMessage(event=_usage_event("same-run")) for _ in range(3)]
+        agent.restore_context(events)
+        assert agent._agent_run_count == 1
+
+    def test_empty_event_list_seeds_zero(self):
+        """Test restoring nothing seeds zero — on a fresh agent and on a spent one.
+
+        The second half is what makes this bite. A fresh agent reads ``0``
+        whether or not seeding ran at all, so asserting only that proves
+        nothing; driving the counter above zero first turns the assertion into
+        a real one. It also pins **assignment** over a high-water mark (AC #6):
+        ``max(self._run_count, ...)`` satisfies every other test in this class.
+        """
+        agent = ReactAgent(config=_agent_limit_config(10))
+        agent.restore_context([])
+        assert agent._agent_run_count == 0
+
+        agent.restore_context([FakeEventMessage(event=_usage_event(rid)) for rid in ("r1", "r2")])
+        assert agent._agent_run_count == 2
+        agent.restore_context([])
+        assert agent._agent_run_count == 0
+
+    def test_events_without_usage_seed_zero(self):
+        """Test envelopes carrying non-usage payloads are ignored.
+
+        Seeded above zero first, for the same reason: this distinguishes "the
+        ignore path assigns zero" from "the counter was simply never touched".
+        """
+        agent = ReactAgent(config=_agent_limit_config(10))
+        agent.restore_context([FakeEventMessage(event=_usage_event(rid)) for rid in ("r1", "r2")])
+        msg = ModelRequest(parts=[UserPromptPart(content="hello")])
+        events = [
+            FakeEventMessage(event=LlmMessageEvent(message=msg)),
+            FakeEventMessage(
+                event=ToolCallEvent(
+                    run_id="r1", tool_name="lookup", tool_call_id="c1", arguments="{}"
+                )
+            ),
+        ]
+        agent.restore_context(events)
+        assert agent._agent_run_count == 0
+
+    def test_restored_agent_at_its_limit_raises_on_the_next_run(self):
+        """Test the seeded value is enforced, not merely stored.
+
+        Reading ``_run_count`` back only proves it was written. This drives the
+        seeded value through ``_check_and_consume_agent_budget`` and asserts the
+        message shape 15-2 pinned.
+        """
+        agent = ReactAgent(config=_agent_limit_config(2))
+        agent.restore_context([FakeEventMessage(event=_usage_event(rid)) for rid in ("r1", "r2")])
+        with patch.object(agent._pydantic_agent, "iter", side_effect=_StubRun):
+            with pytest.raises(UsageLimitError) as exc_info:
+                agent.run_sync("one turn too many")
+        assert str(exc_info.value) == "Exceeded the agent_request_limit of 2 (run_count=2)"
+
+    def test_restored_agent_below_its_limit_spends_only_the_remainder(self):
+        """Test the seeded count is the budget's starting point, not a blanket block.
+
+        Complements the at-limit test: without this, an implementation that seeded
+        the limit itself (or any value >= it) would look correct.
+        """
+        agent = ReactAgent(config=_agent_limit_config(2))
+        agent.restore_context([FakeEventMessage(event=_usage_event("r1"))])
+        with patch.object(agent._pydantic_agent, "iter", side_effect=_StubRun):
+            agent.run_sync("the one run left")
+            with pytest.raises(UsageLimitError):
+                agent.run_sync("one turn too many")
+        assert agent._agent_run_count == 2
+
+    def test_restore_is_idempotent(self):
+        """Test seeding assigns rather than accumulates: restoring twice is stable."""
+        agent = ReactAgent(config=_agent_limit_config(10))
+        events = [FakeEventMessage(event=_usage_event(rid)) for rid in ("r1", "r2")]
+        agent.restore_context(events)
+        agent.restore_context(events)
+        assert agent._agent_run_count == 2
+
+    def test_never_restored_agent_starts_at_zero(self, minimal_config):
+        """Test seeding runs on restore only — construction still yields zero."""
+        assert ReactAgent(config=minimal_config)._agent_run_count == 0
+
+    def test_seeding_leaves_the_message_fold_intact(self):
+        """Test a mixed stream still restores exactly its LlmMessageEvent messages."""
+        agent = ReactAgent(config=_agent_limit_config(10))
+        msg1 = ModelRequest(parts=[UserPromptPart(content="first")])
+        msg2 = ModelRequest(parts=[UserPromptPart(content="second")])
+        agent.restore_context(
+            [
+                FakeEventMessage(event=LlmMessageEvent(message=msg1)),
+                FakeEventMessage(event=_usage_event("r1")),
+                FakeEventMessage(event=LlmMessageEvent(message=msg2)),
+                FakeEventMessage(event=_usage_event("r2")),
+            ]
+        )
+        assert agent.context.messages == [msg1, msg2]
+        assert agent._agent_run_count == 2
+
+
+class TestReactAgentTokenBudgetEnforcement:
+    """Test the agent-lifetime TOKEN budget: accumulate across runs, check pre-flight."""
+
+    def test_fresh_agent_starts_with_nothing_spent(self, minimal_config):
+        """Test a newly constructed agent has burned no tokens."""
+        agent = ReactAgent(config=minimal_config)
+        assert agent._agent_usage.total_tokens == 0
+
+    def test_unset_token_limits_never_block(self, minimal_config):
+        """Test the default (all None) blocks nothing, however much is spent."""
+        limits = minimal_config.agent_usage_limits
+        assert (limits.input_tokens_limit, limits.output_tokens_limit) == (None, None)
+        assert limits.total_tokens_limit is None
+        agent = ReactAgent(config=minimal_config)
+        with patch.object(agent._pydantic_agent, "iter", side_effect=_stub_run_spending(1000, 500)):
+            for _ in range(5):
+                agent.run_sync("unbounded")
+        assert agent._agent_usage.total_tokens == 7500
+
+    def test_total_tokens_limit_blocks_once_the_lifetime_budget_is_spent(self):
+        """Test the budget spans runs: no single run breaches it, the agent still stops.
+
+        The discriminating test for accumulation. Every run here spends 60 against a
+        limit of 100, so an implementation that compared per-run usage — or reset the
+        accumulator each run — never raises and passes a single-run test green.
+        """
+        agent = ReactAgent(config=_agent_token_config(total_tokens_limit=100))
+        with patch.object(agent._pydantic_agent, "iter", side_effect=_stub_run_spending(40, 20)):
+            agent.run_sync("first")
+            agent.run_sync("second")
+            with pytest.raises(UsageLimitError) as exc_info:
+                agent.run_sync("third")
+        assert agent._agent_usage.total_tokens == 120
+        assert str(exc_info.value) == "Exceeded the total_tokens_limit of 100 (total_tokens=120)"
+
+    def test_input_tokens_limit_blocks_independently(self):
+        """Test input_tokens_limit is live on its own, not only via the total."""
+        agent = ReactAgent(config=_agent_token_config(input_tokens_limit=100))
+        with patch.object(agent._pydantic_agent, "iter", side_effect=_stub_run_spending(60)):
+            agent.run_sync("first")
+            agent.run_sync("second")
+            with pytest.raises(UsageLimitError) as exc_info:
+                agent.run_sync("third")
+        assert str(exc_info.value) == "Exceeded the input_tokens_limit of 100 (input_tokens=120)"
+
+    def test_output_tokens_limit_blocks_independently(self):
+        """Test output_tokens_limit is live on its own — output tokens only here."""
+        agent = ReactAgent(config=_agent_token_config(output_tokens_limit=100))
+        with patch.object(agent._pydantic_agent, "iter", side_effect=_stub_run_spending(0, 60)):
+            agent.run_sync("first")
+            agent.run_sync("second")
+            with pytest.raises(UsageLimitError) as exc_info:
+                agent.run_sync("third")
+        assert str(exc_info.value) == "Exceeded the output_tokens_limit of 100 (output_tokens=120)"
+
+    def test_a_run_may_overshoot_the_budget(self):
+        """Test the contract is "do not START once spent", not "never exceed".
+
+        A run's token cost is unknown until it completes, so the run that crosses the
+        line finishes normally and returns its output; only the next one is refused.
+        Pinned as behaviour so a reader meeting the overshoot does not file it as a bug.
+        """
+        agent = ReactAgent(config=_agent_token_config(total_tokens_limit=100))
+        with patch.object(agent._pydantic_agent, "iter", side_effect=_stub_run_spending(900, 100)):
+            assert agent.run_sync("one very expensive run") == "ok"
+            assert agent._agent_usage.total_tokens == 1000
+            with pytest.raises(UsageLimitError):
+                agent.run_sync("refused")
+
+    def test_usage_folds_even_when_the_run_fails_partway(self):
+        """Test tokens a failed run burned are still counted — the provider billed them."""
+        agent = ReactAgent(config=_agent_token_config(total_tokens_limit=1000))
+        with patch.object(agent._pydantic_agent, "iter", side_effect=_stub_run_spending(40, 20)):
+            with patch.object(agent, "_record_run_system_prompt", side_effect=RuntimeError("boom")):
+                with pytest.raises(RuntimeError):
+                    agent.run_sync("fails after spending")
+        assert agent._agent_usage.total_tokens == 60
+
+    def test_token_rejection_consumes_no_run_budget(self):
+        """Test the two agent-tier gates are independent: a token refusal costs no run.
+
+        The token check runs first precisely so a refused call does not also burn a
+        unit of agent_request_limit, which would make repeated refusals shrink an
+        unrelated budget.
+        """
+        config = ReactAgentConfig(
+            model_cfg=ModelConfig(provider="openai", model="gpt-4o"),
+            agent_usage_limits=AgentUsageLimits(agent_request_limit=5, total_tokens_limit=100),
+        )
+        agent = ReactAgent(config=config)
+        with patch.object(agent._pydantic_agent, "iter", side_effect=_stub_run_spending(150)):
+            agent.run_sync("first")
+            with pytest.raises(UsageLimitError):
+                agent.run_sync("refused on tokens")
+            with pytest.raises(UsageLimitError):
+                agent.run_sync("refused again")
+        assert agent._agent_run_count == 1
+
+    def test_token_rejection_happens_before_compaction(self):
+        """Test the token check precedes compaction: a refused run pays no summarizer."""
+        agent = ReactAgent(config=_agent_token_config(total_tokens_limit=100))
+        with patch.object(agent._pydantic_agent, "iter", side_effect=_stub_run_spending(150)):
+            agent.run_sync("first")
+        with patch.object(agent, "_maybe_compact", new=AsyncMock()) as compact:
+            with pytest.raises(UsageLimitError):
+                agent.run_sync("refused")
+        compact.assert_not_called()
+
+    def test_run_tier_never_receives_the_lifetime_accumulator(self):
+        """Test iter() starts every run at zero usage — it never sees the accumulator.
+
+        The mutation this exists to kill (``usage=self._agent_usage`` on the ``iter()``
+        call) raises nothing and logs nothing: it checks the RUN tier's limits against
+        lifetime totals, silently turning a per-run cap into a lifetime one. No other
+        test in this file goes red for it.
+        """
+        agent = ReactAgent(config=_agent_token_config())
+        captured = []
+
+        def capture(*args, **kwargs):
+            captured.append(kwargs.get("usage"))
+            return _StubRun(spent=RunUsage(input_tokens=100, output_tokens=50))
+
+        with patch.object(agent._pydantic_agent, "iter", side_effect=capture):
+            agent.run_sync("first")
+            agent.run_sync("second")
+
+        # Non-zero by the second call, so "fresh" is a real claim there, not a tautology.
+        assert agent._agent_usage.total_tokens == 300
+        assert len(captured) == 2
+        for usage in captured:
+            assert usage is None or (usage is not agent._agent_usage and usage.total_tokens == 0)
+
+    async def test_async_run_enforces_the_same_token_budget(self):
+        """Test the async entry point holds the budget (run_sync only delegates to it)."""
+        agent = ReactAgent(config=_agent_token_config(total_tokens_limit=100))
+        with patch.object(agent._pydantic_agent, "iter", side_effect=_stub_run_spending(150)):
+            await agent.run("first")
+            with pytest.raises(UsageLimitError):
+                await agent.run("second")
+
+    def test_accumulator_is_not_persisted_config_state(self):
+        """Test the accumulator is runtime-only: no config field, nothing serialized."""
+        assert "_agent_usage" not in ReactAgentConfig.model_fields
+        assert "agent_usage" not in ReactAgentConfig.model_fields
+        assert "_agent_usage" not in _agent_token_config(total_tokens_limit=100).model_dump()
+
+
+class TestReactAgentTokenBudgetRestore:
+    """restore_context() reseeds the token accumulator from the same replayed events."""
+
+    def test_restore_seeds_tokens_from_replayed_events(self):
+        """Test three replayed runs seed the summed token totals, not zero."""
+        agent = ReactAgent(config=_agent_token_config(total_tokens_limit=1000))
+        agent.restore_context(
+            [FakeEventMessage(event=_usage_event(rid)) for rid in ("r1", "r2", "r3")]
+        )
+        # _usage_event spends 10 input / 5 output per event.
+        assert agent._agent_usage.input_tokens == 30
+        assert agent._agent_usage.output_tokens == 15
+
+    def test_every_event_of_a_run_contributes_its_tokens(self):
+        """Test tokens sum over EVENTS within a run, unlike the run counter.
+
+        The counterpart to the run counter's "three events, one run". Both seeds come
+        from the same aggregation and they are deliberately different reductions of it:
+        a run with three round-trips counts once but spent three times.
+        """
+        agent = ReactAgent(config=_agent_token_config(total_tokens_limit=1000))
+        agent.restore_context([FakeEventMessage(event=_usage_event("same-run")) for _ in range(3)])
+        assert agent._agent_run_count == 1
+        assert agent._agent_usage.total_tokens == 45
+
+    def test_restored_agent_over_budget_raises_on_the_next_run(self):
+        """Test the seeded tokens are enforced, not merely stored.
+
+        Also the test that catches a dropped ``by_run=True``: that mutation seeds an
+        empty summary, so the agent looks fresh and this run succeeds.
+        """
+        agent = ReactAgent(config=_agent_token_config(total_tokens_limit=40))
+        agent.restore_context(
+            [FakeEventMessage(event=_usage_event(rid)) for rid in ("r1", "r2", "r3")]
+        )
+        with patch.object(agent._pydantic_agent, "iter", side_effect=_stub_run_spending(1)):
+            with pytest.raises(UsageLimitError) as exc_info:
+                agent.run_sync("one run too many")
+        assert str(exc_info.value) == "Exceeded the total_tokens_limit of 40 (total_tokens=45)"
+
+    def test_restored_agent_below_its_limit_spends_only_the_remainder(self):
+        """Test the seeded total is the budget's starting point, not a blanket block."""
+        agent = ReactAgent(config=_agent_token_config(total_tokens_limit=100))
+        agent.restore_context(
+            [FakeEventMessage(event=_usage_event(rid)) for rid in ("r1", "r2", "r3")]
+        )
+        with patch.object(agent._pydantic_agent, "iter", side_effect=_stub_run_spending(60)):
+            agent.run_sync("the one run left")  # 45 + 60 = 105, over only afterwards
+            with pytest.raises(UsageLimitError):
+                agent.run_sync("one run too many")
+
+    def test_restore_is_idempotent_for_tokens(self):
+        """Test seeding assigns rather than accumulates: restoring twice is stable."""
+        agent = ReactAgent(config=_agent_token_config(total_tokens_limit=1000))
+        events = [FakeEventMessage(event=_usage_event(rid)) for rid in ("r1", "r2")]
+        agent.restore_context(events)
+        agent.restore_context(events)
+        assert agent._agent_usage.total_tokens == 30
+
+    def test_empty_event_list_seeds_zero_tokens(self):
+        """Test restoring nothing zeroes the accumulator — on a spent agent, not a fresh one.
+
+        Seeded above zero first for the reason 15-3's review established: asserting
+        ``0`` on something already ``0`` passes under an implementation that never
+        touches the accumulator, and under a high-water-mark one.
+        """
+        agent = ReactAgent(config=_agent_token_config(total_tokens_limit=1000))
+        agent.restore_context([FakeEventMessage(event=_usage_event(rid)) for rid in ("r1", "r2")])
+        assert agent._agent_usage.total_tokens == 30
+        agent.restore_context([])
+        assert agent._agent_usage.total_tokens == 0
+
+    def test_events_without_usage_seed_zero_tokens(self):
+        """Test envelopes carrying non-usage payloads are ignored."""
+        agent = ReactAgent(config=_agent_token_config(total_tokens_limit=1000))
+        agent.restore_context([FakeEventMessage(event=_usage_event(rid)) for rid in ("r1", "r2")])
+        msg = ModelRequest(parts=[UserPromptPart(content="hello")])
+        agent.restore_context(
+            [
+                FakeEventMessage(event=LlmMessageEvent(message=msg)),
+                FakeEventMessage(
+                    event=ToolCallEvent(
+                        run_id="r1", tool_name="lookup", tool_call_id="c1", arguments="{}"
+                    )
+                ),
+            ]
+        )
+        assert agent._agent_usage.total_tokens == 0
+
+    def test_live_spend_continues_from_the_restored_total(self):
+        """Test a restored agent folds new runs on top of the seed, not over it."""
+        agent = ReactAgent(config=_agent_token_config(total_tokens_limit=1000))
+        agent.restore_context([FakeEventMessage(event=_usage_event("r1"))])
+        with patch.object(agent._pydantic_agent, "iter", side_effect=_stub_run_spending(100, 50)):
+            agent.run_sync("one more")
+        assert agent._agent_usage.input_tokens == 110
+        assert agent._agent_usage.output_tokens == 55
 
 
 class TestReactAgentMultimodalPrompt:
@@ -493,7 +1146,7 @@ class TestReactAgentMultimodalPrompt:
         agent = ReactAgent(config=minimal_config)
         captured_kwargs: dict = {}
 
-        class MockRun:
+        class MockRun(_ZeroUsageRun):
             def __init__(self, *args, **kwargs):
                 captured_kwargs.update(kwargs)
                 self.result = MagicMock(output="ok")
@@ -525,7 +1178,7 @@ class TestReactAgentMultimodalPrompt:
         captured_kwargs: dict = {}
         multimodal = ["describe: ", BinaryContent(data=b"imgbytes", media_type="image/png")]
 
-        class MockRun:
+        class MockRun(_ZeroUsageRun):
             def __init__(self, *args, **kwargs):
                 captured_kwargs.update(kwargs)
                 self.result = MagicMock(output="ok")
@@ -582,7 +1235,7 @@ class TestReactAgentMultimodalPrompt:
         bc = BinaryContent(data=b"x", media_type="image/png")
         multimodal: list[str | BinaryContent] = ["text", bc]
 
-        class MockRun:
+        class MockRun(_ZeroUsageRun):
             def __init__(self, *args, **kwargs):
                 captured_kwargs.update(kwargs)
                 self.result = MagicMock(output="ok")
@@ -627,7 +1280,7 @@ class TestReactAgentFoldsPendingOperatorActions:
     def _capturing_run_factory(captured: dict):
         """Return a MockRun class that records the kwargs passed to iter()."""
 
-        class MockRun:
+        class MockRun(_ZeroUsageRun):
             def __init__(self, *args, **kwargs):
                 captured.update(kwargs)
                 self.result = MagicMock(output="ok")
@@ -791,7 +1444,6 @@ class TestReactAgentRestoreContext:
                 )
             ),
             FakeEventMessage(event="arbitrary string"),
-            "not even an event message",
         ]
 
         agent.restore_context(events)
@@ -867,7 +1519,7 @@ def _system_request_with_run_id(
 def _make_mock_run(new_messages: list[ModelRequest]):
     """Return a MockRun instance whose new_messages() yields `new_messages`."""
 
-    class MockRun:
+    class MockRun(_ZeroUsageRun):
         def __init__(self) -> None:
             self.result = MagicMock(output="ok")
             self._new_messages = new_messages
@@ -1348,7 +2000,7 @@ class TestReactAgentConfigValidatorsAtConstruction:
             ReactAgentConfig(
                 model_cfg=ModelConfig(provider="openai", model="gpt-4o", context_length=1000),
                 compaction_cfg=CompactionConfig(auto_trigger=True, trigger_ratio=0.85),
-                usage_limits=UsageLimits(input_tokens_limit=800),  # 850 >= 800
+                run_usage_limits=RunUsageLimits(input_tokens_limit=800),  # 850 >= 800
             )
 
     def test_valid_config_builds_agent(self):
@@ -1356,7 +2008,7 @@ class TestReactAgentConfigValidatorsAtConstruction:
         config = ReactAgentConfig(
             model_cfg=ModelConfig(provider="openai", model="gpt-4o", context_length=10_000),
             compaction_cfg=CompactionConfig(auto_trigger=True, trigger_ratio=0.85),
-            usage_limits=UsageLimits(input_tokens_limit=50_000),
+            run_usage_limits=RunUsageLimits(input_tokens_limit=50_000),
         )
         agent = ReactAgent(config=config)
         assert agent is not None

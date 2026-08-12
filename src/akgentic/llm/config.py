@@ -15,16 +15,21 @@ Examples:
 
     Configuration with usage limits:
 
-    >>> from akgentic.llm import ModelConfig, UsageLimits, ReactAgentConfig
+    >>> from akgentic.llm import ModelConfig, RunUsageLimits, ReactAgentConfig
     >>> config = ReactAgentConfig(
     ...     model=ModelConfig(provider="openai", model="gpt-4o"),
-    ...     usage_limits=UsageLimits(request_limit=10, total_tokens_limit=5000)
+    ...     run_usage_limits=RunUsageLimits(run_request_limit=10, total_tokens_limit=5000)
     ... )
 """
 
-from typing import Literal
+import warnings
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
+
+# Release that deletes the pre-split usage-limits shim. Named in every deprecation
+# warning and docstring below so removing it is a scheduled task, not a hunt.
+_SHIM_REMOVAL_RELEASE = "akgentic-llm 2.0.0"
 
 
 class ModelConfig(BaseModel):
@@ -253,51 +258,17 @@ class CompactionConfig(BaseModel):
     )
 
 
-class UsageLimits(BaseModel):
-    """Usage limits for cost control and resource management.
+class TokenUsageLimits(BaseModel):
+    """Token budgets shared by both usage-limit tiers.
 
-    All limits are optional (None = unlimited) except for request_limit = 50 by default.
-    Limits are enforced cumulatively during agent execution. When exceeded,
-    raises UsageLimitError with details.
-
-    Token tracking is cumulative across all requests in a single agent run:
-    - input_tokens: Sum of all prompt/input tokens
-    - output_tokens: Sum of all completion/output tokens
-    - total_tokens: input_tokens + output_tokens
+    Internal base — callers construct RunUsageLimits or AgentUsageLimits, never this.
+    All limits are optional (None = unlimited) and cumulative over their tier's scope.
 
     Attributes:
-        request_limit: Maximum number of LLM API requests per agent run
-        tool_calls_limit: Maximum number of tool invocations per agent run
-        input_tokens_limit: Maximum cumulative input/prompt tokens across all requests
-        output_tokens_limit: Maximum cumulative output/completion tokens across all requests
-        total_tokens_limit: Maximum cumulative total tokens (input + output) across all requests
-
-    Example:
-        >>> # Basic limits: 10 requests, 5K total tokens
-        >>> limits = UsageLimits(
-        ...     request_limit=10,
-        ...     total_tokens_limit=5000
-        ... )
-        >>>
-        >>> # Strict limits for cost control
-        >>> limits = UsageLimits(
-        ...     request_limit=50,          # default: 50
-        ...     tool_calls_limit=20,       # default: None
-        ...     input_tokens_limit=10000,  # default: None
-        ...     output_tokens_limit=2000.  # default: None
-        ... )
-        >>>
-        >>> # Unlimited (default) except for request_limit (50 default)
-        >>> limits = UsageLimits(request_limit=None, total_tokens_limit=None)
+        input_tokens_limit: Maximum cumulative input/prompt tokens
+        output_tokens_limit: Maximum cumulative output/completion tokens
+        total_tokens_limit: Maximum cumulative total tokens (input + output)
     """
-
-    request_limit: int | None = Field(
-        default=50, gt=0, description="Maximum number of LLM requests per run"
-    )
-
-    tool_calls_limit: int | None = Field(
-        default=None, gt=0, description="Maximum number of tool calls per run"
-    )
 
     input_tokens_limit: int | None = Field(
         default=None, gt=0, description="Maximum input/prompt tokens"
@@ -310,6 +281,141 @@ class UsageLimits(BaseModel):
     total_tokens_limit: int | None = Field(
         default=None, gt=0, description="Maximum total tokens (input + output)"
     )
+
+
+class RunUsageLimits(TokenUsageLimits):
+    """Per-run usage budget: bounds a single ReactAgent.run() call.
+
+    Enforced by pydantic-ai, which raises UsageLimitExceeded mid-run when a limit is hit;
+    ReactAgent surfaces that as UsageLimitError. Token counts reset every run.
+
+    Attributes:
+        run_request_limit: Maximum LLM API requests in one run (50 = the default brake)
+        tool_calls_limit: Maximum tool invocations in one run
+
+    Example:
+        >>> # Basic limits: 10 requests, 5K total tokens
+        >>> limits = RunUsageLimits(run_request_limit=10, total_tokens_limit=5000)
+        >>>
+        >>> # Strict limits for cost control
+        >>> limits = RunUsageLimits(
+        ...     run_request_limit=50,      # default: 50
+        ...     tool_calls_limit=20,       # default: None
+        ...     input_tokens_limit=10000,  # default: None
+        ...     output_tokens_limit=2000,  # default: None
+        ... )
+        >>>
+        >>> # Unlimited, safety brake included
+        >>> limits = RunUsageLimits(run_request_limit=None, total_tokens_limit=None)
+    """
+
+    run_request_limit: int | None = Field(
+        default=50, gt=0, description="Maximum number of LLM requests per run"
+    )
+
+    tool_calls_limit: int | None = Field(
+        default=None, gt=0, description="Maximum number of tool calls per run"
+    )
+
+
+class AgentUsageLimits(TokenUsageLimits):
+    """Agent-lifetime usage budget: bounds an agent across every run it performs.
+
+    Both this tier's limits are enforced by pre-flight checks in ReactAgent.run(),
+    against counters ReactAgent accumulates over its whole lifetime (and reseeds from
+    replayed usage events on restore). Breaching either raises UsageLimitError, the
+    same class the run tier raises, with pydantic-ai's own message text.
+
+    agent_request_limit is consumed BEFORE the call executes, so a run that fails
+    partway still counts.
+
+    TRAP: the inherited token limits bound where a run may START, not where it may
+    end — a run's cost is unknown until it completes, so the run that crosses the
+    line finishes and only the next one is refused.
+
+    Attributes:
+        agent_request_limit: Maximum ReactAgent.run() calls over the agent's lifetime
+
+    Example:
+        >>> limits = AgentUsageLimits(agent_request_limit=100, total_tokens_limit=1_000_000)
+    """
+
+    agent_request_limit: int | None = Field(
+        default=None, gt=0, description="Maximum number of runs over the agent's lifetime"
+    )
+
+
+def _fold_pre_split_request_limit(data: dict[str, Any], owner: str) -> dict[str, Any]:
+    """Fold a pre-split ``request_limit`` key onto ``run_request_limit``.
+
+    Shared by the UsageLimits shim and the ReactAgentConfig keyword shim, which has to
+    reach inside a mapping value: a dict routed to ``run_usage_limits`` is validated as
+    RunUsageLimits, where ``request_limit`` is an unknown key that Pydantic drops in
+    silence — accepted-and-discarded, the one failure mode the shim exists to prevent.
+
+    Raises:
+        ValueError: if both spellings are present; which wins would depend on order.
+    """
+    if "request_limit" not in data:
+        return data
+    if "run_request_limit" in data:
+        raise ValueError(
+            f"{owner} received both request_limit (deprecated) and run_request_limit; "
+            "which one wins would depend on argument order — pass only run_request_limit"
+        )
+    mapped = dict(data)
+    mapped["run_request_limit"] = mapped.pop("request_limit")
+    return mapped
+
+
+class UsageLimits(RunUsageLimits):
+    """DEPRECATED alias of RunUsageLimits, the run tier.
+
+    Accepts the pre-split ``request_limit=`` spelling and maps it onto
+    ``run_request_limit``; ``.request_limit`` reads back through to the same field.
+    Removed in akgentic-llm 2.0.0 — migrate to ``RunUsageLimits(run_request_limit=...)``.
+
+    ``request_limit`` is a read accessor, never a field: a second storage slot would
+    reintroduce the split-brain state the rename exists to remove.
+    """
+
+    @model_validator(mode="before")
+    @classmethod
+    def _map_pre_split_request_limit(cls, data: Any) -> Any:
+        """Warn on construction and fold ``request_limit`` into ``run_request_limit``.
+
+        Runs before field validation, so ``request_limit`` never reaches Pydantic as an
+        unexpected keyword. Non-dict input (model_validate of an instance) passes through.
+
+        The both-spellings ValueError is raised BEFORE the warning: under
+        ``-W error::DeprecationWarning`` a warning emitted first would propagate in place
+        of the error, hiding what the caller actually got wrong.
+        """
+        if not isinstance(data, dict):
+            return data
+        folded = _fold_pre_split_request_limit(data, "UsageLimits")
+        warnings.warn(
+            f"UsageLimits is deprecated and will be removed in {_SHIM_REMOVAL_RELEASE}; "
+            "use RunUsageLimits(run_request_limit=...) instead",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+        return folded
+
+    @property
+    def request_limit(self) -> int | None:
+        """DEPRECATED read accessor for ``run_request_limit``.
+
+        Removed in akgentic-llm 2.0.0. Reflects the underlying field regardless of
+        which spelling set it.
+        """
+        warnings.warn(
+            f"UsageLimits.request_limit is deprecated and will be removed in "
+            f"{_SHIM_REMOVAL_RELEASE}; read run_request_limit instead",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.run_request_limit
 
 
 class HttpClientConfig(BaseModel):
@@ -441,9 +547,16 @@ class ReactAgentConfig(BaseModel):
     Attributes:
         model_cfg: LLM provider and model settings.
         runtime_cfg: Execution behavior and HTTP retry strategy.
-        usage_limits: Resource limits for cost control.
+        run_usage_limits: Per-run resource limits; the tier pydantic-ai enforces.
+        agent_usage_limits: Agent-lifetime resource limits — runs and tokens, both
+            enforced pre-flight in ReactAgent.run().
         compaction_cfg: Context-compaction configuration.
         max_messages: Sliding-window size handed to ContextManager; None = unlimited.
+
+    Deprecated:
+        ``usage_limits`` survives as a constructor keyword and a read accessor for
+        ``run_usage_limits``. Both warn, and both are removed in akgentic-llm 2.0.0.
+        Passing ``usage_limits`` and ``run_usage_limits`` together raises ValueError.
 
     Example:
         >>> # Minimal configuration with defaults
@@ -458,8 +571,8 @@ class ReactAgentConfig(BaseModel):
         ...         model="claude-3-5-sonnet-20241022",
         ...         temperature=0.7
         ...     ),
-        ...     usage_limits=UsageLimits(
-        ...         request_limit=10,
+        ...     run_usage_limits=RunUsageLimits(
+        ...         run_request_limit=10,
         ...         total_tokens_limit=50000
         ...     ),
         ...     runtime_cfg=RuntimeConfig(
@@ -475,8 +588,13 @@ class ReactAgentConfig(BaseModel):
         default_factory=RuntimeConfig, description="Runtime behavior configuration"
     )
 
-    usage_limits: UsageLimits = Field(
-        default_factory=UsageLimits, description="Usage limits for cost control"
+    run_usage_limits: RunUsageLimits = Field(
+        default_factory=RunUsageLimits, description="Per-run usage limits for cost control"
+    )
+
+    agent_usage_limits: AgentUsageLimits = Field(
+        default_factory=AgentUsageLimits,
+        description="Agent-lifetime usage limits, enforced pre-flight on every run",
     )
 
     compaction_cfg: CompactionConfig = Field(
@@ -488,6 +606,54 @@ class ReactAgentConfig(BaseModel):
         ge=0,
         description="Sliding-window size handed to ContextManager; None = unlimited",
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _map_pre_split_usage_limits(cls, data: Any) -> Any:
+        """Warn on the deprecated ``usage_limits=`` keyword and route it to the run tier.
+
+        Runs before field validation, so ``usage_limits`` never reaches Pydantic as an
+        unexpected keyword. The value must actually land on ``run_usage_limits``:
+        accepting it and discarding it would leave the agent on a budget nobody chose.
+
+        A mapping value gets the same treatment one level down, because it is validated
+        as RunUsageLimits — where a pre-split ``request_limit`` key would be dropped in
+        silence, which is the same failure with an extra layer of indirection.
+        """
+        if not isinstance(data, dict) or "usage_limits" not in data:
+            return data
+        if "run_usage_limits" in data:
+            raise ValueError(
+                "ReactAgentConfig received both usage_limits (deprecated) and "
+                "run_usage_limits; which one wins would depend on argument order — "
+                "pass only run_usage_limits"
+            )
+        mapped = dict(data)
+        value = mapped.pop("usage_limits")
+        if isinstance(value, dict):
+            value = _fold_pre_split_request_limit(value, "ReactAgentConfig(usage_limits=...)")
+        warnings.warn(
+            f"ReactAgentConfig(usage_limits=...) is deprecated and will be removed in "
+            f"{_SHIM_REMOVAL_RELEASE}; use run_usage_limits=... instead",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+        mapped["run_usage_limits"] = value
+        return mapped
+
+    @property
+    def usage_limits(self) -> RunUsageLimits:
+        """DEPRECATED read accessor for ``run_usage_limits``.
+
+        Removed in akgentic-llm 2.0.0. Returns the run tier itself, not a copy.
+        """
+        warnings.warn(
+            f"ReactAgentConfig.usage_limits is deprecated and will be removed in "
+            f"{_SHIM_REMOVAL_RELEASE}; read run_usage_limits instead",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.run_usage_limits
 
     @model_validator(mode="after")
     def _reject_window_with_auto_compaction(self) -> "ReactAgentConfig":
@@ -504,22 +670,26 @@ class ReactAgentConfig(BaseModel):
         return self
 
     @model_validator(mode="after")
-    def _reject_threshold_above_usage_limits(self) -> "ReactAgentConfig":
+    def _reject_threshold_above_run_usage_limits(self) -> "ReactAgentConfig":
         """Threshold-vs-usage-limit: keep the auto-trigger reachable before usage limits bite.
 
         When auto-compaction is live, the effective threshold must sit strictly below every
         set token limit; otherwise pydantic-ai raises UsageLimitExceeded first and the
-        auto-trigger is dead code.
+        auto-trigger is dead code. Reads the RUN tier only, by choice: the agent tier's
+        token limits are enforced too, and one set below the threshold does leave the
+        auto-trigger unreachable — the agent refuses the run before compaction can fire.
+        Rejecting that here would change which configs are constructible, so it stays a
+        documented consequence rather than a validation error.
         """
         context_length = self.model_cfg.context_length
         if not (self.compaction_cfg.auto_trigger and context_length is not None):
             return self
         threshold = int(context_length * self.compaction_cfg.trigger_ratio)
         for name in ("input_tokens_limit", "total_tokens_limit"):
-            limit = getattr(self.usage_limits, name)
+            limit = getattr(self.run_usage_limits, name)
             if limit is not None and threshold >= limit:
                 raise ValueError(
                     f"compaction threshold {threshold} must be strictly below "
-                    f"usage_limits.{name} ({limit})"
+                    f"run_usage_limits.{name} ({limit})"
                 )
         return self

@@ -7,6 +7,33 @@ if TYPE_CHECKING:
     from pydantic_ai.messages import ModelMessage
 
 
+class EventMessage(Protocol):
+    """Structural type for the envelope that carries a persisted event payload.
+
+    Not a base class and not an event: it describes the *wrapper* the event
+    store yields, whose ``.event`` holds the payload. Declared here rather than
+    imported because ``akgentic-llm`` must not depend on ``akgentic-core``,
+    which owns the concrete envelope (module boundary rule).
+
+    ``event`` is typed ``object``, not a union of this module's events, and that
+    width is deliberate. ``restore_context`` is handed a team's **entire** event
+    stream, so the payload is routinely one this package has never heard of —
+    emitted by core, team or tool. Narrowing it to the LLM events would describe
+    a stream that does not exist and would make every non-LLM payload a type
+    error at the call site. Consumers narrow with ``isinstance`` instead.
+
+    The *element* type is not similarly defensive: every element really is an
+    envelope. ``akgentic.core``'s ``Akgent.init_llm_context`` already declares
+    ``list[EventMessage]``, and the sole production caller
+    (``akgentic-team``'s restorer) filters to ``EventMessage`` instances before
+    handing the list over. Replay therefore reads ``.event`` directly — the
+    ``hasattr`` guards it used to carry were an artefact of the older
+    ``list[Any]`` signature, not a contract any caller relies on.
+    """
+
+    event: object
+
+
 @dataclass(frozen=True)
 class LlmMessageEvent:
     """Event emitted when a new model message is added to context."""

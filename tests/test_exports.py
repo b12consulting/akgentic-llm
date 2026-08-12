@@ -31,6 +31,8 @@ def test_key_exports_present():
     # Configuration
     assert hasattr(akgentic.llm, "ModelConfig")
     assert hasattr(akgentic.llm, "UsageLimits")
+    assert hasattr(akgentic.llm, "RunUsageLimits")
+    assert hasattr(akgentic.llm, "AgentUsageLimits")
     assert hasattr(akgentic.llm, "RuntimeConfig")
     assert hasattr(akgentic.llm, "ReactAgentConfig")
 

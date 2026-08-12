@@ -15,7 +15,7 @@ call any LLM without coupling to a specific vendor or framework primitive.
 - [Quick Start](#quick-start)
 - [Configuration](#configuration)
   - [ModelConfig](#modelconfig)
-  - [UsageLimits](#usagelimits)
+  - [Usage limits](#usage-limits)
   - [RuntimeConfig](#runtimeconfig)
   - [ReactAgentConfig](#reactagentconfig)
 - [Providers](#providers)
@@ -121,7 +121,7 @@ With tools and a per-call output type:
 
 ```python
 from pydantic import BaseModel
-from akgentic.llm import ReactAgent, ReactAgentConfig, ModelConfig, UsageLimits
+from akgentic.llm import ReactAgent, ReactAgentConfig, ModelConfig, RunUsageLimits
 
 class Summary(BaseModel):
     title: str
@@ -134,7 +134,7 @@ def fetch_data(topic: str) -> str:
 agent = ReactAgent(
     config=ReactAgentConfig(
         model_cfg=ModelConfig(provider="anthropic", model="claude-3-5-sonnet-20241022"),
-        usage_limits=UsageLimits(request_limit=10, total_tokens_limit=20_000),
+        run_usage_limits=RunUsageLimits(run_request_limit=10, total_tokens_limit=20_000),
     ),
     tools=[fetch_data],
 )
@@ -170,25 +170,118 @@ ModelConfig(provider="anthropic", model="claude-3-5-sonnet-20241022",
 ModelConfig(provider="openai", model="o1", reasoning_effort="high")
 ```
 
-### UsageLimits
+### Usage limits
 
-Limits are cumulative across all requests in a single `run()` call. Breaching any limit
-raises `UsageLimitError`.
+Budgets come in two tiers, carried by two separate `ReactAgentConfig` fields, so a limit
+meaning "per `run()` call" can never be mistaken for one meaning "over this agent's
+lifetime". Both share a token-only base (`TokenUsageLimits`, internal).
+
+#### RunUsageLimits — `ReactAgentConfig.run_usage_limits`
+
+Cumulative across all requests in a **single `run()` call**, and reset on the next one.
+Enforced by pydantic-ai; breaching any limit raises `UsageLimitError`.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `request_limit` | `int \| None` | `50` | Max LLM API requests — acts as a safety brake |
-| `tool_calls_limit` | `int \| None` | `None` | Max tool invocations |
+| `run_request_limit` | `int \| None` | `50` | Max LLM API requests per run — acts as a safety brake |
+| `tool_calls_limit` | `int \| None` | `None` | Max tool invocations per run |
 | `input_tokens_limit` | `int \| None` | `None` | Max cumulative input tokens |
 | `output_tokens_limit` | `int \| None` | `None` | Max cumulative output tokens |
 | `total_tokens_limit` | `int \| None` | `None` | Max cumulative total tokens |
 
 ```python
-from akgentic.llm import UsageLimits
+from akgentic.llm import RunUsageLimits
 
-UsageLimits(request_limit=10, total_tokens_limit=5_000)   # tight budget
-UsageLimits(request_limit=None)                            # unlimited (no safety brake)
+RunUsageLimits(run_request_limit=10, total_tokens_limit=5_000)  # tight budget
+RunUsageLimits(run_request_limit=None)                          # no safety brake
 ```
+
+#### AgentUsageLimits — `ReactAgentConfig.agent_usage_limits`
+
+Spans **every run the agent performs**, not one call.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `agent_request_limit` | `int \| None` | `None` | Max `run()` calls over the agent's lifetime |
+| `input_tokens_limit` | `int \| None` | `None` | Max input tokens over the agent's lifetime |
+| `output_tokens_limit` | `int \| None` | `None` | Max output tokens over the agent's lifetime |
+| `total_tokens_limit` | `int \| None` | `None` | Max total tokens over the agent's lifetime |
+
+Both halves are checked **before** each `run()` executes — tokens first, so a token
+refusal costs no run budget — against counters the agent accumulates over its lifetime and
+recomputes from persisted usage events on restore.
+
+`agent_request_limit`: once the agent has used its budget, every further call raises
+`UsageLimitError` — the same class a run-tier breach raises — with a message of the form
+`Exceeded the agent_request_limit of 100 (run_count=100)`.
+
+Four consequences worth knowing before you set it:
+
+- **A run that fails still counts.** The budget is consumed before the call executes, not
+  after it returns — including when the call ends in a *run-tier* `UsageLimitError`. An
+  agent stuck in a failing loop therefore still runs out of lifetime budget, which is the
+  point: both limits mean "this agent is burning too many turns".
+- **It counts runs *consumed*, never runs attempted.** A rejected call consumes nothing,
+  so repeated rejections leave the count — and the error message — unchanged.
+- **The counter is in memory, not persisted** — but resuming does not reset it.
+  Nothing is written to a state snapshot; instead `restore_context()` recomputes the count
+  from the agent's persisted usage events, grouped by run. Only a genuinely new agent
+  starts with a full budget.
+- **A run that never reached the model is invisible after a resume.** It emitted no usage
+  event, so replay cannot see it. It counted while the agent was live; after a restore the
+  count reflects the runs that actually reached the model. Deliberate — a run that produced
+  nothing consumed nothing.
+
+The three token limits bound the agent's **lifetime** spend, summed across every run.
+Breaching one raises `UsageLimitError` with pydantic-ai's own message text — e.g.
+`Exceeded the total_tokens_limit of 1000000 (total_tokens=1000420)` — the same shape a
+run-tier breach produces, so nothing downstream has to parse text to tell the tiers apart.
+
+Two consequences here too:
+
+- **A run may overshoot the budget.** A run's token cost is unknown until it finishes, so
+  the limit governs where a run may *start*, not where it may end. The run that crosses the
+  line completes and returns normally; the next one is refused. Set the limit below the
+  spend you actually want to cap if the last run could be expensive.
+- **Resuming does not reset it**, for the same reason the run counter survives:
+  `restore_context()` sums the agent's persisted usage events. Unlike the counter, tokens
+  sum over *events* — a run with three model round-trips counts once but spends three times.
+
+```python
+from akgentic.llm import AgentUsageLimits
+
+AgentUsageLimits(agent_request_limit=100, total_tokens_limit=1_000_000)
+```
+
+Note that only `run_usage_limits` participates in the compaction-threshold check
+(see [Context compaction](#context-compaction)). The check is deliberately not widened to
+the agent tier, so an `agent_usage_limits` token limit below the compaction threshold still
+constructs — but it does make the auto-trigger unreachable at runtime, because the agent
+refuses the run before compaction can fire.
+
+#### Migrating from the pre-split surface
+
+> **Deprecated in 1.7.0, removed in 2.0.0.** The pre-split `UsageLimits` class and the
+> `ReactAgentConfig(usage_limits=...)` keyword still work and still carry your values
+> through to `run_usage_limits`, but every use emits a `DeprecationWarning`.
+
+| Before | After |
+|--------|-------|
+| `UsageLimits(request_limit=10)` | `RunUsageLimits(run_request_limit=10)` |
+| `limits.request_limit` | `limits.run_request_limit` |
+| `ReactAgentConfig(usage_limits=...)` | `ReactAgentConfig(run_usage_limits=...)` |
+| `config.usage_limits` | `config.run_usage_limits` |
+
+Three things the shim deliberately does **not** do:
+
+- **Passing both names raises `ValueError`.** `ReactAgentConfig(usage_limits=a, run_usage_limits=b)`
+  is rejected rather than resolved, because which one won would otherwise depend on the
+  order you wrote them in. The same applies to `UsageLimits(request_limit=..., run_request_limit=...)`.
+- **Serialization keys are not preserved.** `model_dump()` emits `run_usage_limits` and
+  `run_request_limit`. Code that round-trips config through JSON and keys off the old
+  names must be updated now; only the constructor keyword and the attribute read are shimmed.
+- **Assignment is not shimmed.** `config.usage_limits = ...` raises — the deprecated names
+  are read-only views over the real fields. Assign to `run_usage_limits` instead.
 
 ### RuntimeConfig
 
@@ -214,7 +307,10 @@ UsageLimits(request_limit=None)                            # unlimited (no safet
 Composes all three layers:
 
 ```python
-from akgentic.llm import ReactAgentConfig, ModelConfig, UsageLimits, RuntimeConfig, HttpClientConfig
+from akgentic.llm import (
+    ReactAgentConfig, ModelConfig, RunUsageLimits, AgentUsageLimits,
+    RuntimeConfig, HttpClientConfig,
+)
 
 config = ReactAgentConfig(
     model_cfg=ModelConfig(
@@ -222,9 +318,12 @@ config = ReactAgentConfig(
         model="claude-3-5-sonnet-20241022",
         temperature=0.7,
     ),
-    usage_limits=UsageLimits(
-        request_limit=10,
+    run_usage_limits=RunUsageLimits(
+        run_request_limit=10,
         total_tokens_limit=50_000,
+    ),
+    agent_usage_limits=AgentUsageLimits(
+        agent_request_limit=100,  # max run() calls over this agent's lifetime
     ),
     runtime_cfg=RuntimeConfig(
         end_strategy="exhaustive",
@@ -829,8 +928,9 @@ blocked from merging until all steps are green.
 src/akgentic/llm/
     __init__.py     # Public API exports
     agent.py        # ReactAgent, UsageLimitError, UserPrompt type alias
-    config.py       # ModelConfig, CompactionConfig, UsageLimits, HttpClientConfig,
-                    #   RuntimeConfig, ReactAgentConfig, _supports_native_output()
+    config.py       # ModelConfig, CompactionConfig, TokenUsageLimits, RunUsageLimits,
+                    #   AgentUsageLimits, HttpClientConfig, RuntimeConfig,
+                    #   ReactAgentConfig, _supports_native_output()
     context.py      # ContextManager, ContextSnapshot
     event.py        # LlmMessageEvent, LlmUsageEvent, LlmCheckpoint*Event,
                     #   LlmSystemPromptEvent, SystemPromptPartSnapshot,
