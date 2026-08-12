@@ -620,9 +620,10 @@ class ReactAgent:
         if not isinstance(last, ModelResponse) or not last.tool_calls:
             return
 
-        # Annotated with the union ModelRequest.parts itself declares, not the
-        # concrete ToolReturnPart: list is invariant, so only the exact element
-        # type is assignable.
+        # The union ModelRequest.parts declares, rather than the concrete
+        # ToolReturnPart built here, so the list stays open to other part kinds.
+        # Either annotation type-checks — parts is a covariant Sequence, not a
+        # list — so this is a choice, not a constraint imposed by variance.
         error_parts: list[ModelRequestPart] = [
             ToolReturnPart(
                 tool_name=call.tool_name,

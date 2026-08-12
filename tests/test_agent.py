@@ -501,6 +501,9 @@ class TestReactAgentToolDecorator:
         2. The premise that annotation rests on still holds — pydantic-ai hands
            back the original function object rather than a wrapper. If a future
            version starts wrapping, ``-> F`` becomes a lie and this goes red.
+           Asserted for both wrappers: they reach pydantic-ai through different
+           code paths (``tool()`` versus the ``system_prompt(dynamic=True)``
+           closure), so one holding says nothing about the other.
         """
         for method in (ReactAgent.tool, ReactAgent.system_prompt):
             hints = get_type_hints(method)
@@ -525,7 +528,11 @@ class TestReactAgentToolDecorator:
             """
             return [f"Result: {query}"]
 
+        def dynamic_prompt(ctx: RunContext[MyDeps]) -> str:
+            return "Dynamic system prompt"
+
         assert agent.tool(search_tool) is search_tool
+        assert agent.system_prompt(dynamic_prompt) is dynamic_prompt
 
 
 class TestReactAgentUsageLimits:
