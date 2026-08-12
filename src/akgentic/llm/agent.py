@@ -19,7 +19,9 @@ from .event import (
     LlmContextCompactedEvent,
     LlmMessageEvent,
     LlmSystemPromptEvent,
+    LlmUsageEvent,
 )
+from .pricing import aggregate_usage
 from .providers import create_http_client, create_model, get_output_type
 
 logger = logging.getLogger(__name__)
@@ -132,8 +134,8 @@ class ReactAgent:
         self._result_type = result_type
 
         # Agent-lifetime run counter backing agent_usage_limits.agent_request_limit.
-        # In memory only: never a Pydantic field, never persisted. TRAP: restore does
-        # not recompute it yet, so a restored agent resumes with a full budget.
+        # In memory only: never a Pydantic field, never persisted. Not lost on resume —
+        # restore_context() recomputes it from the replayed LlmUsageEvents.
         self._run_count: int = 0
 
         # Create context manager (no max_messages by default)
@@ -602,6 +604,10 @@ class ReactAgent:
         compose (the later fold consumes the earlier synthetic summary) with the
         fold applied exactly once per event (FR16).
 
+        The same list also reseeds the agent-lifetime run counter, so a resumed
+        agent carries the budget it already spent instead of a fresh one
+        (ADR-013 §D3).
+
         Args:
             events: List of event-like objects (typically ``EventMessage``
                 instances from ``akgentic-core``). Each is expected to carry a
@@ -620,6 +626,29 @@ class ReactAgent:
                 messages = []
         self._context.restore(messages)
         self._seed_system_prompt_from_events(events)
+        self._seed_run_count_from_events(events)
+
+    def _seed_run_count_from_events(self, events: list[Any]) -> None:
+        """Recompute the agent-lifetime run budget from replayed usage events.
+
+        Counts **distinct runs**, never events: one ``run()`` emits one
+        ``LlmUsageEvent`` per ``ModelResponse``, so a run with three tool-call
+        round-trips contributes three events under one ``run_id``.
+        ``aggregate_usage`` does that grouping — ``by_run=True`` is what
+        populates ``runs`` at all, and without it this seeds zero every time.
+
+        Assignment, not accumulation, so replaying the same stream twice is
+        idempotent. A ``run()`` that failed before any ``ModelResponse`` left no
+        usage event and is invisible here; that is deliberate (ADR-013 §Out of
+        scope) — it consumed no model resources.
+
+        Args:
+            events: The same event-like list passed to ``restore_context``.
+        """
+        usage = [
+            e.event for e in events if hasattr(e, "event") and isinstance(e.event, LlmUsageEvent)
+        ]
+        self._run_count = len(aggregate_usage(usage, by_run=True).runs)
 
     def _seed_system_prompt_from_events(self, events: list[Any]) -> None:
         """Seed the dedup hash from the latest persisted ``LlmSystemPromptEvent``.

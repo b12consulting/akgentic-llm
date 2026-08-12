@@ -212,7 +212,7 @@ used its budget, every further call raises `UsageLimitError` — the same class 
 breach raises — with a message of the form
 `Exceeded the agent_request_limit of 100 (run_count=100)`.
 
-Three consequences worth knowing before you set it:
+Four consequences worth knowing before you set it:
 
 - **A run that fails still counts.** The budget is consumed before the call executes, not
   after it returns — including when the call ends in a *run-tier* `UsageLimitError`. An
@@ -220,8 +220,14 @@ Three consequences worth knowing before you set it:
   point: both limits mean "this agent is burning too many turns".
 - **It counts runs *consumed*, never runs attempted.** A rejected call consumes nothing,
   so repeated rejections leave the count — and the error message — unchanged.
-- **The counter is in memory, not persisted.** It lives on the agent instance and is
-  never written to a state snapshot, so a fresh instance starts with a full budget.
+- **The counter is in memory, not persisted** — but resuming does not reset it.
+  Nothing is written to a state snapshot; instead `restore_context()` recomputes the count
+  from the agent's persisted usage events, grouped by run. Only a genuinely new agent
+  starts with a full budget.
+- **A run that never reached the model is invisible after a resume.** It emitted no usage
+  event, so replay cannot see it. It counted while the agent was live; after a restore the
+  count reflects the runs that actually reached the model. Deliberate — a run that produced
+  nothing consumed nothing.
 
 The three inherited token fields are never enforced at all — they exist only so both tiers
 have the same shape.

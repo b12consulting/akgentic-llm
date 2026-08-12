@@ -25,6 +25,7 @@ from akgentic.llm.event import (
     LlmContextCompactedEvent,
     LlmMessageEvent,
     LlmSystemPromptEvent,
+    LlmUsageEvent,
     SystemPromptPartSnapshot,
     ToolCallEvent,
 )
@@ -662,6 +663,123 @@ class TestReactAgentRunCountEnforcement:
         dumped = _agent_limit_config(2).model_dump()
         assert "_run_count" not in dumped
         assert "run_count" not in dumped
+
+
+def _usage_event(run_id: str) -> LlmUsageEvent:
+    """One model round-trip's usage record, tagged with the run it belongs to."""
+    return LlmUsageEvent(
+        run_id=run_id,
+        model_name="gpt-4o",
+        provider_name="openai",
+        input_tokens=10,
+        output_tokens=5,
+        cache_read_tokens=0,
+        cache_write_tokens=0,
+        requests=1,
+    )
+
+
+class TestReactAgentRunCountRestore:
+    """restore_context() recomputes the agent-lifetime run budget from replayed events."""
+
+    def test_three_distinct_runs_seed_three(self):
+        """Test one event per run over three runs seeds a count of three."""
+        agent = ReactAgent(config=_agent_limit_config(10))
+        events = [FakeEventMessage(event=_usage_event(rid)) for rid in ("r1", "r2", "r3")]
+        agent.restore_context(events)
+        assert agent._run_count == 3
+
+    def test_one_run_emitting_three_events_seeds_one(self):
+        """Test a run with three tool-call round-trips counts once, not three times.
+
+        The discriminating test. One ``run()`` emits one ``LlmUsageEvent`` per
+        ``ModelResponse``, all sharing one ``run_id``. Two plausible-but-wrong
+        implementations fail here and only here: counting events seeds 3, and
+        aggregating without ``by_run=True`` leaves ``runs`` empty and seeds 0.
+        A fixture with one event per run passes under all three.
+        """
+        agent = ReactAgent(config=_agent_limit_config(10))
+        events = [FakeEventMessage(event=_usage_event("same-run")) for _ in range(3)]
+        agent.restore_context(events)
+        assert agent._run_count == 1
+
+    def test_empty_event_list_leaves_zero(self):
+        """Test restoring nothing leaves the budget untouched."""
+        agent = ReactAgent(config=_agent_limit_config(10))
+        agent.restore_context([])
+        assert agent._run_count == 0
+
+    def test_events_without_usage_leave_zero(self):
+        """Test non-usage events and objects with no .event payload are ignored."""
+        agent = ReactAgent(config=_agent_limit_config(10))
+        msg = ModelRequest(parts=[UserPromptPart(content="hello")])
+        events = [
+            FakeEventMessage(event=LlmMessageEvent(message=msg)),
+            FakeEventMessage(
+                event=ToolCallEvent(
+                    run_id="r1", tool_name="lookup", tool_call_id="c1", arguments="{}"
+                )
+            ),
+            object(),
+        ]
+        agent.restore_context(events)
+        assert agent._run_count == 0
+
+    def test_restored_agent_at_its_limit_raises_on_the_next_run(self):
+        """Test the seeded value is enforced, not merely stored.
+
+        Reading ``_run_count`` back only proves it was written. This drives the
+        seeded value through ``_check_and_consume_agent_budget`` and asserts the
+        message shape 15-2 pinned.
+        """
+        agent = ReactAgent(config=_agent_limit_config(2))
+        agent.restore_context([FakeEventMessage(event=_usage_event(rid)) for rid in ("r1", "r2")])
+        with patch.object(agent._pydantic_agent, "iter", side_effect=_StubRun):
+            with pytest.raises(UsageLimitError) as exc_info:
+                agent.run_sync("one turn too many")
+        assert str(exc_info.value) == "Exceeded the agent_request_limit of 2 (run_count=2)"
+
+    def test_restored_agent_below_its_limit_spends_only_the_remainder(self):
+        """Test the seeded count is the budget's starting point, not a blanket block.
+
+        Complements the at-limit test: without this, an implementation that seeded
+        the limit itself (or any value >= it) would look correct.
+        """
+        agent = ReactAgent(config=_agent_limit_config(2))
+        agent.restore_context([FakeEventMessage(event=_usage_event("r1"))])
+        with patch.object(agent._pydantic_agent, "iter", side_effect=_StubRun):
+            agent.run_sync("the one run left")
+            with pytest.raises(UsageLimitError):
+                agent.run_sync("one turn too many")
+        assert agent._run_count == 2
+
+    def test_restore_is_idempotent(self):
+        """Test seeding assigns rather than accumulates: restoring twice is stable."""
+        agent = ReactAgent(config=_agent_limit_config(10))
+        events = [FakeEventMessage(event=_usage_event(rid)) for rid in ("r1", "r2")]
+        agent.restore_context(events)
+        agent.restore_context(events)
+        assert agent._run_count == 2
+
+    def test_never_restored_agent_starts_at_zero(self, minimal_config):
+        """Test seeding runs on restore only — construction still yields zero."""
+        assert ReactAgent(config=minimal_config)._run_count == 0
+
+    def test_seeding_leaves_the_message_fold_intact(self):
+        """Test a mixed stream still restores exactly its LlmMessageEvent messages."""
+        agent = ReactAgent(config=_agent_limit_config(10))
+        msg1 = ModelRequest(parts=[UserPromptPart(content="first")])
+        msg2 = ModelRequest(parts=[UserPromptPart(content="second")])
+        agent.restore_context(
+            [
+                FakeEventMessage(event=LlmMessageEvent(message=msg1)),
+                FakeEventMessage(event=_usage_event("r1")),
+                FakeEventMessage(event=LlmMessageEvent(message=msg2)),
+                FakeEventMessage(event=_usage_event("r2")),
+            ]
+        )
+        assert agent.context.messages == [msg1, msg2]
+        assert agent._run_count == 2
 
 
 class TestReactAgentMultimodalPrompt:
