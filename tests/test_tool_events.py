@@ -13,6 +13,7 @@ import importlib.util
 import uuid
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 from pydantic_ai.messages import (
     ModelRequest,
@@ -100,9 +101,7 @@ def _retry_with_id_msg(
     run_id: uuid.UUID = RUN_ID,
 ) -> ModelRequest:
     return ModelRequest(
-        parts=[
-            RetryPromptPart(tool_name=tool_name, tool_call_id=tool_call_id, content=content)
-        ],
+        parts=[RetryPromptPart(tool_name=tool_name, tool_call_id=tool_call_id, content=content)],
         run_id=run_id,
     )
 
@@ -530,3 +529,30 @@ class TestNonToolModelRequest:
 
         assert len(capture.events) == 1
         assert isinstance(capture.events[0], LlmMessageEvent)
+
+
+# ---------------------------------------------------------------------------
+# Story 16-2 AC7: unrecognized part_kind raises instead of silently no-op'ing
+# ---------------------------------------------------------------------------
+
+
+class TestUnrecognizedPartKindRaises:
+    """AC7: a part_kind outside PartKind raises, proving the improved failure mode.
+
+    Real pydantic-ai parts cannot carry an invalid part_kind (it's a fixed Literal
+    field — construction itself would raise pydantic.ValidationError), so this uses
+    a duck-typed stand-in that only defines the attributes `_emit_tool_events`
+    actually reads before reaching the raise.
+    """
+
+    def test_unknown_part_kind_raises_value_error(self) -> None:
+        """A duck-typed part with an out-of-PartKind part_kind raises ValueError."""
+        manager, capture = _make_manager_with_capture()
+        fake_part = SimpleNamespace(part_kind="not-a-real-kind", tool_name=None)
+        fake_message = SimpleNamespace(run_id=RUN_ID, parts=[fake_part])
+
+        with __import__("pytest").raises(ValueError, match="not-a-real-kind"):
+            manager._emit_tool_events(fake_message)  # type: ignore[arg-type]
+
+        # No event should have been emitted before the raise.
+        assert capture.events == []

@@ -1,6 +1,7 @@
 """Context management for LLM conversation history."""
 
 import hashlib
+from typing import Literal
 
 from pydantic_ai.messages import (
     ModelMessage,
@@ -20,6 +21,48 @@ from akgentic.llm.event import (
     SystemPromptPartSnapshot,
     ToolCallEvent,
     ToolReturnEvent,
+)
+
+# Every `part.part_kind` value reachable via `message.parts` on pydantic-ai==1.107.0,
+# verified directly against `pydantic_ai/messages.py` (ADR-014 Phase 1, FR2). A rename
+# or removal here must fail loudly via `_emit_tool_events`'s raise, not silently no-op.
+type PartKind = Literal[
+    "system-prompt",
+    "user-prompt",
+    "tool-return",
+    "retry-prompt",
+    "text",
+    "tool-call",
+    "builtin-tool-call",
+    "builtin-tool-return",
+    "thinking",
+    "compaction",
+    "file",
+]
+
+# The only two values `ModelRequest.kind` / `ModelResponse.kind` can hold in 1.107.0.
+type MessageKind = Literal["request", "response"]
+
+# Single source of truth for the "system-prompt" part_kind literal, shared by
+# `_emit_tool_events`'s no-op branch and `_snapshot_system_parts`'s filter. Narrowly
+# typed (not the broad `PartKind`) so mypy still narrows the discriminated union at
+# the `_snapshot_system_parts` equality check below.
+_SYSTEM_PROMPT_PART_KIND: Literal["system-prompt"] = "system-prompt"
+
+# PartKind members that are legitimate but not tool-call/tool-return/retry-prompt
+# events — an explicit no-op in `_emit_tool_events`, never a silent fallthrough.
+_NON_TOOL_PART_KINDS: frozenset[PartKind] = frozenset(
+    {
+        _SYSTEM_PROMPT_PART_KIND,
+        "user-prompt",
+        "text",
+        "thinking",
+        "compaction",
+        "file",
+        "builtin-tool-call",
+        "builtin-tool-return",
+        "retry-prompt",
+    }
 )
 
 
@@ -177,9 +220,7 @@ class ContextManager:
                             tool_name=part.tool_name,
                             tool_call_id=part.tool_call_id,
                             arguments=(
-                                part.args
-                                if isinstance(part.args, str)
-                                else part.args_as_json_str()
+                                part.args if isinstance(part.args, str) else part.args_as_json_str()
                             ),
                         )
                     )
@@ -201,11 +242,20 @@ class ContextManager:
                             success=False,
                         )
                     )
+                case k if k in _NON_TOOL_PART_KINDS:
+                    pass
+                case _:
+                    raise ValueError(
+                        f"Unrecognized part_kind {part.part_kind!r}; not a member of PartKind"
+                    )
 
     def _emit_usage_event(self, message: ModelMessage) -> None:
         """Emit LlmUsageEvent for ModelResponse messages with usage data."""
-        if getattr(message, "kind", None) != "response":
+        kind = getattr(message, "kind", None)
+        if kind == "request":
             return
+        if kind != "response":
+            raise ValueError(f"Unrecognized message kind {kind!r}; not a member of MessageKind")
         usage = getattr(message, "usage", None)
         if usage is None:
             return
@@ -271,15 +321,13 @@ class ContextManager:
             in part order. Empty if there is no first ``ModelRequest`` or it has
             no system parts.
         """
-        first_request = next(
-            (m for m in self._messages if isinstance(m, ModelRequest)), None
-        )
+        first_request = next((m for m in self._messages if isinstance(m, ModelRequest)), None)
         if first_request is None:
             return []
         return [
             SystemPromptPartSnapshot(dynamic_ref=part.dynamic_ref, content=part.content)
             for part in first_request.parts
-            if part.part_kind == "system-prompt"
+            if part.part_kind == _SYSTEM_PROMPT_PART_KIND
         ]
 
     @staticmethod

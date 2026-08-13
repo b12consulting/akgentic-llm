@@ -4,6 +4,7 @@
 import importlib.util
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from pydantic_ai.messages import (
@@ -43,9 +44,7 @@ class EventRecorder:
 
 def create_tool_call(tool_name: str, call_id: str) -> ModelResponse:
     """Create an assistant tool-call response for testing."""
-    return ModelResponse(
-        parts=[ToolCallPart(tool_name=tool_name, tool_call_id=call_id, args="{}")]
-    )
+    return ModelResponse(parts=[ToolCallPart(tool_name=tool_name, tool_call_id=call_id, args="{}")])
 
 
 def create_tool_return(tool_name: str, call_id: str) -> ModelRequest:
@@ -479,6 +478,18 @@ class TestLastInputTokens:
         manager.add_message(self._response_with_input_tokens(100))
         manager.add_message(create_user_message("a non-response message"))
         assert manager.last_input_tokens == 100
+
+
+class TestUnrecognizedMessageKindRaises:
+    """Story 16-2 AC8: a message.kind outside MessageKind raises symmetrically to AC7."""
+
+    def test_unknown_kind_raises_value_error(self) -> None:
+        """A duck-typed message with an out-of-MessageKind kind raises ValueError."""
+        manager = ContextManager()
+        fake_message = SimpleNamespace(kind="not-a-real-kind")
+
+        with pytest.raises(ValueError, match="not-a-real-kind"):
+            manager._emit_usage_event(fake_message)  # type: ignore[arg-type]
 
 
 class TestContextManagerCompact:
