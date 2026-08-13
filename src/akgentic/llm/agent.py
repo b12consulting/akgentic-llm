@@ -315,9 +315,12 @@ class ReactAgent:
     def _fold_run_usage(self, run: AgentRun[Any, Any]) -> None:
         """Add one completed run's token usage to the agent-lifetime accumulator.
 
-        ``run.usage`` is a **property** on pydantic-ai's ``AgentRun``; calling it
-        emits a deprecation warning. Called from a ``finally``, so a run that failed
-        partway still contributes what it spent — the provider billed it either way.
+        ``run.usage`` is a **property** on pydantic-ai's ``AgentRun`` — reading it
+        as an attribute, with no parentheses, is the correct, non-deprecated form
+        and is exactly what this call site does. The deprecated form is calling it
+        like the old method, ``run.usage()``; nothing in this codebase does that.
+        Called from a ``finally``, so a run that failed partway still contributes
+        what it spent — the provider billed it either way.
 
         Args:
             run: The pydantic-ai run object yielded by ``iter()``.

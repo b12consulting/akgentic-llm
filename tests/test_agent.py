@@ -233,6 +233,34 @@ class TestReactAgentCapabilityHook:
         assert cap.invoked is True
         assert result == "ok"
 
+    @pytest.mark.asyncio
+    async def test_run_usage_fold_emits_no_usage_deprecation_warning(self, minimal_config):
+        """`_fold_run_usage`'s `run.usage` read (property, no parens) stays warning-free.
+
+        Regression test for ADR-014 Phase 0 / FR1: pins the currently-correct
+        accessor form against a real pydantic-ai ``AgentRun``. The deprecated form
+        is calling ``run.usage()`` like the old method — nothing in this codebase
+        does that, and this test fails immediately if it ever starts to.
+        """
+        import warnings
+
+        from pydantic_ai.messages import ModelResponse, TextPart
+        from pydantic_ai.models.function import AgentInfo, FunctionModel
+
+        agent = ReactAgent(config=minimal_config)
+
+        def stub_model(messages: list, info: AgentInfo) -> ModelResponse:
+            return ModelResponse(parts=[TextPart(content="ok")])
+
+        with agent.pydantic_agent.override(model=FunctionModel(stub_model)):
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                result = await agent.run("hello")
+
+        usage_warnings = [w for w in caught if "usage" in str(w.message).lower()]
+        assert usage_warnings == []
+        assert result == "ok"
+
 
 class TestReactAgentRun:
     """Test ReactAgent.run() method."""
