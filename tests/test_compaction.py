@@ -290,6 +290,41 @@ def test_has_tool_helpers() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Story 16-4 — regression pin for the inferred role=tool wire-mapping:
+# _is_tool_result_part classification and its _tool_result_call_ids consequence.
+# ---------------------------------------------------------------------------
+
+
+def test_is_tool_result_part_tool_return_is_tool_result() -> None:
+    part = ToolReturnPart(tool_name="f", content="ok")
+    assert comp._is_tool_result_part(part) is True
+
+
+def test_is_tool_result_part_retry_with_tool_name_is_tool_result() -> None:
+    # Tool-validation retry: tool_name set -> serialises as role=tool.
+    part = RetryPromptPart(content="bad", tool_name="f")
+    assert comp._is_tool_result_part(part) is True
+
+
+def test_is_tool_result_part_retry_without_tool_name_is_not_tool_result() -> None:
+    # Output-validation retry: tool_name left None -> NOT a role=tool result.
+    part = RetryPromptPart(content="bad")
+    assert comp._is_tool_result_part(part) is False
+
+
+def test_tool_result_call_ids_includes_tool_validation_retry() -> None:
+    part = RetryPromptPart(content="bad", tool_name="f", tool_call_id="c1")
+    msg = ModelRequest(parts=[part])
+    assert comp._tool_result_call_ids(msg) == {"c1"}
+
+
+def test_tool_result_call_ids_excludes_output_validation_retry() -> None:
+    part = RetryPromptPart(content="bad", tool_call_id="c1")
+    msg = ModelRequest(parts=[part])
+    assert comp._tool_result_call_ids(msg) == set()
+
+
+# ---------------------------------------------------------------------------
 # Summary-prompt rendering helpers (exercised on the SummarizingCompaction path)
 # ---------------------------------------------------------------------------
 
