@@ -797,16 +797,18 @@ config that never enters the per-agent event stream.
 These events carry per-request token counts and can be aggregated into hierarchical cost
 summaries using `aggregate_usage()`.
 
-### Pricing Table
+### Pricing
 
-Model pricing is externalized in `pricing.yaml` (bundled with the package). It covers
-Anthropic (Claude Sonnet 4, Claude Opus 4) and OpenAI (GPT-4.1 family, GPT-4o family,
-GPT-5 family) with per-1M-token rates for `input`, `output`, `cache_read`, and
-`cache_write`. The table is loaded once at import time into the `PRICING` dict.
+Model pricing is resolved via the [`genai-prices`](https://github.com/pydantic/genai-prices)
+library against its bundled offline snapshot — there is no pricing table maintained in
+this package. For each model, `_compute_cost()` builds a `genai_prices.Usage` from the
+aggregated token counts and calls `calc_price(usage, model_ref=model_name,
+provider_id=provider_name or None)`. An unmatched `model_ref` raises `LookupError`, which
+is caught and mapped to `0.0` — unpriced models still have their tokens aggregated.
 
-Pricing resolution uses substring matching against model names (longest key first), so
-versioned names like `"claude-sonnet-4-20250514"` match the `"claude-sonnet-4-20250514"`
-key, and `"gpt-4.1-mini-2025-12-11"` matches `"gpt-4.1-mini"` before `"gpt-4.1"`.
+Because pricing comes from `genai-prices`' bundled snapshot, refreshing prices means
+bumping the `genai-prices` version pin in `pyproject.toml` (no live/auto-update is wired
+into this package).
 
 ### Aggregation
 
@@ -935,9 +937,8 @@ src/akgentic/llm/
     event.py        # LlmMessageEvent, LlmUsageEvent, LlmCheckpoint*Event,
                     #   LlmSystemPromptEvent, SystemPromptPartSnapshot,
                     #   ToolCallEvent, ToolReturnEvent, ContextObserver protocol
-    pricing.py      # PRICING dict, ModelUsage, RunUsageSummary, AgentUsageSummary,
-                    #   aggregate_usage()
-    pricing.yaml    # Externalized per-1M-token pricing table (Anthropic + OpenAI)
+    pricing.py      # _compute_cost() (genai-prices), ModelUsage, RunUsageSummary,
+                    #   AgentUsageSummary, aggregate_usage()
     prompts.py      # PromptTemplate, current_datetime_prompt, json_output_reminder_prompt
     providers.py    # create_model(), create_http_client(), get_output_type(),
                     #   create_model_settings()
