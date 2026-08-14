@@ -53,20 +53,6 @@ def _over_budget_config() -> ReactAgentConfig:
     )
 
 
-class _ZeroUsageRun:
-    """Mixin giving a run double pydantic-ai's ``AgentRun.usage`` property.
-
-    ``usage`` is a property there, not a method, and every real run has one — the
-    agent folds it into its lifetime accumulator after each run. These doubles
-    report a run that spent nothing; the token-budget suites use ``_StubRun`` when
-    the spend matters.
-    """
-
-    @property
-    def usage(self) -> RunUsage:
-        return RunUsage()
-
-
 class MockObserver:
     """Mock observer for context notifications."""
 
@@ -92,41 +78,6 @@ def config_with_limits():
         model_cfg=ModelConfig(provider="openai", model="gpt-4o"),
         run_usage_limits=RunUsageLimits(run_request_limit=5, total_tokens_limit=1000),
     )
-
-
-@pytest.fixture
-def mock_agent_iter():
-    """Mock pydantic-ai Agent.iter() for testing."""
-
-    async def fake_iter(*args, **kwargs):
-        # Create mock run object that supports async context manager
-        class MockRun(_ZeroUsageRun):
-            def __init__(self):
-                self.result = MagicMock(output="test result")
-                self._messages = [ModelRequest(parts=[UserPromptPart(content="test")])]
-
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, exc_type, exc_val, exc_tb):
-                return False
-
-            def __aiter__(self):
-                return self
-
-            async def __anext__(self):
-                # Yield once then stop
-                if not hasattr(self, "_iterated"):
-                    self._iterated = True
-                    return None
-                raise StopAsyncIteration
-
-            def all_messages(self):
-                return self._messages
-
-        return MockRun()
-
-    return fake_iter
 
 
 class TestUsageLimitError:
@@ -233,6 +184,34 @@ class TestReactAgentCapabilityHook:
         assert cap.invoked is True
         assert result == "ok"
 
+    @pytest.mark.asyncio
+    async def test_run_usage_fold_emits_no_usage_deprecation_warning(self, minimal_config):
+        """`_fold_run_usage`'s `run.usage` read (property, no parens) stays warning-free.
+
+        Regression test for ADR-014 Phase 0 / FR1: pins the currently-correct
+        accessor form against a real pydantic-ai ``AgentRun``. The deprecated form
+        is calling ``run.usage()`` like the old method — nothing in this codebase
+        does that, and this test fails immediately if it ever starts to.
+        """
+        import warnings
+
+        from pydantic_ai.messages import ModelResponse, TextPart
+        from pydantic_ai.models.function import AgentInfo, FunctionModel
+
+        agent = ReactAgent(config=minimal_config)
+
+        def stub_model(messages: list, info: AgentInfo) -> ModelResponse:
+            return ModelResponse(parts=[TextPart(content="ok")])
+
+        with agent.pydantic_agent.override(model=FunctionModel(stub_model)):
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                result = await agent.run("hello")
+
+        usage_warnings = [w for w in caught if "usage" in str(w.message).lower()]
+        assert usage_warnings == []
+        assert result == "ok"
+
 
 class TestReactAgentRun:
     """Test ReactAgent.run() method."""
@@ -242,32 +221,13 @@ class TestReactAgentRun:
         """Test run() returns result from pydantic-ai agent."""
         agent = ReactAgent(config=minimal_config)
 
-        # Create mock run object
-        class MockRun(_ZeroUsageRun):
-            def __init__(self):
-                self.result = MagicMock(output="test result")
-                self._new_messages = [ModelRequest(parts=[UserPromptPart(content="test")])]
-
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, exc_type, exc_val, exc_tb):
-                return False
-
-            def __aiter__(self):
-                return self
-
-            async def __anext__(self):
-                if not hasattr(self, "_iterated"):
-                    self._iterated = True
-                    return None
-                raise StopAsyncIteration
-
-            def new_messages(self):
-                return self._new_messages
-
+        run = _StubRun(
+            output="test result",
+            yields=True,
+            new_messages=[ModelRequest(parts=[UserPromptPart(content="test")])],
+        )
         # Patch iter to return context manager directly
-        with patch.object(agent._pydantic_agent, "iter", return_value=MockRun()):
+        with patch.object(agent._pydantic_agent, "iter", return_value=run):
             result = await agent.run("test query")
             assert result == "test result"
 
@@ -276,33 +236,14 @@ class TestReactAgentRun:
         """Test context messages updated after run()."""
         agent = ReactAgent(config=minimal_config)
 
-        # Create mock run object
-        class MockRun(_ZeroUsageRun):
-            def __init__(self):
-                self.result = MagicMock(output="test result")
-                self._new_messages = [ModelRequest(parts=[UserPromptPart(content="test")])]
-
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, exc_type, exc_val, exc_tb):
-                return False
-
-            def __aiter__(self):
-                return self
-
-            async def __anext__(self):
-                if not hasattr(self, "_iterated"):
-                    self._iterated = True
-                    return None
-                raise StopAsyncIteration
-
-            def new_messages(self):
-                return self._new_messages
-
+        run = _StubRun(
+            output="test result",
+            yields=True,
+            new_messages=[ModelRequest(parts=[UserPromptPart(content="test")])],
+        )
         assert len(agent.context.messages) == 0
 
-        with patch.object(agent._pydantic_agent, "iter", return_value=MockRun()):
+        with patch.object(agent._pydantic_agent, "iter", return_value=run):
             await agent.run("test query")
 
             # Context should have messages after run
@@ -313,14 +254,8 @@ class TestReactAgentRun:
         """Test UsageLimitError raised when pydantic-ai raises UsageLimitExceeded."""
         agent = ReactAgent(config=minimal_config)
 
-        class FailingRun:
-            async def __aenter__(self):
-                raise UsageLimitExceeded("Request limit exceeded")
-
-            async def __aexit__(self, exc_type, exc_val, exc_tb):
-                return False
-
-        with patch.object(agent._pydantic_agent, "iter", return_value=FailingRun()):
+        run = _StubRun(enter_raises=UsageLimitExceeded("Request limit exceeded"))
+        with patch.object(agent._pydantic_agent, "iter", return_value=run):
             with pytest.raises(UsageLimitError) as exc_info:
                 await agent.run("test query")
             assert "Request limit exceeded" in str(exc_info.value)
@@ -355,33 +290,14 @@ class TestReactAgentContextMethods:
         observer = MockObserver()
         agent = ReactAgent(config=minimal_config)
 
-        # Create mock run object
-        class MockRun(_ZeroUsageRun):
-            def __init__(self):
-                self.result = MagicMock(output="test result")
-                self._new_messages = [ModelRequest(parts=[UserPromptPart(content="test")])]
-
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, exc_type, exc_val, exc_tb):
-                return False
-
-            def __aiter__(self):
-                return self
-
-            async def __anext__(self):
-                if not hasattr(self, "_iterated"):
-                    self._iterated = True
-                    return None
-                raise StopAsyncIteration
-
-            def new_messages(self):
-                return self._new_messages
-
+        run = _StubRun(
+            output="test result",
+            yields=True,
+            new_messages=[ModelRequest(parts=[UserPromptPart(content="test")])],
+        )
         agent.subscribe_context(observer)
 
-        with patch.object(agent._pydantic_agent, "iter", return_value=MockRun()):
+        with patch.object(agent._pydantic_agent, "iter", return_value=run):
             await agent.run("test query")
 
             # Observer should have been notified
@@ -401,31 +317,12 @@ class TestReactAgentSyncMethod:
         """Test run_sync() executes synchronously."""
         agent = ReactAgent(config=minimal_config)
 
-        # Create mock run object
-        class MockRun(_ZeroUsageRun):
-            def __init__(self):
-                self.result = MagicMock(output="test result")
-                self._new_messages = [ModelRequest(parts=[UserPromptPart(content="test")])]
-
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, exc_type, exc_val, exc_tb):
-                return False
-
-            def __aiter__(self):
-                return self
-
-            async def __anext__(self):
-                if not hasattr(self, "_iterated"):
-                    self._iterated = True
-                    return None
-                raise StopAsyncIteration
-
-            def new_messages(self):
-                return self._new_messages
-
-        with patch.object(agent._pydantic_agent, "iter", return_value=MockRun()):
+        run = _StubRun(
+            output="test result",
+            yields=True,
+            new_messages=[ModelRequest(parts=[UserPromptPart(content="test")])],
+        )
+        with patch.object(agent._pydantic_agent, "iter", return_value=run):
             result = agent.run_sync("test query")
             assert result == "test result"
 
@@ -572,21 +469,52 @@ class TestReactAgentUsageLimits:
 
 
 class _StubRun:
-    """Stand-in for pydantic-ai's iter() run object: yields nothing, calls no model.
+    """Full ``AgentRun``-protocol test double: the single shared component every
+    test in this file constructs (directly or via a small factory) instead of
+    redefining the protocol locally.
 
-    ``usage`` is a property, not a method, matching pydantic-ai's ``AgentRun.usage``
-    (calling that one emits a deprecation warning). Spends nothing unless told to.
+    ``usage`` is a property, not a method, matching pydantic-ai's real
+    ``AgentRun.usage`` (calling it as a method emits the deprecation warning
+    story 16-1 guards against). The constructor accepts and discards ``iter()``'s
+    real ``*args``/``**kwargs`` so it survives a future ``iter()`` signature
+    change untouched; pass ``captured=`` (or use ``_capturing_stub_run`` below)
+    to record those kwargs instead of discarding them.
+
+    Defaults reproduce the zero-yield, zero-usage, empty-``new_messages()``
+    shape most call sites need. Pass ``yields=True`` for call sites whose test
+    reads ``agent.context.messages``: ``ReactAgent.run()`` only invokes
+    ``new_messages()`` from inside its ``async for`` loop body, so a fake that
+    never yields never adds anything to context regardless of what
+    ``new_messages()`` would return (the iteration-count trap — see story
+    16-3's Dev Notes).
     """
 
-    def __init__(self, *args, spent=None, **kwargs):
-        self.result = MagicMock(output="ok")
+    def __init__(
+        self,
+        *args,
+        output="ok",
+        spent=None,
+        new_messages=None,
+        yields=False,
+        enter_raises=None,
+        captured=None,
+        **kwargs,
+    ):
+        if captured is not None:
+            captured.update(kwargs)
+        self.result = MagicMock(output=output)
         self._usage = spent if spent is not None else RunUsage()
+        self._new_messages = new_messages if new_messages is not None else []
+        self._yields = yields
+        self._enter_raises = enter_raises
 
     @property
     def usage(self):
         return self._usage
 
     async def __aenter__(self):
+        if self._enter_raises is not None:
+            raise self._enter_raises
         return self
 
     async def __aexit__(self, *_):
@@ -596,10 +524,29 @@ class _StubRun:
         return self
 
     async def __anext__(self):
+        if self._yields and not hasattr(self, "_iterated"):
+            self._iterated = True
+            return None
         raise StopAsyncIteration
 
     def new_messages(self):
-        return []
+        return self._new_messages
+
+
+def _capturing_stub_run(captured: dict, **stub_kwargs):
+    """iter() ``side_effect`` that records the call's real kwargs into `captured`.
+
+    Complements passing ``captured=`` directly into ``_StubRun(...)`` (which only
+    works with ``return_value=``, a single fixed instance): a ``side_effect=``
+    factory must be invoked fresh, with ``iter()``'s actual args/kwargs, on every
+    call — this returns such a factory.
+    """
+
+    def factory(*args, **kwargs):
+        captured.update(kwargs)
+        return _StubRun(**stub_kwargs)
+
+    return factory
 
 
 def _agent_limit_config(limit):
@@ -1146,28 +1093,9 @@ class TestReactAgentMultimodalPrompt:
         agent = ReactAgent(config=minimal_config)
         captured_kwargs: dict = {}
 
-        class MockRun(_ZeroUsageRun):
-            def __init__(self, *args, **kwargs):
-                captured_kwargs.update(kwargs)
-                self.result = MagicMock(output="ok")
-                self._new_messages = []
-
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *_):
-                return False
-
-            def __aiter__(self):
-                return self
-
-            async def __anext__(self):
-                raise StopAsyncIteration
-
-            def new_messages(self):
-                return self._new_messages
-
-        with patch.object(agent._pydantic_agent, "iter", side_effect=MockRun):
+        with patch.object(
+            agent._pydantic_agent, "iter", side_effect=_capturing_stub_run(captured_kwargs)
+        ):
             agent.run_sync("plain text")
 
         assert captured_kwargs["user_prompt"] == "plain text"
@@ -1178,28 +1106,9 @@ class TestReactAgentMultimodalPrompt:
         captured_kwargs: dict = {}
         multimodal = ["describe: ", BinaryContent(data=b"imgbytes", media_type="image/png")]
 
-        class MockRun(_ZeroUsageRun):
-            def __init__(self, *args, **kwargs):
-                captured_kwargs.update(kwargs)
-                self.result = MagicMock(output="ok")
-                self._new_messages = []
-
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *_):
-                return False
-
-            def __aiter__(self):
-                return self
-
-            async def __anext__(self):
-                raise StopAsyncIteration
-
-            def new_messages(self):
-                return self._new_messages
-
-        with patch.object(agent._pydantic_agent, "iter", side_effect=MockRun):
+        with patch.object(
+            agent._pydantic_agent, "iter", side_effect=_capturing_stub_run(captured_kwargs)
+        ):
             agent.run_sync(multimodal)
 
         assert captured_kwargs["user_prompt"] is multimodal  # exact same object, no copy
@@ -1235,28 +1144,9 @@ class TestReactAgentMultimodalPrompt:
         bc = BinaryContent(data=b"x", media_type="image/png")
         multimodal: list[str | BinaryContent] = ["text", bc]
 
-        class MockRun(_ZeroUsageRun):
-            def __init__(self, *args, **kwargs):
-                captured_kwargs.update(kwargs)
-                self.result = MagicMock(output="ok")
-                self._new_messages = []
-
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *_):
-                return False
-
-            def __aiter__(self):
-                return self
-
-            async def __anext__(self):
-                raise StopAsyncIteration
-
-            def new_messages(self):
-                return self._new_messages
-
-        with patch.object(agent._pydantic_agent, "iter", side_effect=MockRun):
+        with patch.object(
+            agent._pydantic_agent, "iter", side_effect=_capturing_stub_run(captured_kwargs)
+        ):
             agent.run_sync(multimodal)
 
         # The exact same list object must be passed — no copy, no wrapping
@@ -1278,30 +1168,8 @@ class TestReactAgentFoldsPendingOperatorActions:
 
     @staticmethod
     def _capturing_run_factory(captured: dict):
-        """Return a MockRun class that records the kwargs passed to iter()."""
-
-        class MockRun(_ZeroUsageRun):
-            def __init__(self, *args, **kwargs):
-                captured.update(kwargs)
-                self.result = MagicMock(output="ok")
-                self._new_messages: list = []
-
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *_):
-                return False
-
-            def __aiter__(self):
-                return self
-
-            async def __anext__(self):
-                raise StopAsyncIteration
-
-            def new_messages(self):
-                return self._new_messages
-
-        return MockRun
+        """Return an iter() side_effect that records the kwargs passed to iter()."""
+        return _capturing_stub_run(captured)
 
     @pytest.mark.asyncio
     async def test_str_prompt_gets_preamble_prepended(self, minimal_config):
@@ -1517,32 +1385,8 @@ def _system_request_with_run_id(
 
 
 def _make_mock_run(new_messages: list[ModelRequest]):
-    """Return a MockRun instance whose new_messages() yields `new_messages`."""
-
-    class MockRun(_ZeroUsageRun):
-        def __init__(self) -> None:
-            self.result = MagicMock(output="ok")
-            self._new_messages = new_messages
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *_):
-            return False
-
-        def __aiter__(self):
-            return self
-
-        async def __anext__(self):
-            if not hasattr(self, "_iterated"):
-                self._iterated = True
-                return None
-            raise StopAsyncIteration
-
-        def new_messages(self):
-            return self._new_messages
-
-    return MockRun()
+    """Return a run double (via return_value=) whose new_messages() yields `new_messages`."""
+    return _StubRun(new_messages=new_messages, yields=True)
 
 
 def _system_events(observer: MockObserver) -> list[LlmSystemPromptEvent]:
