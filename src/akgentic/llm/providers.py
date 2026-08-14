@@ -392,20 +392,32 @@ def _create_google_model(
     transitive dependency on ``mcp`` which may not be installed or may conflict
     in some environments).
 
+    Uses the API key from ``GOOGLE_API_KEY``, falling back to ``GEMINI_API_KEY``
+    for backward compatibility.
+
     Args:
         config: LLM model configuration.
         http_client: Async HTTP client with retry logic.
 
     Returns:
         Configured GoogleModel instance.
+
+    Raises:
+        ValueError: If neither ``GOOGLE_API_KEY`` nor ``GEMINI_API_KEY`` is set.
     """
     from pydantic_ai.models.google import GoogleModel  # noqa: PLC0415
     from pydantic_ai.providers.google import GoogleProvider  # noqa: PLC0415
 
+    api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise ValueError(
+            "GOOGLE_API_KEY or GEMINI_API_KEY environment variable is required "
+            "for Google provider"
+        )
     settings = _build_core_settings(config)
     return GoogleModel(
         model_name=config.model,
-        provider=GoogleProvider(http_client=http_client),
+        provider=GoogleProvider(api_key=api_key, http_client=http_client),
         settings=settings,
     )
 
