@@ -295,6 +295,98 @@ class TestReactAgentCapabilityHook:
         assert result == "ok"
 
 
+class TestReactAgentEndStrategyRetryWins:
+    """Story 17-5: pins v2's 'exhaustive'-strategy retry-wins invariant.
+
+    `RuntimeConfig.end_strategy` defaults to ``"exhaustive"`` and is always passed
+    explicitly to ``Agent(...)`` (`agent.py`), so pydantic-ai's own constructor
+    default (which flipped `'early'`->`'graceful'` in v2) never applies here -- but
+    v2's *implementation* of `'exhaustive'` itself changed underneath that default.
+    v2 moved tool-call processing into `pydantic_ai/_tool_execution.py`
+    (`_ExhaustiveProcessor`, `_apply_retry_wins`, `_is_retry_wins_trigger`): when a
+    function tool call in the same round as an already-successful output tool call
+    produces a `RetryPromptPart` (from `ModelRetry` or arg-validation failure), the
+    output is suppressed and the run stays open for a further model turn. The pinned
+    v1.107.0 baseline (`pydantic_ai/_agent_graph.py::process_tool_calls`) has no code
+    path that reads a function tool's `RetryPromptPart` to affect an already-set
+    `final_result` -- the output would win immediately, ending the run on that turn.
+    """
+
+    @pytest.mark.asyncio
+    async def test_exhaustive_strategy_keeps_run_open_when_a_concurrent_function_tool_retries(
+        self, monkeypatch
+    ):
+        from pydantic import BaseModel
+        from pydantic_ai import ModelRetry
+        from pydantic_ai.messages import ModelResponse, ToolCallPart
+        from pydantic_ai.models.function import AgentInfo, FunctionModel
+
+        # google-gla is a non-native provider: get_output_type() returns the raw
+        # BaseModel unwrapped, so pydantic-ai uses tool-based (ToolOutput) output --
+        # the model must emit a discrete output ToolCallPart, matching the scenario.
+        # The API key is never dereferenced: FunctionModel replaces the real model
+        # before any run happens.
+        monkeypatch.setenv("GOOGLE_API_KEY", "test-key")
+
+        class RouteDecision(BaseModel):
+            target: str
+
+        config = ReactAgentConfig(
+            model_cfg=ModelConfig(provider="google-gla", model="gemini-2.0-flash"),
+        )
+        assert config.runtime_cfg.end_strategy == "exhaustive"
+        agent = ReactAgent(config=config, result_type=RouteDecision)
+
+        @agent.pydantic_agent.tool_plain
+        def flaky_tool(value: str) -> str:
+            raise ModelRetry("needs correction")
+
+        call_count = 0
+
+        def stub_model(messages: list, info: AgentInfo) -> ModelResponse:
+            nonlocal call_count
+            call_count += 1
+            output_tool_name = info.output_tools[0].name
+            if call_count == 1:
+                # One round, two tool calls: an already-valid output AND a function
+                # tool call that will retry.
+                return ModelResponse(
+                    parts=[
+                        ToolCallPart(
+                            tool_name=output_tool_name,
+                            args={"target": "billing"},
+                            tool_call_id="out-1",
+                        ),
+                        ToolCallPart(
+                            tool_name="flaky_tool",
+                            args={"value": "x"},
+                            tool_call_id="fn-1",
+                        ),
+                    ]
+                )
+            # Second turn: no more function tool calls, so nothing can retry-win --
+            # this output finalizes the run.
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name=output_tool_name,
+                        args={"target": "billing"},
+                        tool_call_id="out-2",
+                    )
+                ]
+            )
+
+        with agent.pydantic_agent.override(model=FunctionModel(stub_model)):
+            result = await agent.run("route this")
+
+        # Under v1.107.0, the first turn's output would have won immediately
+        # (call_count == 1). Under the real v2 install, `flaky_tool`'s ModelRetry
+        # sets `retry_wins_triggered`, `_apply_retry_wins` nulls the already-set
+        # `final_result`, and the graph loops for a second model turn.
+        assert call_count == 2
+        assert result == RouteDecision(target="billing")
+
+
 class TestReactAgentRun:
     """Test ReactAgent.run() method."""
 
