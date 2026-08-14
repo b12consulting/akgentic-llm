@@ -185,6 +185,88 @@ class TestReactAgentCapabilityHook:
         assert result == "ok"
 
     @pytest.mark.asyncio
+    async def test_capability_orphaning_a_tool_call_pair_is_repaired_by_the_framework(
+        self, minimal_config
+    ):
+        """AC3 (story 17-4): the pre-v2 "no re-fold" claim does not hold under v2.
+
+        `agent.py`'s ``capabilities`` docstring used to say the framework "does not
+        re-run its orphan role=tool fold after capabilities run." Direct source
+        verification against pydantic-ai 2.21.0 (``_agent_graph.py``'s
+        ``_prepare_request``) found this false: on every model request,
+        ``_clean_message_history(..., repair_last_response=True)`` runs AFTER
+        ``before_model_request`` and silently synthesizes a matching
+        ``ToolReturnPart`` for any dangling ``ToolCallPart`` — including one a
+        capability itself just created. This test pins that corrected behavior
+        against a capability that does exactly what the old docstring warned about:
+        splits a tool call/return pair by deleting the return.
+        """
+        from dataclasses import replace as dc_replace
+
+        from pydantic_ai.capabilities import AbstractCapability
+        from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart, ToolReturnPart
+        from pydantic_ai.models.function import AgentInfo, FunctionModel
+
+        tool_call_id = "call-1"
+
+        class _OrphaningCapability(AbstractCapability):
+            """Strips the ToolReturnPart matching tool_call_id from every message."""
+
+            async def before_model_request(self, ctx, request_context):
+                request_context.messages = [
+                    dc_replace(
+                        m,
+                        parts=[
+                            p
+                            for p in m.parts
+                            if not (
+                                isinstance(p, ToolReturnPart) and p.tool_call_id == tool_call_id
+                            )
+                        ],
+                    )
+                    if isinstance(m, ModelRequest)
+                    else m
+                    for m in request_context.messages
+                ]
+                return request_context
+
+        agent = ReactAgent(config=minimal_config, capabilities=[_OrphaningCapability()])
+        # Seed a completed tool round-trip directly; before_model_request strips its
+        # ToolReturnPart on the next run, orphaning the preceding ToolCallPart.
+        agent.context.restore(
+            [
+                ModelRequest(parts=[UserPromptPart(content="first")]),
+                ModelResponse(
+                    parts=[ToolCallPart(tool_name="foo", args={}, tool_call_id=tool_call_id)]
+                ),
+                ModelRequest(
+                    parts=[ToolReturnPart(tool_name="foo", content="ok", tool_call_id=tool_call_id)]
+                ),
+            ]
+        )
+
+        received_messages: list = []
+
+        def stub_model(messages: list, info: AgentInfo) -> ModelResponse:
+            received_messages.extend(messages)
+            return ModelResponse(parts=[TextPart(content="done")])
+
+        with agent.pydantic_agent.override(model=FunctionModel(stub_model)):
+            result = await agent.run("continue")
+
+        assert result == "done"
+        # The capability deleted the only ToolReturnPart for tool_call_id — if the
+        # model still received one, the framework synthesized it after the
+        # capability ran, contradicting the old "no re-fold" docstring claim.
+        returned_ids = {
+            p.tool_call_id
+            for m in received_messages
+            for p in getattr(m, "parts", [])
+            if isinstance(p, ToolReturnPart)
+        }
+        assert tool_call_id in returned_ids
+
+    @pytest.mark.asyncio
     async def test_run_usage_fold_emits_no_usage_deprecation_warning(self, minimal_config):
         """`_fold_run_usage`'s `run.usage` read (property, no parens) stays warning-free.
 
