@@ -1045,7 +1045,11 @@ class TestReactAgentTokenBudgetEnforcement:
             with pytest.raises(UsageLimitError) as exc_info:
                 agent.run_sync("third")
         assert agent._agent_usage.total_tokens == 120
-        assert str(exc_info.value) == "Exceeded the total_tokens_limit of 100 (total_tokens=120)"
+        # pydantic-ai v2 appends a docs-hint suffix to UsageLimitExceeded; ADR-013 only
+        # requires the prefix to keep matching.
+        assert str(exc_info.value).startswith(
+            "Exceeded the total_tokens_limit of 100 (total_tokens=120)"
+        )
 
     def test_input_tokens_limit_blocks_independently(self):
         """Test input_tokens_limit is live on its own, not only via the total."""
@@ -1055,7 +1059,11 @@ class TestReactAgentTokenBudgetEnforcement:
             agent.run_sync("second")
             with pytest.raises(UsageLimitError) as exc_info:
                 agent.run_sync("third")
-        assert str(exc_info.value) == "Exceeded the input_tokens_limit of 100 (input_tokens=120)"
+        # pydantic-ai v2 appends a docs-hint suffix to UsageLimitExceeded; ADR-013 only
+        # requires the prefix to keep matching.
+        assert str(exc_info.value).startswith(
+            "Exceeded the input_tokens_limit of 100 (input_tokens=120)"
+        )
 
     def test_output_tokens_limit_blocks_independently(self):
         """Test output_tokens_limit is live on its own — output tokens only here."""
@@ -1065,7 +1073,11 @@ class TestReactAgentTokenBudgetEnforcement:
             agent.run_sync("second")
             with pytest.raises(UsageLimitError) as exc_info:
                 agent.run_sync("third")
-        assert str(exc_info.value) == "Exceeded the output_tokens_limit of 100 (output_tokens=120)"
+        # pydantic-ai v2 appends a docs-hint suffix to UsageLimitExceeded; ADR-013 only
+        # requires the prefix to keep matching.
+        assert str(exc_info.value).startswith(
+            "Exceeded the output_tokens_limit of 100 (output_tokens=120)"
+        )
 
     def test_a_run_may_overshoot_the_budget(self):
         """Test the contract is "do not START once spent", not "never exceed".
@@ -1198,7 +1210,11 @@ class TestReactAgentTokenBudgetRestore:
         with patch.object(agent._pydantic_agent, "iter", side_effect=_stub_run_spending(1)):
             with pytest.raises(UsageLimitError) as exc_info:
                 agent.run_sync("one run too many")
-        assert str(exc_info.value) == "Exceeded the total_tokens_limit of 40 (total_tokens=45)"
+        # pydantic-ai v2 appends a docs-hint suffix to UsageLimitExceeded; ADR-013 only
+        # requires the prefix to keep matching.
+        assert str(exc_info.value).startswith(
+            "Exceeded the total_tokens_limit of 40 (total_tokens=45)"
+        )
 
     def test_restored_agent_below_its_limit_spends_only_the_remainder(self):
         """Test the seeded total is the budget's starting point, not a blanket block."""
