@@ -365,7 +365,8 @@ class ContextManager:
         """Apply sliding window to messages.
 
         Keeps most recent max_messages while preserving all system messages.
-        System messages don't count toward the limit.
+        System messages consume the budget: the retained total is capped at
+        max_messages, so more system messages means fewer non-system ones kept.
         """
         if self._max_messages is None or len(self._messages) <= self._max_messages:
             return

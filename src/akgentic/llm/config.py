@@ -17,7 +17,7 @@ Examples:
 
     >>> from akgentic.llm import ModelConfig, RunUsageLimits, ReactAgentConfig
     >>> config = ReactAgentConfig(
-    ...     model=ModelConfig(provider="openai", model="gpt-4o"),
+    ...     model_cfg=ModelConfig(provider="openai", model="gpt-4o"),
     ...     run_usage_limits=RunUsageLimits(run_request_limit=10, total_tokens_limit=5000)
     ... )
 """
@@ -27,9 +27,16 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
-# Release that deletes the pre-split usage-limits shim. Named in every deprecation
-# warning and docstring below so removing it is a scheduled task, not a hunt.
-_SHIM_REMOVAL_RELEASE = "akgentic-llm 2.0.0"
+# Removal schedule for the pre-split usage-limits shim, interpolated into every
+# deprecation warning below so the schedule is stated in exactly one place.
+#
+# There is deliberately no release number here. The shim was announced for removal
+# in 2.0.0, but 2.0.0 turned out to be the release that carried the move to
+# pydantic-ai v2 -- the major bump was forced by the dependency, not by this
+# deprecation, and the two collided on a number. The shim shipped through it. Naming
+# any future release here would recreate that same defect at the next forced major,
+# so the schedule stays open until someone actually schedules it.
+_SHIM_REMOVAL_NOTICE = "no removal release is scheduled"
 
 
 class ModelConfig(BaseModel):
@@ -40,9 +47,12 @@ class ModelConfig(BaseModel):
     - OpenAI: OPENAI_API_KEY
     - Azure: AZURE_OPENAI_API_KEY, AZURE_OPENAI_ENDPOINT
     - Anthropic: ANTHROPIC_API_KEY
-    - Google: GOOGLE_API_KEY or GOOGLE_APPLICATION_CREDENTIALS
+    - Google: GOOGLE_API_KEY or GEMINI_API_KEY (one is required; ADC is not consulted)
     - Mistral: MISTRAL_API_KEY
-    - NVIDIA: NVIDIA_API_KEY
+    - NVIDIA: OPENAI_API_KEY (no api_key is passed to OpenAIProvider, so its own
+      OPENAI_API_KEY fallback applies; a missing key surfaces as a 401 at request
+      time, not at construction). Endpoint from NVIDIA_BASE_URL, which defaults to
+      https://integrate.api.nvidia.com/v1
 
     Attributes:
         provider: LLM provider name
@@ -373,7 +383,8 @@ class UsageLimits(RunUsageLimits):
 
     Accepts the pre-split ``request_limit=`` spelling and maps it onto
     ``run_request_limit``; ``.request_limit`` reads back through to the same field.
-    Removed in akgentic-llm 2.0.0 — migrate to ``RunUsageLimits(run_request_limit=...)``.
+    Still shipped, with no removal release scheduled — migrate to
+    ``RunUsageLimits(run_request_limit=...)`` anyway; every use warns.
 
     ``request_limit`` is a read accessor, never a field: a second storage slot would
     reintroduce the split-brain state the rename exists to remove.
@@ -395,7 +406,7 @@ class UsageLimits(RunUsageLimits):
             return data
         folded = _fold_pre_split_request_limit(data, "UsageLimits")
         warnings.warn(
-            f"UsageLimits is deprecated and will be removed in {_SHIM_REMOVAL_RELEASE}; "
+            f"UsageLimits is deprecated ({_SHIM_REMOVAL_NOTICE}); "
             "use RunUsageLimits(run_request_limit=...) instead",
             DeprecationWarning,
             stacklevel=3,
@@ -406,12 +417,12 @@ class UsageLimits(RunUsageLimits):
     def request_limit(self) -> int | None:
         """DEPRECATED read accessor for ``run_request_limit``.
 
-        Removed in akgentic-llm 2.0.0. Reflects the underlying field regardless of
-        which spelling set it.
+        Still shipped, with no removal release scheduled. Reflects the underlying
+        field regardless of which spelling set it.
         """
         warnings.warn(
-            f"UsageLimits.request_limit is deprecated and will be removed in "
-            f"{_SHIM_REMOVAL_RELEASE}; read run_request_limit instead",
+            f"UsageLimits.request_limit is deprecated ({_SHIM_REMOVAL_NOTICE}); "
+            f"read run_request_limit instead",
             DeprecationWarning,
             stacklevel=2,
         )
@@ -482,7 +493,11 @@ class RuntimeConfig(BaseModel):
     Attributes:
         retries: Number of retry attempts for tool call failures and output validation errors
         end_strategy: Tool execution termination strategy
-        parallel_tool_calls: Enable concurrent tool execution when model supports it
+        parallel_tool_calls: Accepted and validated, but read by nothing in this package.
+            ReactAgent reads only retries, end_strategy and http_client_config off
+            runtime_cfg, and never derives a parallel_tool_calls model setting from it.
+            create_model_settings() is the only function that emits that setting; it takes
+            a ModelConfig, never a RuntimeConfig, and has no call site here.
         http_client_config: HTTP client configuration for API communication
             (timeout and retry settings)
 
@@ -530,7 +545,10 @@ class RuntimeConfig(BaseModel):
 
     parallel_tool_calls: bool = Field(
         default=True,
-        description="Enable parallel tool execution when model supports concurrent calls",
+        description=(
+            "Accepted and validated, but read by nothing in this package: ReactAgent "
+            "never derives a parallel_tool_calls model setting from it"
+        ),
     )
 
     http_client_config: HttpClientConfig = Field(
@@ -563,7 +581,7 @@ class ReactAgentConfig(BaseModel):
 
     Deprecated:
         ``usage_limits`` survives as a constructor keyword and a read accessor for
-        ``run_usage_limits``. Both warn, and both are removed in akgentic-llm 2.0.0.
+        ``run_usage_limits``. Both warn; neither has a scheduled removal release.
         Passing ``usage_limits`` and ``run_usage_limits`` together raises ValueError.
 
     Example:
@@ -585,7 +603,7 @@ class ReactAgentConfig(BaseModel):
         ...     ),
         ...     runtime_cfg=RuntimeConfig(
         ...         end_strategy="exhaustive",
-        ...         http_client=HttpClientConfig(timeout=180.0)
+        ...         http_client_config=HttpClientConfig(timeout=180.0)
         ...     )
         ... )
     """
@@ -641,8 +659,8 @@ class ReactAgentConfig(BaseModel):
         if isinstance(value, dict):
             value = _fold_pre_split_request_limit(value, "ReactAgentConfig(usage_limits=...)")
         warnings.warn(
-            f"ReactAgentConfig(usage_limits=...) is deprecated and will be removed in "
-            f"{_SHIM_REMOVAL_RELEASE}; use run_usage_limits=... instead",
+            f"ReactAgentConfig(usage_limits=...) is deprecated ({_SHIM_REMOVAL_NOTICE}); "
+            f"use run_usage_limits=... instead",
             DeprecationWarning,
             stacklevel=3,
         )
@@ -653,11 +671,12 @@ class ReactAgentConfig(BaseModel):
     def usage_limits(self) -> RunUsageLimits:
         """DEPRECATED read accessor for ``run_usage_limits``.
 
-        Removed in akgentic-llm 2.0.0. Returns the run tier itself, not a copy.
+        Still shipped, with no removal release scheduled. Returns the run tier
+        itself, not a copy.
         """
         warnings.warn(
-            f"ReactAgentConfig.usage_limits is deprecated and will be removed in "
-            f"{_SHIM_REMOVAL_RELEASE}; read run_usage_limits instead",
+            f"ReactAgentConfig.usage_limits is deprecated ({_SHIM_REMOVAL_NOTICE}); "
+            f"read run_usage_limits instead",
             DeprecationWarning,
             stacklevel=2,
         )

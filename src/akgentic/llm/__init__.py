@@ -6,7 +6,7 @@ context management, and comprehensive configuration.
 Quick Start:
     >>> from akgentic.llm import ModelConfig, ReactAgentConfig, ReactAgent
     >>> config = ReactAgentConfig(
-    ...     model=ModelConfig(provider="openai", model="gpt-4o"),
+    ...     model_cfg=ModelConfig(provider="openai", model="gpt-4o"),
     ... )
     >>> agent = ReactAgent(config=config)
     >>> result = await agent.run("Hello!")
@@ -14,10 +14,12 @@ Quick Start:
 Key Concepts:
     - REACT pattern: Iterative agent execution with tool calls
     - RunUsageLimits: Per-run token/request budget, enforced by pydantic-ai
-    - AgentUsageLimits: Agent-lifetime budget (declared, not yet enforced)
+    - AgentUsageLimits: Agent-lifetime budget, enforced pre-flight on every run
     - ContextManager: Message history tracking
     - PromptTemplate: Template-based prompts with parameter substitution
 """
+
+from importlib import metadata as _metadata
 
 from .agent import ReactAgent, UsageLimitError, UserPrompt
 from .compaction import (
@@ -67,7 +69,7 @@ __all__ = [
     "ModelConfig",
     "RunUsageLimits",
     "AgentUsageLimits",
-    "UsageLimits",  # DEPRECATED alias of RunUsageLimits — removed in 2.0.0
+    "UsageLimits",  # DEPRECATED alias of RunUsageLimits — removal not yet scheduled
     "RuntimeConfig",
     "HttpClientConfig",
     "ReactAgentConfig",
@@ -109,4 +111,10 @@ __all__ = [
     "get_output_type",
 ]
 
-__version__ = "0.1.0"
+try:
+    __version__ = _metadata.version("akgentic-llm")
+except _metadata.PackageNotFoundError:  # pragma: no cover - source tree, never installed
+    # Importing from a source tree that was never installed must not fail over a
+    # version string. A hardcoded literal here is what drifted from pyproject.toml
+    # for eight minor releases; the sentinel is unmistakably "not a real version".
+    __version__ = "0.0.0+unknown"
