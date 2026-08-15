@@ -488,7 +488,15 @@ class RuntimeConfig(BaseModel):
 
     Tool Execution Strategies:
         - 'early': Stops after first successful result (fast path)
-        - 'exhaustive': Executes all tool calls even when result available (complete data gathering)
+        - 'exhaustive': Executes all tool calls even when result available (complete data
+          gathering). Under pydantic-ai v2, this strategy also applies a "retry-wins" rule: if a
+          function tool call in the same round as an already-successful output call
+          raises ModelRetry (or fails argument validation), the output is suppressed
+          and the run continues for another model turn instead of ending immediately.
+          v1.107 had no such rule -- an already-successful output always won. The forced extra
+          turn counts against run_usage_limits (run_request_limit, total_tokens_limit): a run
+          that would have finished successfully on v1 (output wins, retry ignored) can instead
+          raise UsageLimitError on v2 if that turn pushes it past a run-tier ceiling.
 
     Example:
         >>> # Default: resilient with standard HTTP settings

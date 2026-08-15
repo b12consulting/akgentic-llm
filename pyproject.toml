@@ -1,6 +1,6 @@
 [project]
 name = "akgentic-llm"
-version = "1.6.3"
+version = "1.6.4"
 description = "LLM integration layer for Akgentic agent systems"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -20,8 +20,12 @@ authors = [
 keywords = ["llm", "agents", "ai", "pydantic-ai", "react"]
 
 dependencies = [
-    "pydantic-ai>=1.107.0,<2",
-    "genai-prices>=0.0.66,<0.1",
+    "pydantic-ai[mistral]>=2,<3",
+    # NEVER cap this: genai-prices ships the price table itself, so an upper bound
+    # freezes prices and the framework reports stale costs. The floor is the v2
+    # pricing-data line; a ceiling here also transitively caps pydantic-ai, since
+    # pydantic-ai-slim>=2.22.0 requires genai-prices>=0.1.0.
+    "genai-prices>=0.1.0",
     "pydantic>=2.0.0",
     "httpx>=0.27.0",
     "tenacity>=8.0.0",

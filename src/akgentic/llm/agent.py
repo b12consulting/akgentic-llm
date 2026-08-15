@@ -118,13 +118,20 @@ class ReactAgent:
                 Ordering is fixed: a capability's before_model_request hook runs AFTER
                 compaction — ContextManager rewrites messages first, the result is
                 passed as message_history, and only then does the capability chain
-                run. Two consequences, neither guessable from the signature:
-                - A capability sees only the POST-compaction history; it never sees
-                  what compaction folded away.
-                - The framework does not re-run its orphan role=tool fold after
-                  capabilities run. A capability that reintroduces one (e.g. by
-                  splitting a tool call/return pair while injecting content) will
-                  produce a request OpenAI rejects.
+                run. One consequence, not guessable from the signature: a capability
+                sees only the POST-compaction history; it never sees what compaction
+                folded away.
+                Under pydantic-ai 2.x (verified against 2.21.0), a capability that
+                orphans a tool call/return pair (e.g. by splitting one while injecting
+                content) is NOT left broken: pydantic-ai's own dangling-tool-call
+                repair (`_agent_graph._clean_message_history` with
+                `repair_last_response=True`) runs on every model request, AFTER the
+                capability chain, and silently synthesizes a matching ToolReturnPart
+                before the request reaches the provider. This corrects the pre-v2
+                assumption that no such re-fold happened. It is pydantic-ai's own
+                internal pipeline behavior, not a documented public guarantee, and
+                could change in a future release — a capability should still avoid
+                orphaning tool calls on purpose.
             event_loop: Deprecated — accepted and ignored. The agent creates and
                 owns its own loop (``self._loop``); the passed loop is neither
                 adopted nor used by ``run_sync``. Kept in the signature for one
@@ -186,18 +193,18 @@ class ReactAgent:
         wrapped_result_type: Any = get_output_type(config.model_cfg, result_type)
 
         # Create pydantic-ai Agent.
-        # pydantic-ai's Agent() @overload stubs are narrower than the runtime
-        # __init__: they reject `history_processors` / `instrument` and a
-        # `type[Any] | None` `deps_type`, all of which the runtime accepts.
-        self._pydantic_agent = Agent(  # type: ignore[call-overload]
+        # pydantic-ai's Agent() overloads declare `deps_type: type[AgentDepsT]
+        # = object` (no `None`); ReactAgent forwards its own `deps_type:
+        # type[Any] | None`, which the overload stubs reject even though the
+        # runtime accepts it.
+        self._pydantic_agent = Agent(
             model=self._model,
             tools=tools or [],
             toolsets=toolsets or [],
             retries=config.runtime_cfg.retries,
-            deps_type=deps_type,
+            deps_type=deps_type,  # type: ignore[arg-type]
             end_strategy=config.runtime_cfg.end_strategy,
             output_type=wrapped_result_type,
-            instrument=None,
             capabilities=capabilities or [],
         )
 
@@ -812,6 +819,4 @@ class ReactAgent:
         Returns:
             Pydantic-ai Agent instance
         """
-        # `_pydantic_agent` is Any-typed (Agent() call uses a typed-ignore);
-        # the runtime value genuinely is an Agent, so cast to recover the type.
-        return cast(Agent[Any, Any], self._pydantic_agent)
+        return self._pydantic_agent

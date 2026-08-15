@@ -604,10 +604,11 @@ class TestCreateModel:
     # Google
     # ------------------------------------------------------------------
 
-    def test_create_google_model(self) -> None:
+    def test_create_google_model(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """create_model returns a GoogleModel for provider='google-gla'."""
         import sys
 
+        monkeypatch.setenv("GOOGLE_API_KEY", "test-key")
         mock_google_model = MagicMock()
         mock_google_provider = MagicMock()
         mock_models_google = MagicMock(GoogleModel=mock_google_model)
@@ -629,10 +630,11 @@ class TestCreateModel:
         assert mock_google_model.call_args.kwargs["model_name"] == "gemini-2.0-flash"
         assert result is mock_google_model.return_value
 
-    def test_google_http_client_passed_to_provider(self) -> None:
-        """http_client is passed to GoogleProvider."""
+    def test_google_http_client_passed_to_provider(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """http_client and the resolved api_key are passed to GoogleProvider."""
         import sys
 
+        monkeypatch.setenv("GOOGLE_API_KEY", "test-key")
         mock_google_model = MagicMock()
         mock_google_provider = MagicMock()
         mock_models_google = MagicMock(GoogleModel=mock_google_model)
@@ -650,7 +652,19 @@ class TestCreateModel:
 
             create_model(config, http_client=mock_client)
 
-        mock_google_provider.assert_called_once_with(http_client=mock_client)
+        mock_google_provider.assert_called_once_with(api_key="test-key", http_client=mock_client)
+
+    def test_create_google_model_missing_credentials_raises(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """create_model raises ValueError when neither Google env var is set."""
+        monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+        monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+        mock_client = MagicMock(spec=httpx.AsyncClient)
+        config = ModelConfig(provider="google-gla", model="gemini-2.0-flash")
+
+        with pytest.raises(ValueError, match="GOOGLE_API_KEY"):
+            create_model(config, http_client=mock_client)
 
     # ------------------------------------------------------------------
     # Mistral

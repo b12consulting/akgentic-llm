@@ -185,6 +185,88 @@ class TestReactAgentCapabilityHook:
         assert result == "ok"
 
     @pytest.mark.asyncio
+    async def test_capability_orphaning_a_tool_call_pair_is_repaired_by_the_framework(
+        self, minimal_config
+    ):
+        """AC3 (story 17-4): the pre-v2 "no re-fold" claim does not hold under v2.
+
+        `agent.py`'s ``capabilities`` docstring used to say the framework "does not
+        re-run its orphan role=tool fold after capabilities run." Direct source
+        verification against pydantic-ai 2.21.0 (``_agent_graph.py``'s
+        ``_prepare_request``) found this false: on every model request,
+        ``_clean_message_history(..., repair_last_response=True)`` runs AFTER
+        ``before_model_request`` and silently synthesizes a matching
+        ``ToolReturnPart`` for any dangling ``ToolCallPart`` — including one a
+        capability itself just created. This test pins that corrected behavior
+        against a capability that does exactly what the old docstring warned about:
+        splits a tool call/return pair by deleting the return.
+        """
+        from dataclasses import replace as dc_replace
+
+        from pydantic_ai.capabilities import AbstractCapability
+        from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart, ToolReturnPart
+        from pydantic_ai.models.function import AgentInfo, FunctionModel
+
+        tool_call_id = "call-1"
+
+        class _OrphaningCapability(AbstractCapability):
+            """Strips the ToolReturnPart matching tool_call_id from every message."""
+
+            async def before_model_request(self, ctx, request_context):
+                request_context.messages = [
+                    dc_replace(
+                        m,
+                        parts=[
+                            p
+                            for p in m.parts
+                            if not (
+                                isinstance(p, ToolReturnPart) and p.tool_call_id == tool_call_id
+                            )
+                        ],
+                    )
+                    if isinstance(m, ModelRequest)
+                    else m
+                    for m in request_context.messages
+                ]
+                return request_context
+
+        agent = ReactAgent(config=minimal_config, capabilities=[_OrphaningCapability()])
+        # Seed a completed tool round-trip directly; before_model_request strips its
+        # ToolReturnPart on the next run, orphaning the preceding ToolCallPart.
+        agent.context.restore(
+            [
+                ModelRequest(parts=[UserPromptPart(content="first")]),
+                ModelResponse(
+                    parts=[ToolCallPart(tool_name="foo", args={}, tool_call_id=tool_call_id)]
+                ),
+                ModelRequest(
+                    parts=[ToolReturnPart(tool_name="foo", content="ok", tool_call_id=tool_call_id)]
+                ),
+            ]
+        )
+
+        received_messages: list = []
+
+        def stub_model(messages: list, info: AgentInfo) -> ModelResponse:
+            received_messages.extend(messages)
+            return ModelResponse(parts=[TextPart(content="done")])
+
+        with agent.pydantic_agent.override(model=FunctionModel(stub_model)):
+            result = await agent.run("continue")
+
+        assert result == "done"
+        # The capability deleted the only ToolReturnPart for tool_call_id — if the
+        # model still received one, the framework synthesized it after the
+        # capability ran, contradicting the old "no re-fold" docstring claim.
+        returned_ids = {
+            p.tool_call_id
+            for m in received_messages
+            for p in getattr(m, "parts", [])
+            if isinstance(p, ToolReturnPart)
+        }
+        assert tool_call_id in returned_ids
+
+    @pytest.mark.asyncio
     async def test_run_usage_fold_emits_no_usage_deprecation_warning(self, minimal_config):
         """`_fold_run_usage`'s `run.usage` read (property, no parens) stays warning-free.
 
@@ -211,6 +293,98 @@ class TestReactAgentCapabilityHook:
         usage_warnings = [w for w in caught if "usage" in str(w.message).lower()]
         assert usage_warnings == []
         assert result == "ok"
+
+
+class TestReactAgentEndStrategyRetryWins:
+    """Story 17-5: pins v2's 'exhaustive'-strategy retry-wins invariant.
+
+    `RuntimeConfig.end_strategy` defaults to ``"exhaustive"`` and is always passed
+    explicitly to ``Agent(...)`` (`agent.py`), so pydantic-ai's own constructor
+    default (which flipped `'early'`->`'graceful'` in v2) never applies here -- but
+    v2's *implementation* of `'exhaustive'` itself changed underneath that default.
+    v2 moved tool-call processing into `pydantic_ai/_tool_execution.py`
+    (`_ExhaustiveProcessor`, `_apply_retry_wins`, `_is_retry_wins_trigger`): when a
+    function tool call in the same round as an already-successful output tool call
+    produces a `RetryPromptPart` (from `ModelRetry` or arg-validation failure), the
+    output is suppressed and the run stays open for a further model turn. The pinned
+    v1.107.0 baseline (`pydantic_ai/_agent_graph.py::process_tool_calls`) has no code
+    path that reads a function tool's `RetryPromptPart` to affect an already-set
+    `final_result` -- the output would win immediately, ending the run on that turn.
+    """
+
+    @pytest.mark.asyncio
+    async def test_exhaustive_strategy_keeps_run_open_when_a_concurrent_function_tool_retries(
+        self, monkeypatch
+    ):
+        from pydantic import BaseModel
+        from pydantic_ai import ModelRetry
+        from pydantic_ai.messages import ModelResponse, ToolCallPart
+        from pydantic_ai.models.function import AgentInfo, FunctionModel
+
+        # google-gla is a non-native provider: get_output_type() returns the raw
+        # BaseModel unwrapped, so pydantic-ai uses tool-based (ToolOutput) output --
+        # the model must emit a discrete output ToolCallPart, matching the scenario.
+        # The API key is never dereferenced: FunctionModel replaces the real model
+        # before any run happens.
+        monkeypatch.setenv("GOOGLE_API_KEY", "test-key")
+
+        class RouteDecision(BaseModel):
+            target: str
+
+        config = ReactAgentConfig(
+            model_cfg=ModelConfig(provider="google-gla", model="gemini-2.0-flash"),
+        )
+        assert config.runtime_cfg.end_strategy == "exhaustive"
+        agent = ReactAgent(config=config, result_type=RouteDecision)
+
+        @agent.pydantic_agent.tool_plain
+        def flaky_tool(value: str) -> str:
+            raise ModelRetry("needs correction")
+
+        call_count = 0
+
+        def stub_model(messages: list, info: AgentInfo) -> ModelResponse:
+            nonlocal call_count
+            call_count += 1
+            output_tool_name = info.output_tools[0].name
+            if call_count == 1:
+                # One round, two tool calls: an already-valid output AND a function
+                # tool call that will retry.
+                return ModelResponse(
+                    parts=[
+                        ToolCallPart(
+                            tool_name=output_tool_name,
+                            args={"target": "billing"},
+                            tool_call_id="out-1",
+                        ),
+                        ToolCallPart(
+                            tool_name="flaky_tool",
+                            args={"value": "x"},
+                            tool_call_id="fn-1",
+                        ),
+                    ]
+                )
+            # Second turn: no more function tool calls, so nothing can retry-win --
+            # this output finalizes the run.
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name=output_tool_name,
+                        args={"target": "billing"},
+                        tool_call_id="out-2",
+                    )
+                ]
+            )
+
+        with agent.pydantic_agent.override(model=FunctionModel(stub_model)):
+            result = await agent.run("route this")
+
+        # Under v1.107.0, the first turn's output would have won immediately
+        # (call_count == 1). Under the real v2 install, `flaky_tool`'s ModelRetry
+        # sets `retry_wins_triggered`, `_apply_retry_wins` nulls the already-set
+        # `final_result`, and the graph loops for a second model turn.
+        assert call_count == 2
+        assert result == RouteDecision(target="billing")
 
 
 class TestReactAgentRun:
@@ -871,7 +1045,11 @@ class TestReactAgentTokenBudgetEnforcement:
             with pytest.raises(UsageLimitError) as exc_info:
                 agent.run_sync("third")
         assert agent._agent_usage.total_tokens == 120
-        assert str(exc_info.value) == "Exceeded the total_tokens_limit of 100 (total_tokens=120)"
+        # pydantic-ai v2 appends a docs-hint suffix to UsageLimitExceeded; ADR-013 only
+        # requires the prefix to keep matching.
+        assert str(exc_info.value).startswith(
+            "Exceeded the total_tokens_limit of 100 (total_tokens=120)"
+        )
 
     def test_input_tokens_limit_blocks_independently(self):
         """Test input_tokens_limit is live on its own, not only via the total."""
@@ -881,7 +1059,11 @@ class TestReactAgentTokenBudgetEnforcement:
             agent.run_sync("second")
             with pytest.raises(UsageLimitError) as exc_info:
                 agent.run_sync("third")
-        assert str(exc_info.value) == "Exceeded the input_tokens_limit of 100 (input_tokens=120)"
+        # pydantic-ai v2 appends a docs-hint suffix to UsageLimitExceeded; ADR-013 only
+        # requires the prefix to keep matching.
+        assert str(exc_info.value).startswith(
+            "Exceeded the input_tokens_limit of 100 (input_tokens=120)"
+        )
 
     def test_output_tokens_limit_blocks_independently(self):
         """Test output_tokens_limit is live on its own — output tokens only here."""
@@ -891,7 +1073,11 @@ class TestReactAgentTokenBudgetEnforcement:
             agent.run_sync("second")
             with pytest.raises(UsageLimitError) as exc_info:
                 agent.run_sync("third")
-        assert str(exc_info.value) == "Exceeded the output_tokens_limit of 100 (output_tokens=120)"
+        # pydantic-ai v2 appends a docs-hint suffix to UsageLimitExceeded; ADR-013 only
+        # requires the prefix to keep matching.
+        assert str(exc_info.value).startswith(
+            "Exceeded the output_tokens_limit of 100 (output_tokens=120)"
+        )
 
     def test_a_run_may_overshoot_the_budget(self):
         """Test the contract is "do not START once spent", not "never exceed".
@@ -1024,7 +1210,11 @@ class TestReactAgentTokenBudgetRestore:
         with patch.object(agent._pydantic_agent, "iter", side_effect=_stub_run_spending(1)):
             with pytest.raises(UsageLimitError) as exc_info:
                 agent.run_sync("one run too many")
-        assert str(exc_info.value) == "Exceeded the total_tokens_limit of 40 (total_tokens=45)"
+        # pydantic-ai v2 appends a docs-hint suffix to UsageLimitExceeded; ADR-013 only
+        # requires the prefix to keep matching.
+        assert str(exc_info.value).startswith(
+            "Exceeded the total_tokens_limit of 40 (total_tokens=45)"
+        )
 
     def test_restored_agent_below_its_limit_spends_only_the_remainder(self):
         """Test the seeded total is the budget's starting point, not a blanket block."""

@@ -806,9 +806,11 @@ aggregated token counts and calls `calc_price(usage, model_ref=model_name,
 provider_id=provider_name or None)`. An unmatched `model_ref` raises `LookupError`, which
 is caught and mapped to `0.0` — unpriced models still have their tokens aggregated.
 
-Because pricing comes from `genai-prices`' bundled snapshot, refreshing prices means
-bumping the `genai-prices` version pin in `pyproject.toml` (no live/auto-update is wired
-into this package).
+Because pricing comes from `genai-prices`' bundled snapshot, prices are only as current as
+the installed `genai-prices` release (no live/auto-update is wired into this package). The
+dependency therefore carries **no upper bound** — capping it would freeze the price table
+and make this package report stale costs. Refreshing prices means resolving a newer
+`genai-prices`, not editing a pin.
 
 ### Aggregation
 
