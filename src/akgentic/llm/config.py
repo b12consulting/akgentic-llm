@@ -49,7 +49,10 @@ class ModelConfig(BaseModel):
     - Anthropic: ANTHROPIC_API_KEY
     - Google: GOOGLE_API_KEY or GEMINI_API_KEY (one is required; ADC is not consulted)
     - Mistral: MISTRAL_API_KEY
-    - NVIDIA: NVIDIA_API_KEY
+    - NVIDIA: OPENAI_API_KEY (no api_key is passed to OpenAIProvider, so its own
+      OPENAI_API_KEY fallback applies; a missing key surfaces as a 401 at request
+      time, not at construction). Endpoint from NVIDIA_BASE_URL, which defaults to
+      https://integrate.api.nvidia.com/v1
 
     Attributes:
         provider: LLM provider name
@@ -490,7 +493,11 @@ class RuntimeConfig(BaseModel):
     Attributes:
         retries: Number of retry attempts for tool call failures and output validation errors
         end_strategy: Tool execution termination strategy
-        parallel_tool_calls: Enable concurrent tool execution when model supports it
+        parallel_tool_calls: Accepted and validated, but read by nothing in this package.
+            ReactAgent reads only retries, end_strategy and http_client_config off
+            runtime_cfg, and never derives a parallel_tool_calls model setting from it.
+            create_model_settings() is the only function that emits that setting; it takes
+            a ModelConfig, never a RuntimeConfig, and has no call site here.
         http_client_config: HTTP client configuration for API communication
             (timeout and retry settings)
 
@@ -538,7 +545,10 @@ class RuntimeConfig(BaseModel):
 
     parallel_tool_calls: bool = Field(
         default=True,
-        description="Enable parallel tool execution when model supports concurrent calls",
+        description=(
+            "Accepted and validated, but read by nothing in this package: ReactAgent "
+            "never derives a parallel_tool_calls model setting from it"
+        ),
     )
 
     http_client_config: HttpClientConfig = Field(

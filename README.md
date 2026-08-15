@@ -304,7 +304,7 @@ Three things the shim deliberately does **not** do:
 |-------|------|---------|-------------|
 | `retries` | `int` | `3` | Retry attempts for tool failures and output validation errors |
 | `end_strategy` | `Literal["early","exhaustive"]` | `"exhaustive"` | Tool execution termination |
-| `parallel_tool_calls` | `bool` | `True` | Concurrent tool execution when provider supports it |
+| `parallel_tool_calls` | `bool` | `True` | Accepted and validated, but read by nothing — see the note below |
 | `http_client_config` | `HttpClientConfig` | `HttpClientConfig()` | HTTP timeout and retry tuning |
 
 **End strategies:**
@@ -319,8 +319,13 @@ won. The forced extra turn is charged to `run_usage_limits` (`run_request_limit`
 `total_tokens_limit`), so a run that finished cleanly on v1 can raise `UsageLimitError` on v2 if
 that turn pushes it past a run-tier ceiling. See [Usage limits](#usage-limits).
 
-> **Note:** `parallel_tool_calls` is silently forced to `False` for providers without native
-> structured output (google-gla, mistral, non-openai NVIDIA). See [Providers](#providers).
+> **Note: `parallel_tool_calls` currently reaches no model.** `ReactAgent.__init__` reads only
+> `retries`, `end_strategy` and `http_client_config` off `runtime_cfg`, and never passes a
+> `parallel_tool_calls` model setting. The one function that emits that setting,
+> `create_model_settings()`, derives it from `ModelConfig` alone — it never sees a
+> `RuntimeConfig` — and has no call site in this package: it is an exported helper for callers
+> who build their own model, not part of `ReactAgent`'s construction path. Setting this field
+> changes nothing about how `ReactAgent` runs.
 
 `HttpClientConfig` fields: `timeout=120.0`, `max_retries=5`, `backoff_multiplier=0.5`,
 `backoff_max=60.0` — all configurable.
@@ -362,14 +367,20 @@ config = ReactAgentConfig(
 | OpenAI | `"openai"` | `OPENAI_API_KEY` | ✅ |
 | Azure OpenAI | `"azure"` | `AZURE_OPENAI_API_KEY`, `AZURE_OPENAI_ENDPOINT` | ✅ |
 | Anthropic | `"anthropic"` | `ANTHROPIC_API_KEY` | ✅ |
-| NVIDIA NIM (openai/* models) | `"nvidia"` | `NVIDIA_API_KEY` | ✅ |
-| NVIDIA NIM (other models) | `"nvidia"` | `NVIDIA_API_KEY` | ❌ |
+| NVIDIA NIM (openai/* models) | `"nvidia"` | `OPENAI_API_KEY` | ✅ |
+| NVIDIA NIM (other models) | `"nvidia"` | `OPENAI_API_KEY` | ❌ |
 | Google Gemini | `"google-gla"` | `GOOGLE_API_KEY` **or** `GEMINI_API_KEY` (one is mandatory) | ❌ |
 | Mistral AI | `"mistral"` | `MISTRAL_API_KEY` | ❌ |
 
 Providers without native structured output use pydantic-ai's prompt-based extraction fallback.
-`parallel_tool_calls` is automatically disabled for these providers to prevent malformed
-tool-call responses.
+
+> **NVIDIA reads `OPENAI_API_KEY`, and a missing key fails late.** `_create_nvidia_model` builds
+> `OpenAIProvider(base_url=..., http_client=...)` and passes **no** `api_key`, so pydantic-ai's
+> `OpenAIProvider` falls back to `OPENAI_API_KEY`. There is no `NVIDIA_API_KEY` lookup anywhere
+> in this package. Because a `base_url` **is** supplied, a missing key does not raise at
+> construction — pydantic-ai substitutes the placeholder key `'api-key-not-set'` and the failure
+> surfaces as a **401 at request time**, not as a configuration error. The endpoint comes from
+> `NVIDIA_BASE_URL`, defaulting to `https://integrate.api.nvidia.com/v1`.
 
 > **Google is API-key only.** The provider factory reads `GOOGLE_API_KEY`, falling back to
 > `GEMINI_API_KEY`, and raises `ValueError` when neither is set. Application Default
@@ -509,9 +520,11 @@ agent = ReactAgent(
   what compaction folded away.
 - A capability that orphans a tool call/return pair — e.g. by splitting one while injecting
   content — is **not** left broken. pydantic-ai's own dangling-tool-call repair
-  (`_agent_graph._clean_message_history` with `repair_last_response=True`) runs on **every**
-  model request, **after** the capability chain, and synthesizes a matching `ToolReturnPart`
-  before the request reaches the provider.
+  (`_agent_graph._clean_message_history` with `repair_last_response=True`) runs on the model
+  request path, **after** the capability chain, and synthesizes a matching `ToolReturnPart`
+  before the request reaches the provider. One pydantic-ai path skips the repair: resuming a
+  provider-suspended response runs the capability chain without it. `ReactAgent` has no
+  deferred-tool or suspend flow, so every request `ReactAgent` itself issues is repaired.
   This is pydantic-ai's internal pipeline behaviour, **not a documented public guarantee**, and
   it could change in a future release — a capability should still avoid orphaning tool calls on
   purpose.
