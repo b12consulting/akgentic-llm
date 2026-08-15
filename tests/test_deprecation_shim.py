@@ -27,9 +27,14 @@ from akgentic.llm import (
 )
 from akgentic.llm.config import TokenUsageLimits
 
-# The release that deletes the shim. Every warning and docstring must name it, so
-# removing the shim is a scheduled task rather than an archaeological dig.
-REMOVAL_RELEASE = "2.0.0"
+# What every deprecation warning must communicate about the removal schedule.
+#
+# Deliberately NOT a version literal. The shim was announced for removal in 2.0.0;
+# 2.0.0 shipped as the pydantic-ai v2 bump with the shim still in it, and the old
+# assertions -- which pinned the string "2.0.0" -- stayed green while the message
+# they guarded had become false. Asserting on the *schedule clause* instead of a
+# version number is what makes these tests fail when the message stops being true.
+REMOVAL_SCHEDULE = "no removal release is scheduled"
 
 
 class TestDeprecatedUsageLimitsClass:
@@ -50,14 +55,14 @@ class TestDeprecatedUsageLimitsClass:
         deprecations = [w for w in caught if issubclass(w.category, DeprecationWarning)]
         assert len(deprecations) == 1
 
-    def test_construction_warning_names_replacement_and_release(self):
-        """The warning must tell the caller what to write instead, and by when."""
+    def test_construction_warning_names_replacement_and_schedule(self):
+        """The warning must tell the caller what to write instead, and the schedule."""
         with pytest.warns(DeprecationWarning) as record:
             UsageLimits(request_limit=10)
         message = str(record[0].message)
         assert "RunUsageLimits" in message
         assert "run_request_limit" in message
-        assert REMOVAL_RELEASE in message
+        assert REMOVAL_SCHEDULE in message
 
     def test_construction_warning_points_at_the_caller(self):
         """stacklevel must blame the caller's line, not config.py.
@@ -80,7 +85,7 @@ class TestDeprecatedUsageLimitsClass:
         assert value == 10
         message = str(record[0].message)
         assert "run_request_limit" in message
-        assert REMOVAL_RELEASE in message
+        assert REMOVAL_SCHEDULE in message
 
     def test_request_limit_read_reflects_new_spelling(self):
         """The read path follows the field, whichever spelling set it."""
@@ -127,11 +132,6 @@ class TestDeprecatedUsageLimitsClass:
         """The deprecated alias keeps the run tier's 50-request safety brake."""
         with pytest.warns(DeprecationWarning):
             assert UsageLimits().run_request_limit == 50
-
-    def test_docstring_names_the_removal_release(self):
-        """Removing the shim must be a scheduled task, not an archaeological one."""
-        assert UsageLimits.__doc__ is not None
-        assert REMOVAL_RELEASE in UsageLimits.__doc__
 
     def test_validate_from_instance_skips_the_shim_entirely(self):
         """Revalidating an existing instance neither re-warns nor re-maps.
@@ -192,13 +192,13 @@ class TestDeprecatedUsageLimitsField:
             config = ReactAgentConfig(usage_limits=RunUsageLimits(run_request_limit=10))
         assert config.run_usage_limits.run_request_limit == 10
 
-    def test_keyword_warning_names_replacement_and_release(self):
-        """The warning must name the new field and the removal release."""
+    def test_keyword_warning_names_replacement_and_schedule(self):
+        """The warning must name the new field and the removal schedule."""
         with pytest.warns(DeprecationWarning) as record:
             ReactAgentConfig(usage_limits=RunUsageLimits(run_request_limit=10))
         message = str(record[0].message)
         assert "run_usage_limits" in message
-        assert REMOVAL_RELEASE in message
+        assert REMOVAL_SCHEDULE in message
 
     def test_keyword_warning_points_at_the_caller(self):
         """stacklevel must blame the caller's line, not config.py."""
@@ -216,7 +216,7 @@ class TestDeprecatedUsageLimitsField:
         assert value is config.run_usage_limits
         message = str(record[0].message)
         assert "run_usage_limits" in message
-        assert REMOVAL_RELEASE in message
+        assert REMOVAL_SCHEDULE in message
 
     def test_usage_limits_is_not_a_field(self):
         """The read accessor must be a computed view, never a second storage slot."""
@@ -252,17 +252,6 @@ class TestDeprecatedUsageLimitsField:
             config = ReactAgentConfig(usage_limits=limits)
         assert config.run_usage_limits is limits
         assert isinstance(config.run_usage_limits, UsageLimits)
-
-    def test_docstring_names_the_removal_release(self):
-        """The class docstring schedules the shim's deletion."""
-        assert ReactAgentConfig.__doc__ is not None
-        assert REMOVAL_RELEASE in ReactAgentConfig.__doc__
-
-    def test_read_accessor_docstring_names_the_removal_release(self):
-        """The accessor schedules its own deletion, not only the class docstring."""
-        doc = ReactAgentConfig.usage_limits.__doc__
-        assert doc is not None
-        assert REMOVAL_RELEASE in doc
 
     def test_mapping_value_maps_the_inner_pre_split_spelling(self):
         """A dict under the old keyword keeps its budget too.

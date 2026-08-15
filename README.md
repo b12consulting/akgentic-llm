@@ -51,8 +51,8 @@ call any LLM without coupling to a specific vendor or framework primitive.
 - **HTTP retry** — `create_http_client()` configures `AsyncTenacityTransport` with exponential
   backoff, jitter, and `Retry-After` header support; fast-fails on 4xx (except 429)
 - **Context management** — `ContextManager` tracks message history across multiple `run()` calls,
-  supports checkpoint/rewind for error recovery, and applies a sliding window (system messages
-  always preserved) when a message cap is configured
+  folds it into a summary on compaction or drops it outright on clear, and applies a sliding
+  window (system messages always preserved) when a message cap is configured
 - **Prompt utilities** — `PromptTemplate` for config-time `{placeholder}` rendering;
   `current_datetime_prompt` and `json_output_reminder_prompt` as ready-made dynamic prompts
 - **Multimodal** — `UserPrompt = str | list[str | BinaryContent]`; exported so `akgentic-agent`
@@ -75,12 +75,16 @@ ReactAgent
   │     └── return run.result.output
   │
   ├── context: ContextManager               # persistent message history
-  ├── checkpoint() / rewind()               # snapshot and restore context
+  ├── compact() / clear_context()           # fold history into a summary, or drop it
   └── system_prompt(func)                   # register dynamic system prompt
 ```
 
-**Module boundary:** `akgentic-llm` depends only on `pydantic-ai`, `httpx`, and `tenacity`.
-It MUST NOT import from `akgentic-core`, `akgentic-tool`, or `akgentic-agent`.
+**Runtime dependencies:** `pydantic-ai[mistral]>=2,<3`, `genai-prices>=0.1.0`, `pydantic>=2.0.0`,
+`httpx>=0.27.0`, `tenacity>=8.0.0`, `pyyaml>=6.0`. An optional `loadtest` extra pulls in the
+token-free mock agent's own `pyyaml` requirement.
+
+**Module boundary:** `akgentic-llm` MUST NOT import from `akgentic-core`, `akgentic-tool`, or
+`akgentic-agent`.
 
 ## Installation
 
@@ -154,7 +158,9 @@ print(result.title, result.points)
 | `temperature` | `float \| None` | `None` | 0.0–2.0; `None` = provider default |
 | `seed` | `int \| None` | `None` | Reproducible outputs (not all providers) |
 | `max_tokens` | `int \| None` | `None` | Max response tokens; `None` = provider max |
+| `context_length` | `int \| None` | `None` | Model context window; the budget that auto-triggers compaction. `None` = compaction off. Distinct from `max_tokens`, which caps output |
 | `reasoning_effort` | `Literal["low","medium","high"] \| None` | `None` | For o1/o3-style models only |
+| `fallback_models` | `list[ModelConfig]` | `[]` | Models tried in declaration order after this one on API failure — see [Fallback chain](#fallback-chain) |
 
 ```python
 from akgentic.llm import ModelConfig
@@ -195,6 +201,13 @@ from akgentic.llm import RunUsageLimits
 RunUsageLimits(run_request_limit=10, total_tokens_limit=5_000)  # tight budget
 RunUsageLimits(run_request_limit=None)                          # no safety brake
 ```
+
+> **A tool retry can cost you a request.** Under `end_strategy="exhaustive"` — the default —
+> pydantic-ai v2 lets a failing tool call suppress an already-successful output and continue
+> the run for another model turn (see [RuntimeConfig](#runtimeconfig)). That forced turn is
+> charged to this tier: it consumes one `run_request_limit` unit and its tokens count toward
+> `total_tokens_limit`. A run that completed on pydantic-ai v1 can therefore raise
+> `UsageLimitError` on v2 without the prompt or the tools having changed.
 
 #### AgentUsageLimits — `ReactAgentConfig.agent_usage_limits`
 
@@ -261,9 +274,11 @@ refuses the run before compaction can fire.
 
 #### Migrating from the pre-split surface
 
-> **Deprecated in 1.7.0, removed in 2.0.0.** The pre-split `UsageLimits` class and the
-> `ReactAgentConfig(usage_limits=...)` keyword still work and still carry your values
-> through to `run_usage_limits`, but every use emits a `DeprecationWarning`.
+> **Deprecated in 1.7.0. Still shipped — removal is not scheduled for a named release.**
+> The pre-split `UsageLimits` class and the `ReactAgentConfig(usage_limits=...)` keyword still
+> work and still carry your values through to `run_usage_limits`, but every use emits a
+> `DeprecationWarning`. The 2.0.0 major bump was driven by the move to pydantic-ai v2, not by
+> this deprecation; the shim shipped through it unchanged.
 
 | Before | After |
 |--------|-------|
@@ -295,6 +310,14 @@ Three things the shim deliberately does **not** do:
 **End strategies:**
 - `"early"` — stops after the first successful result (fast path)
 - `"exhaustive"` — runs all tool calls even when a result is available (complete data gathering)
+
+Under pydantic-ai v2, `"exhaustive"` also carries a **retry-wins** rule: when a function tool
+called in the same round as an already-successful output call raises `ModelRetry` — or fails
+argument validation — the output is **suppressed** and the run continues for another model turn
+instead of ending there. pydantic-ai 1.107 had no such rule; an already-successful output always
+won. The forced extra turn is charged to `run_usage_limits` (`run_request_limit`,
+`total_tokens_limit`), so a run that finished cleanly on v1 can raise `UsageLimitError` on v2 if
+that turn pushes it past a run-tier ceiling. See [Usage limits](#usage-limits).
 
 > **Note:** `parallel_tool_calls` is silently forced to `False` for providers without native
 > structured output (google-gla, mistral, non-openai NVIDIA). See [Providers](#providers).
@@ -341,12 +364,16 @@ config = ReactAgentConfig(
 | Anthropic | `"anthropic"` | `ANTHROPIC_API_KEY` | ✅ |
 | NVIDIA NIM (openai/* models) | `"nvidia"` | `NVIDIA_API_KEY` | ✅ |
 | NVIDIA NIM (other models) | `"nvidia"` | `NVIDIA_API_KEY` | ❌ |
-| Google Gemini | `"google-gla"` | `GOOGLE_API_KEY` or `GOOGLE_APPLICATION_CREDENTIALS` | ❌ |
+| Google Gemini | `"google-gla"` | `GOOGLE_API_KEY` **or** `GEMINI_API_KEY` (one is mandatory) | ❌ |
 | Mistral AI | `"mistral"` | `MISTRAL_API_KEY` | ❌ |
 
 Providers without native structured output use pydantic-ai's prompt-based extraction fallback.
 `parallel_tool_calls` is automatically disabled for these providers to prevent malformed
 tool-call responses.
+
+> **Google is API-key only.** The provider factory reads `GOOGLE_API_KEY`, falling back to
+> `GEMINI_API_KEY`, and raises `ValueError` when neither is set. Application Default
+> Credentials are not consulted, so an ADC-only deployment does not work.
 
 ```python
 # NVIDIA NIM — openai-compatible model (native output)
@@ -400,7 +427,7 @@ class ReactAgent:
         result_type: type[Any] = str,         # default output type
         observer: ContextObserver | None = None,
         capabilities: Sequence[AgentCapability[Any]] | None = None,  # pydantic-ai AgentCapability sequence
-        event_loop: asyncio.AbstractEventLoop | None = None,
+        event_loop: asyncio.AbstractEventLoop | None = None,  # DEPRECATED — accepted and ignored
     ) -> None: ...
 
     # Execution
@@ -411,12 +438,19 @@ class ReactAgent:
     @property
     def context(self) -> ContextManager: ...
     def subscribe_context(self, observer: ContextObserver) -> None: ...
-    def checkpoint(self, checkpoint_id: str | None = None) -> ContextSnapshot: ...
-    def rewind(self, checkpoint_id: str) -> None: ...
+    def restore_context(self, events: Sequence[EventMessage]) -> None: ...
+
+    # Context compaction (see Context Compaction)
+    def compact(self) -> str: ...         # force a fold now, bypassing the budget gate
+    def clear_context(self) -> str: ...   # drop history; system prompt regenerates next run
 
     # Dynamic prompts and tools (decorator API)
-    def system_prompt(self, func: Any) -> Any: ...  # wraps @agent.system_prompt(dynamic=True)
-    def tool(self, func: Any) -> Any: ...            # wraps @agent.tool()
+    def system_prompt(self, func: F) -> F: ...  # wraps @agent.system_prompt(dynamic=True)
+    def tool(self, func: F) -> F: ...            # wraps @agent.tool()
+
+    # Teardown
+    async def aclose(self) -> None: ...  # release the httpx pool; leaves the loop open
+    def close(self) -> None: ...         # full synchronous teardown; idempotent
 
     # Advanced
     @property
@@ -425,6 +459,13 @@ class ReactAgent:
 
 `output_type` in `run()` overrides the construction-time `result_type` for that call only.
 Both are wrapped with `get_output_type()` to apply the provider-aware `NativeOutput` strategy.
+
+`event_loop=` is **deprecated and ignored**: `ReactAgent.__init__` always creates and owns its
+own loop, and `run_sync()` runs on that one. It is kept in the signature for one release so
+callers can stop passing it without a flag day.
+
+`ReactAgent.__init__` creates that loop eagerly, so an agent built and discarded without
+`close()` leaks it. Call `close()` (or `await aclose()` then `close()`) when you are done.
 
 ## Capabilities
 
@@ -466,9 +507,14 @@ agent = ReactAgent(
   rewrites messages first, the result is passed as `message_history`, and only then does the
   capability chain run. A capability sees only the **post-compaction** history — it never sees
   what compaction folded away.
-- The framework does **not** re-run its orphan `role=tool` fold after capabilities run. A
-  capability that reintroduces one — e.g. by splitting a tool call/return pair while injecting
-  content — produces a request OpenAI rejects.
+- A capability that orphans a tool call/return pair — e.g. by splitting one while injecting
+  content — is **not** left broken. pydantic-ai's own dangling-tool-call repair
+  (`_agent_graph._clean_message_history` with `repair_last_response=True`) runs on **every**
+  model request, **after** the capability chain, and synthesizes a matching `ToolReturnPart`
+  before the request reaches the provider.
+  This is pydantic-ai's internal pipeline behaviour, **not a documented public guarantee**, and
+  it could change in a future release — a capability should still avoid orphaning tool calls on
+  purpose.
 
 ## Multimodal Prompts
 
@@ -514,13 +560,8 @@ agent.run_sync("Start the analysis.")
 # Second turn — model sees the previous exchange
 agent.run_sync("Now summarise your findings.")
 
-# Checkpoint before a risky operation
-snap = agent.checkpoint("before-migration")
-
-try:
-    agent.run_sync("Apply the database migration plan.")
-except Exception:
-    agent.rewind("before-migration")   # restore to known-good state
+# Inspect what the model will see next
+print(len(agent.context.messages))
 ```
 
 ### ContextManager
@@ -531,22 +572,37 @@ from akgentic.llm import ContextManager
 # With optional sliding window (system messages always preserved)
 ctx = ContextManager(max_messages=20)
 
-ctx.add_message(msg)
-ctx.checkpoint("id", metadata={"note": "pre-flight"})
-ctx.rewind("id")
-ctx.get_checkpoint("id")     # → ContextSnapshot | None
-ctx.list_checkpoints()       # → list[str] in creation order
+# History
+ctx.add_message(msg)          # append + notify observers (message, tool and usage events)
+ctx.messages                  # → list[ModelMessage] — a shallow copy, safe to hold
+ctx.last_input_tokens         # → int | None — provider-reported size of the last response
+
+# Observers
 ctx.subscribe(observer)
 ctx.unsubscribe(observer)
-ctx.clear()
+
+# Operator actions recorded outside a run
+ctx.record_operator_action("…")     # buffered before the first run, appended after it
+ctx.drain_pending_operator_actions()  # → list[str]; ReactAgent.run folds these into the prompt
+
+# System-prompt rendering (see System Prompt Rendering Events)
+ctx.record_system_prompt(run_id)
+ctx.seed_system_prompt_hash(content_hash)   # restore dedup state without re-emitting
+
+# Compaction and reset
+ContextManager.fold_compaction(messages, event)  # static; the shared live/replay fold
+ctx.compact(event)            # apply the fold and emit LlmContextCompactedEvent
+ctx.clear_context()           # → int removed; emits LlmContextClearedEvent
+ctx.restore(messages)         # bulk replace, no observers, no window
+ctx.clear()                   # drop every message, silently
 ```
 
 ### Observer Pattern
 
 ```python
 from akgentic.llm import (
-    ContextObserver, LlmMessageEvent, LlmCheckpointCreatedEvent,
-    LlmUsageEvent, LlmSystemPromptEvent, ToolCallEvent, ToolReturnEvent,
+    ContextObserver, LlmMessageEvent, LlmUsageEvent, LlmSystemPromptEvent,
+    LlmContextCompactedEvent, LlmContextClearedEvent, ToolCallEvent, ToolReturnEvent,
 )
 
 class MyObserver:
@@ -564,16 +620,17 @@ class MyObserver:
                 print(f"  [{part.dynamic_ref or 'static'}] {part.content}")
         elif isinstance(event, LlmMessageEvent):
             print(f"New message: {event.message}")
-        elif isinstance(event, LlmCheckpointCreatedEvent):
-            print(f"Checkpoint created: {event.snapshot.checkpoint_id}")
+        elif isinstance(event, LlmContextCompactedEvent):
+            print(f"Compacted {event.replaced_message_count} msg(s) via '{event.strategy_id}'")
+        elif isinstance(event, LlmContextClearedEvent):
+            print(f"Cleared {event.cleared_message_count} msg(s)")
 
 agent = ReactAgent(config=config, observer=MyObserver())
 # or: agent.subscribe_context(MyObserver())
 ```
 
 Events: `LlmMessageEvent`, `LlmUsageEvent`, `LlmSystemPromptEvent`,
-`LlmCheckpointCreatedEvent`, `LlmCheckpointRestoredEvent`, `ToolCallEvent`,
-`ToolReturnEvent`.
+`LlmContextCompactedEvent`, `LlmContextClearedEvent`, `ToolCallEvent`, `ToolReturnEvent`.
 Observers are notified synchronously — exceptions propagate to the caller.
 
 ### Tool Event Observability
@@ -664,8 +721,8 @@ replaced `ModelMessage` objects — so the log round-trips through the generic s
 any subscriber can fold the same change client-side.
 
 Compaction can fire **automatically** (usage-based: when the provider-reported input tokens
-cross `trigger_ratio × context_length`, no tokenizer required) or **on demand** via the
-agent's `compact` / `clear` commands.
+cross `trigger_ratio × context_length`, no tokenizer required) or **on demand** via
+`ReactAgent.compact()` and `ReactAgent.clear_context()`.
 
 ### Compaction & Clear Events
 
@@ -864,6 +921,8 @@ print(tpl.render())
 Register callables that are evaluated fresh on every LLM call:
 
 ```python
+from typing import Any
+
 from akgentic.llm import ReactAgent, ReactAgentConfig, ModelConfig
 from akgentic.llm import current_datetime_prompt, json_output_reminder_prompt
 
@@ -917,11 +976,14 @@ uv run mypy packages/akgentic-llm/src/
 
 Every pull request runs the full quality gate via GitHub Actions (`.github/workflows/ci.yml`):
 
+CI checks out this repository standalone — not the workspace — so its commands use
+repo-relative paths, unlike the workspace-root invocations under [Commands](#commands) above.
+
 | Step | Command | Gate |
 |------|---------|------|
-| Type check | `mypy packages/akgentic-llm/src/` (strict, Python 3.12) | Zero errors |
-| Lint | `ruff check packages/akgentic-llm/src/` | Zero errors |
-| Tests | `pytest packages/akgentic-llm/tests/ --cov=akgentic.llm --cov-fail-under=80` | All pass, ≥ 80% coverage |
+| Type check | `uv run mypy src/` (strict, Python 3.12) | Zero errors |
+| Lint | `uv run ruff check src/` | Zero errors |
+| Tests | `uv run pytest tests/ --cov=akgentic.llm --cov-report=term-missing --cov-report=json:coverage.json --cov-fail-under=80` | All pass, ≥ 80% coverage |
 
 The CI badge at the top of this README reflects the current state of `master`. PRs are
 blocked from merging until all steps are green.
@@ -932,18 +994,25 @@ blocked from merging until all steps are green.
 src/akgentic/llm/
     __init__.py     # Public API exports
     agent.py        # ReactAgent, UsageLimitError, UserPrompt type alias
+    compaction.py   # COMPACTION_STRATEGIES, SUMMARY_INSTRUCTIONS, CompactionStrategy,
+                    #   CompactionResult, create_compaction()
     config.py       # ModelConfig, CompactionConfig, TokenUsageLimits, RunUsageLimits,
-                    #   AgentUsageLimits, HttpClientConfig, RuntimeConfig,
-                    #   ReactAgentConfig, _supports_native_output()
-    context.py      # ContextManager, ContextSnapshot
-    event.py        # LlmMessageEvent, LlmUsageEvent, LlmCheckpoint*Event,
-                    #   LlmSystemPromptEvent, SystemPromptPartSnapshot,
-                    #   ToolCallEvent, ToolReturnEvent, ContextObserver protocol
+                    #   AgentUsageLimits, UsageLimits (deprecated), HttpClientConfig,
+                    #   RuntimeConfig, ReactAgentConfig, _supports_native_output()
+    context.py      # ContextManager
+    event.py        # LlmMessageEvent, LlmUsageEvent, LlmSystemPromptEvent,
+                    #   SystemPromptPartSnapshot, LlmContextCompactedEvent,
+                    #   LlmContextClearedEvent, ToolCallEvent, ToolReturnEvent,
+                    #   ContextObserver and EventMessage protocols
     pricing.py      # _compute_cost() (genai-prices), ModelUsage, RunUsageSummary,
                     #   AgentUsageSummary, aggregate_usage()
     prompts.py      # PromptTemplate, current_datetime_prompt, json_output_reminder_prompt
     providers.py    # create_model(), create_http_client(), get_output_type(),
                     #   create_model_settings()
+    loadtest/       # Optional `loadtest` extra: token-free mock agent
+        __init__.py
+        mock_agent.py
+        scenario.py
 tests/              # Tests organised by module
 ```
 

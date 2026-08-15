@@ -78,7 +78,7 @@ class ReactAgent:
 
     Example:
         >>> config = ReactAgentConfig(
-        ...     model=ModelConfig(provider="openai", model="gpt-4o")
+        ...     model_cfg=ModelConfig(provider="openai", model="gpt-4o")
         ... )
         >>> # Option 1: Pass observer at initialization
         >>> agent = ReactAgent(
