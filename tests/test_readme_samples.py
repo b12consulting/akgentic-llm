@@ -32,7 +32,7 @@ from typing import Any
 
 import pytest
 from pydantic import BaseModel
-from pydantic_ai import BinaryContent
+from pydantic_ai import BinaryContent, NativeOutput
 from pydantic_ai.capabilities import ProcessHistory
 from pydantic_ai.messages import ModelRequest, SystemPromptPart, UserPromptPart
 
@@ -58,8 +58,11 @@ from akgentic.llm import (
     SystemPromptPartSnapshot,
     ToolCallEvent,
     ToolReturnEvent,
+    UserPrompt,
     aggregate_usage,
+    create_compaction,
     current_datetime_prompt,
+    get_output_type,
     json_output_reminder_prompt,
 )
 
@@ -105,6 +108,21 @@ def agents() -> Any:
 
     for agent in built:
         agent.close()
+
+
+def _tool_names(agent: ReactAgent) -> set[str]:
+    """Tool names actually registered on the wrapped pydantic-ai agent.
+
+    ``Agent.toolsets`` is public and each function toolset keeps a ``tools``
+    mapping. Isolated in one helper so a pydantic-ai reshuffle is a one-line
+    repair rather than a hunt; if the attribute ever disappears this returns an
+    empty set and the samples go red, which is the honest signal — we would no
+    longer be able to prove a documented tool reaches the agent.
+    """
+    names: set[str] = set()
+    for toolset in agent.pydantic_agent.toolsets:
+        names.update(getattr(toolset, "tools", {}))
+    return names
 
 
 def _usage_event(run_id: str, model_name: str = "gpt-4o") -> LlmUsageEvent:
@@ -167,10 +185,17 @@ def test_quick_start_tools_and_output_type_sample(agents: Any) -> None:
     assert agent._config.model_cfg.provider == "anthropic"
     assert agent._config.run_usage_limits.run_request_limit == 10
     assert agent._config.run_usage_limits.total_tokens_limit == 20_000
-    # The sample passes output_type=Summary to run_sync; verify the type is usable
-    # as an output type rather than issuing the request.
-    assert issubclass(Summary, BaseModel)
-    assert fetch_data("x").startswith("Latest data on x")
+
+    # The sample passes output_type=Summary to run_sync. Issuing the request would
+    # contact Anthropic, so what is checked instead is the documented wrapping path
+    # (§ReactAgent API: "Both are wrapped with get_output_type()"): a provider with
+    # native structured output must yield a NativeOutput wrapper, not the bare type.
+    wrapped = get_output_type(agent._config.model_cfg, Summary)
+    assert isinstance(wrapped, NativeOutput)
+
+    # The tool the sample passes must reach the wrapped agent, not merely be accepted
+    # by the constructor.
+    assert "fetch_data" in _tool_names(agent)
 
 
 # ---------------------------------------------------------------------------
@@ -539,23 +564,28 @@ def test_capabilities_process_history_sample(agents: Any) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_multimodal_prompt_sample(agents: Any) -> None:
+def test_multimodal_prompt_sample() -> None:
     """§Multimodal Prompts — the documented prompt shape.
 
     The README opens ``diagram.png``; there is no such file in the repo, so the
-    bytes are produced in memory. What is under test is that the resulting
-    ``[str, BinaryContent]`` list is a valid ``UserPrompt``.
-    """
-    agents(ReactAgentConfig(model_cfg=ModelConfig(provider="openai", model="gpt-4o")))
+    bytes are produced in memory.
 
+    ``isinstance`` on a string literal and on a ``BinaryContent`` the test itself
+    just built cannot fail, so it proves nothing. What is checked instead is that
+    the keyword names the README uses land in the fields it claims — the same
+    silently-discarded-keyword trap that made ``ReactAgentConfig(model=...)``
+    configure nothing — and that the pair matches the exported ``UserPrompt``.
+    """
     image_bytes = b"\x89PNG\r\n\x1a\n"  # in-memory stand-in for diagram.png
 
-    prompt = [
-        "Describe what is shown in this architecture diagram.",
-        BinaryContent(data=image_bytes, media_type="image/png"),
-    ]
-    assert isinstance(prompt[0], str)
-    assert isinstance(prompt[1], BinaryContent)
+    image = BinaryContent(data=image_bytes, media_type="image/png")
+    prompt: UserPrompt = ["Describe what is shown in this architecture diagram.", image]
+
+    assert image.data == image_bytes
+    assert image.media_type == "image/png"
+    assert image.is_image
+    # UserPrompt = str | list[str | BinaryContent]; the list form is the one here.
+    assert prompt[1] is image
 
 
 # ---------------------------------------------------------------------------
@@ -719,14 +749,35 @@ def test_observer_sample_imports_and_dispatches() -> None:
 
 
 def test_observer_is_accepted_at_construction_and_via_subscribe(agents: Any) -> None:
-    """§Observer Pattern — both documented wiring routes work."""
+    """§Observer Pattern — both documented wiring routes actually deliver events.
+
+    Constructing without raising proves nothing here: this test was written that
+    way first, and deleting ``self._context.subscribe(observer)`` from
+    ``ReactAgent.__init__`` left it green. Each route is therefore driven with a
+    real message and the observer must have been notified.
+    """
 
     class MyObserver:
-        def notify_event(self, event: object) -> None: ...
+        def __init__(self) -> None:
+            self.events: list[object] = []
+
+        def notify_event(self, event: object) -> None:
+            self.events.append(event)
 
     config = ReactAgentConfig(model_cfg=ModelConfig(provider="openai", model="gpt-4o"))
-    agents(config, observer=MyObserver())
-    agents(config).subscribe_context(MyObserver())
+    message = ModelRequest(parts=[UserPromptPart(content="hi")])
+
+    # Route 1 — observer= at construction.
+    at_construction = MyObserver()
+    agents(config, observer=at_construction).context.add_message(message)
+    assert any(isinstance(e, LlmMessageEvent) for e in at_construction.events)
+
+    # Route 2 — subscribe_context() afterwards.
+    via_subscribe = MyObserver()
+    later = agents(config)
+    later.subscribe_context(via_subscribe)
+    later.context.add_message(message)
+    assert any(isinstance(e, LlmMessageEvent) for e in via_subscribe.events)
 
 
 def test_system_prompt_tracer_sample() -> None:
@@ -821,9 +872,18 @@ def test_compaction_tracer_sample(agents: Any) -> None:
     assert "900 → 120 tok est." in lines[0]
     assert lines[2] == "cleared @ run r1: dropped 6 msg(s)"
 
+    # Both documented wiring routes, each proven by an event actually arriving —
+    # a tracer that is merely accepted by the constructor traces nothing.
     config = ReactAgentConfig(model_cfg=ModelConfig(provider="openai", model="gpt-4o"))
-    agents(config, observer=CompactionTracer())
-    agents(config).subscribe_context(CompactionTracer())
+    agent = agents(config, observer=tracer)
+    before = len(lines)
+    agent.context.clear_context()
+    assert len(lines) == before + 1
+
+    subscribed = agents(config)
+    subscribed.subscribe_context(tracer)
+    subscribed.context.clear_context()
+    assert len(lines) == before + 2
 
 
 def test_compaction_config_sample() -> None:
@@ -860,39 +920,54 @@ async def test_custom_compaction_strategy_sample() -> None:
                 summary="", replaced_message_count=max(0, len(messages) - 1)
             )
 
+    model_cfg = ModelConfig(provider="openai", model="gpt-4o")
     original = dict(COMPACTION_STRATEGIES)
     try:
-        # (a) register a factory under a short id...
+        # (a) register a factory under a short id. ``strategy`` is a plain str field
+        # with no validator, so reading it back proves nothing; what the README
+        # promises is that the FRAMEWORK resolves through the registry.
         COMPACTION_STRATEGIES["keep_last"] = lambda cfg, model_cfg, http_client: KeepLastOnly()
         cfg = CompactionConfig(strategy="keep_last")
-        assert cfg.strategy == "keep_last"
-        assert "keep_last" in COMPACTION_STRATEGIES
+        assert isinstance(create_compaction(cfg, model_cfg), KeepLastOnly)
 
         # The registered strategy really is a CompactionStrategy.
         result = await KeepLastOnly().compact([1, 2, 3])
         assert result.replaced_message_count == 2
 
-        # (b) ...or point strategy at a dotted FQCN — no registration needed
+        # (b) ...or point strategy at a dotted FQCN — no registration needed. That
+        # branch is taken only when the id contains a dot: an importable-looking id
+        # goes to importlib, while a bare unknown id is rejected outright.
         cfg = CompactionConfig(strategy="my_package.compaction.KeepLastOnly")
-        assert cfg.strategy == "my_package.compaction.KeepLastOnly"
+        with pytest.raises(ModuleNotFoundError):
+            create_compaction(cfg, model_cfg)
+        with pytest.raises(ValueError, match="Unknown compaction strategy"):
+            create_compaction(CompactionConfig(strategy="not_registered"), model_cfg)
     finally:
         COMPACTION_STRATEGIES.clear()
         COMPACTION_STRATEGIES.update(original)
 
 
 def test_summary_instructions_override_sample() -> None:
-    """§Overriding the Summarizer Prompt — both documented override routes."""
+    """§Overriding the Summarizer Prompt — both documented override routes.
+
+    Asserting that the key you just wrote is back in the dict cannot fail. The
+    README's actual promise is that the framework reaches the registry *through*
+    ``CompactionConfig.summarizer_prompt_version``, so that is what is pinned —
+    including the part a reader cannot see: that "v1" is the id a default config
+    asks for, which is the only reason overriding "v1" reaches every agent.
+    """
+    legal = "You are a summarizer for legal documents. Preserve …"
     original = dict(SUMMARY_INSTRUCTIONS)
     try:
         # (a) replace the default in place — every "v1" agent picks it up
-        SUMMARY_INSTRUCTIONS["v1"] = "You are a summarizer for legal documents. Preserve …"
-        assert SUMMARY_INSTRUCTIONS["v1"].startswith("You are a summarizer")
+        SUMMARY_INSTRUCTIONS["v1"] = legal
+        assert CompactionConfig().summarizer_prompt_version == "v1"
+        assert SUMMARY_INSTRUCTIONS[CompactionConfig().summarizer_prompt_version] is legal
 
         # (b) register a named variant and select it per agent
-        SUMMARY_INSTRUCTIONS["legal"] = "You are a summarizer for legal documents. Preserve …"
+        SUMMARY_INSTRUCTIONS["legal"] = legal
         cfg = CompactionConfig(strategy="summarize", summarizer_prompt_version="legal")
-        assert cfg.summarizer_prompt_version == "legal"
-        assert "legal" in SUMMARY_INSTRUCTIONS
+        assert SUMMARY_INSTRUCTIONS[cfg.summarizer_prompt_version] is legal
     finally:
         SUMMARY_INSTRUCTIONS.clear()
         SUMMARY_INSTRUCTIONS.update(original)
@@ -915,7 +990,13 @@ def test_aggregate_usage_sample() -> None:
     ]
 
     summary = aggregate_usage(events)
-    assert f"Total cost: ${summary.total_cost_usd:.4f}".startswith("Total cost: $")
+    # The README prints f"Total cost: ${summary.total_cost_usd:.4f}". Asserting that
+    # THAT string starts with "Total cost: $" is a tautology — the needle is the
+    # f-string's own literal prefix. The falsifiable claim is that the attribute
+    # exists and is a real number; the amount itself is never pinned, because
+    # genai-prices ships the price table and it moves (Golden Rule #13).
+    assert isinstance(summary.total_cost_usd, float)
+    assert summary.total_cost_usd >= 0.0
     assert summary.total_input_tokens == 200
     assert summary.total_output_tokens == 100
     assert set(summary.by_model) == {"gpt-4o"}
