@@ -3,8 +3,8 @@
 [![CI](https://github.com/b12consulting/akgentic-llm/actions/workflows/ci.yml/badge.svg)](https://github.com/b12consulting/akgentic-llm/actions/workflows/ci.yml)
 [![Coverage](https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/gpiroux/dd80a44fe9e2e27b46f7f3431e19202f/raw/coverage.json)](https://github.com/b12consulting/akgentic-llm/actions/workflows/ci.yml)
 
-LLM integration layer for the [Akgentic](https://github.com/b12consulting/akgentic-quick-start)
-multi-agent framework. Wraps pydantic-ai's REACT execution loop with persistent context
+LLM integration layer for the [Akgentic](https://github.com/b12consulting/akgentic-framework)
+multi-agent framework (open-source bundle). Wraps pydantic-ai's REACT execution loop with persistent context
 management, production HTTP retry logic, and a clean provider abstraction — letting agents
 call any LLM without coupling to a specific vendor or framework primitive.
 
@@ -88,24 +88,54 @@ token-free mock agent's own `pyyaml` requirement.
 
 ## Installation
 
-### Workspace Installation (Recommended)
+Published on PyPI. Python 3.12 or newer.
 
 ```bash
-git clone git@github.com:b12consulting/akgentic-quick-start.git
-cd akgentic-quick-start
-git submodule update --init --recursive
-
-uv venv && source .venv/bin/activate
-uv sync --all-packages --all-extras
+uv add akgentic-llm
+# or
+pip install akgentic-llm
 ```
 
-### Standalone
+That is the whole install. `pydantic-ai`, `genai-prices`, `httpx`, `tenacity`
+and `pyyaml` come with it as ordinary dependencies — no workspace checkout, no
+submodules.
+
+### Optional Extras
+
+| Extra      | Packages pulled in | Enables                                            |
+|------------|--------------------|----------------------------------------------------|
+| `loadtest` | `pyyaml`           | `akgentic.llm.loadtest` — token-free scripted mock |
 
 ```bash
-cd packages/akgentic-llm
-uv venv && source .venv/bin/activate
-uv pip install -e ".[dev]"
+uv add "akgentic-llm[loadtest]"
 ```
+
+### As part of the framework bundle
+
+`akgentic-framework` is the meta-distribution that pins every akgentic package
+at versions built and tested together. Install `akgentic-llm` through it when
+you want the release-wide pin rather than a single package:
+
+```bash
+pip install "akgentic-framework[llm]"   # this package alone, release-pinned
+pip install "akgentic-framework[all]"   # the whole framework
+```
+
+### Working on the package itself
+
+To develop `akgentic-llm` rather than use it, clone the open-source bundle
+[akgentic-framework](https://github.com/b12consulting/akgentic-framework), which
+carries every package together as submodules:
+
+```bash
+git clone git@github.com:b12consulting/akgentic-framework.git
+cd akgentic-framework
+git submodule update --init
+# uncomment the two "SOURCE MODE" blocks in pyproject.toml
+uv sync
+```
+
+Source mode resolves `akgentic-*` to the local checkouts, editable.
 
 ## Quick Start
 
@@ -963,34 +993,34 @@ def workspace_context(ctx: Any) -> str:
 ### Setup
 
 ```bash
-uv sync --all-packages --all-extras
+uv sync --all-extras
 ```
 
 ### Commands
 
 ```bash
 # Run tests
-uv run pytest packages/akgentic-llm/tests/
+uv run pytest tests/
 
 # Run tests with coverage
-uv run pytest packages/akgentic-llm/tests/ --cov=akgentic.llm --cov-fail-under=80
+uv run pytest tests/ --cov=akgentic.llm --cov-fail-under=80
 
 # Lint
-uv run ruff check packages/akgentic-llm/src/
+uv run ruff check src/ tests/
 
 # Format
-uv run ruff format packages/akgentic-llm/src/
+uv run ruff format src/ tests/
 
 # Type check
-uv run mypy packages/akgentic-llm/src/
+uv run mypy src/
 ```
 
 ### CI Pipeline
 
 Every pull request runs the full quality gate via GitHub Actions (`.github/workflows/ci.yml`):
 
-CI checks out this repository standalone — not the workspace — so its commands use
-repo-relative paths, unlike the workspace-root invocations under [Commands](#commands) above.
+CI checks out this repository standalone and resolves `akgentic-*` dependencies
+from PyPI, so it runs the same repo-relative commands listed above.
 
 | Step | Command | Gate |
 |------|---------|------|
