@@ -59,7 +59,37 @@ def _evict_anyio_run_vars(loop: asyncio.AbstractEventLoop) -> None:
 
 
 class UsageLimitError(Exception):
-    """Raised when usage limits are exceeded during agent execution."""
+    """Raised when a usage limit is exceeded during agent execution.
+
+    Base of both tiers — catch this to handle either; catch a subclass to react to
+    one. Every breach raises one of the two subclasses below, never this class
+    directly, but it stays the documented catch-all: an ``except UsageLimitError``
+    written before the tiers were split still catches everything it used to
+    (ADR-016 §D1).
+    """
+
+    pass
+
+
+class RunUsageLimitError(UsageLimitError):
+    """One run() call exhausted its RunUsageLimits budget.
+
+    Requests, tool calls or tokens spent within the turn — pydantic-ai stopped the
+    run mid-graph. The agent may still have lifetime budget, so this is
+    **recoverable**: the turn may not call another tool, but the agent can be asked
+    to conclude with what it already gathered.
+    """
+
+    pass
+
+
+class AgentUsageLimitError(UsageLimitError):
+    """The agent has spent its AgentUsageLimits budget over its whole lifetime.
+
+    Raised pre-flight, by the token check or the run-count check, before the call
+    executes. **Terminal** for this agent — no follow-up run can be admitted,
+    because the budget that would pay for it is exactly the one that is spent.
+    """
 
     pass
 
@@ -232,9 +262,12 @@ class ReactAgent:
             Agent result output (type matches output_type if given, else result_type)
 
         Raises:
-            UsageLimitError: On either tier — the agent-lifetime budget (tokens or
-                runs) rejecting this call before it runs, or a run-tier limit
-                breached by pydantic-ai mid-run.
+            AgentUsageLimitError: If the agent-lifetime budget (tokens or runs)
+                rejects this call before it runs. Terminal for this agent.
+            RunUsageLimitError: If pydantic-ai breaches a run-tier limit mid-run.
+                Recoverable — the agent may still have lifetime budget.
+            Both subclass UsageLimitError, so a caller that does not care which tier
+            fired can keep catching the base.
         """
         # Pre-flight: reject before spending anything (a rejected run must not even
         # pay for compaction's summarizer call). Tokens first, so a token rejection
@@ -285,7 +318,7 @@ class ReactAgent:
 
         except UsageLimitExceeded as e:
             self._heal_unprocessed_tool_calls(traceback.format_exc())
-            raise UsageLimitError(str(e)) from e
+            raise RunUsageLimitError(str(e)) from e
         except Exception:
             self._heal_unprocessed_tool_calls(traceback.format_exc())
             raise
@@ -295,9 +328,10 @@ class ReactAgent:
 
         Builds a pydantic-ai ``UsageLimits`` from ``agent_usage_limits``' three token
         fields and reuses its ``check_tokens()`` against the lifetime accumulator, so
-        an agent-tier breach reads exactly like a run-tier one and nothing downstream
-        has to parse text to tell the tiers apart. Unset limits (the default, all
-        ``None``) make the check a no-op.
+        an agent-tier breach carries pydantic-ai's own message wording. The tier is
+        carried by the **class** — ``AgentUsageLimitError`` here, ``RunUsageLimitError``
+        at the run-tier site — so nothing downstream has to parse text to tell the
+        tiers apart. Unset limits (the default, all ``None``) make the check a no-op.
 
         **A run may overshoot the budget, by construction.** A run's token cost is
         unknown until it completes, so this is "do not start a run once the budget is
@@ -310,7 +344,8 @@ class ReactAgent:
         lifetime one (ADR-013 §Out of scope, reopened for the token tier).
 
         Raises:
-            UsageLimitError: If lifetime usage has already exceeded a token limit.
+            AgentUsageLimitError: If lifetime usage has already exceeded a token
+                limit. A subclass of UsageLimitError.
         """
         limits = self._config.agent_usage_limits
         pydantic_limits = PydanticUsageLimits(
@@ -321,7 +356,7 @@ class ReactAgent:
         try:
             pydantic_limits.check_tokens(self._agent_usage)
         except UsageLimitExceeded as e:
-            raise UsageLimitError(str(e)) from e
+            raise AgentUsageLimitError(str(e)) from e
 
     def _fold_run_usage(self, run: AgentRun[Any, Any]) -> None:
         """Add one completed run's token usage to the agent-lifetime accumulator.
@@ -343,7 +378,7 @@ class ReactAgent:
 
         Check-then-consume: the counter advances **before** the call executes, so a
         ``run()`` that fails partway — including one that raises the run-tier
-        ``UsageLimitError`` — has already been counted. That ordering is deliberate:
+        ``RunUsageLimitError`` — has already been counted. That ordering is deliberate:
         an agent whose run-tier limit fires repeatedly must also exhaust its
         agent-tier budget, since both mean "this agent is burning too many turns"
         (ADR-013 §D2). Do not move the increment after the call.
@@ -353,11 +388,12 @@ class ReactAgent:
         ``agent_request_limit=None`` never blocks.
 
         Raises:
-            UsageLimitError: If the agent has already used its lifetime run budget.
+            AgentUsageLimitError: If the agent has already used its lifetime run
+                budget. A subclass of UsageLimitError.
         """
         limit = self._config.agent_usage_limits.agent_request_limit
         if limit is not None and self._agent_run_count >= limit:
-            raise UsageLimitError(
+            raise AgentUsageLimitError(
                 f"Exceeded the agent_request_limit of {limit} (run_count={self._agent_run_count})"
             )
         self._agent_run_count += 1
@@ -525,7 +561,10 @@ class ReactAgent:
 
         Raises:
             RuntimeError: If the agent has been closed
-            UsageLimitError: If usage limits exceeded
+            UsageLimitError: If usage limits are exceeded. run_sync() surfaces
+                whatever run() raised, so either subclass can arrive here:
+                RunUsageLimitError for a run-tier breach, AgentUsageLimitError for
+                an agent-tier one.
         """
         # Always run on the agent's own loop so the httpx connection pool stays
         # bound to ONE stable loop across calls. There is no asyncio.run()

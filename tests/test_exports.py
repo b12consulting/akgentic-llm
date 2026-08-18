@@ -39,6 +39,8 @@ def test_key_exports_present():
     # Agent
     assert hasattr(akgentic.llm, "ReactAgent")
     assert hasattr(akgentic.llm, "UsageLimitError")
+    assert hasattr(akgentic.llm, "RunUsageLimitError")
+    assert hasattr(akgentic.llm, "AgentUsageLimitError")
 
     # Context
     assert hasattr(akgentic.llm, "ContextManager")

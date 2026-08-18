@@ -11,12 +11,14 @@ from pydantic_ai.messages import ModelRequest, SystemPromptPart, UserPromptPart
 from pydantic_ai.usage import RunUsage
 
 from akgentic.llm import (
+    AgentUsageLimitError,
     AgentUsageLimits,
     CompactionConfig,
     CompactionResult,
     ModelConfig,
     ReactAgent,
     ReactAgentConfig,
+    RunUsageLimitError,
     RunUsageLimits,
     UsageLimitError,
     UserPrompt,
@@ -1273,6 +1275,106 @@ class TestReactAgentTokenBudgetRestore:
             agent.run_sync("one more")
         assert agent._agent_usage.input_tokens == 110
         assert agent._agent_usage.output_tokens == 55
+
+
+class TestUsageLimitErrorTierSplit:
+    """Test the two tiers raise distinct classes, told apart by isinstance only.
+
+    Every assertion here is on the exception's CLASS. The tier is never derived
+    from the message text — asserting the text of a message is a separate concern
+    and lives in the message-identity test below.
+    """
+
+    def test_run_tier_breach_raises_the_run_subclass(self, minimal_config):
+        """Test pydantic-ai's mid-run breach surfaces as RunUsageLimitError."""
+        agent = ReactAgent(config=minimal_config)
+        run = _StubRun(enter_raises=UsageLimitExceeded("Request limit exceeded"))
+        with patch.object(agent._pydantic_agent, "iter", return_value=run):
+            with pytest.raises(RunUsageLimitError):
+                agent.run_sync("test query")
+
+    def test_agent_tier_token_breach_raises_the_agent_subclass(self):
+        """Test a pre-flight token breach surfaces as AgentUsageLimitError."""
+        agent = ReactAgent(config=_agent_token_config(total_tokens_limit=100))
+        with patch.object(agent._pydantic_agent, "iter", side_effect=_stub_run_spending(80, 40)):
+            agent.run_sync("first")
+            with pytest.raises(AgentUsageLimitError):
+                agent.run_sync("second")
+
+    def test_agent_tier_run_breach_raises_the_agent_subclass(self):
+        """Test the N+1 run surfaces as AgentUsageLimitError."""
+        agent = ReactAgent(config=_agent_limit_config(2))
+        with patch.object(agent._pydantic_agent, "iter", side_effect=_StubRun):
+            agent.run_sync("first")
+            agent.run_sync("second")
+            with pytest.raises(AgentUsageLimitError):
+                agent.run_sync("third")
+
+    def test_base_class_still_catches_both_tiers(self, minimal_config):
+        """Test the additive claim: one `except UsageLimitError` catches both tiers.
+
+        This is the guard behind "no deprecation shim is required". If either
+        subclass ever stops descending from the base, every existing handler in
+        akgentic-agent and downstream breaks silently — this test goes red first.
+        """
+        assert issubclass(RunUsageLimitError, UsageLimitError)
+        assert issubclass(AgentUsageLimitError, UsageLimitError)
+
+        run_tier_agent = ReactAgent(config=minimal_config)
+        breach = _StubRun(enter_raises=UsageLimitExceeded("Request limit exceeded"))
+        with patch.object(run_tier_agent._pydantic_agent, "iter", return_value=breach):
+            try:
+                run_tier_agent.run_sync("burn the turn")
+            except UsageLimitError as err:
+                assert isinstance(err, RunUsageLimitError)
+            else:
+                pytest.fail("run tier did not raise")
+
+        agent_tier_agent = ReactAgent(config=_agent_limit_config(1))
+        with patch.object(agent_tier_agent._pydantic_agent, "iter", side_effect=_StubRun):
+            agent_tier_agent.run_sync("first")
+            try:
+                agent_tier_agent.run_sync("second")
+            except UsageLimitError as err:
+                assert isinstance(err, AgentUsageLimitError)
+            else:
+                pytest.fail("agent tier did not raise")
+
+    def test_the_two_tiers_are_not_each_other(self):
+        """Test the split is a real discrimination, not two aliases of one class."""
+        assert not issubclass(RunUsageLimitError, AgentUsageLimitError)
+        assert not issubclass(AgentUsageLimitError, RunUsageLimitError)
+
+        run_tier = RunUsageLimitError("turn exhausted")
+        agent_tier = AgentUsageLimitError("lifetime exhausted")
+        assert not isinstance(run_tier, AgentUsageLimitError)
+        assert not isinstance(agent_tier, RunUsageLimitError)
+
+    def test_the_base_class_is_unchanged(self):
+        """Test UsageLimitError stays a plain Exception subclass, not abstract."""
+        assert issubclass(UsageLimitError, Exception)
+        assert UsageLimitError.__bases__ == (Exception,)
+        # Still directly instantiable: nothing downstream that constructs the base
+        # (tests, fakes, re-raises) is broken by the split.
+        assert str(UsageLimitError("still constructible")) == "still constructible"
+
+    def test_message_text_is_unchanged_by_the_split(self, minimal_config):
+        """Test the split moved the class, never the wording, at both tiers."""
+        agent = ReactAgent(config=_agent_limit_config(2))
+        with patch.object(agent._pydantic_agent, "iter", side_effect=_StubRun):
+            agent.run_sync("first")
+            agent.run_sync("second")
+            with pytest.raises(AgentUsageLimitError) as agent_tier:
+                agent.run_sync("third")
+        assert str(agent_tier.value) == "Exceeded the agent_request_limit of 2 (run_count=2)"
+
+        run_agent = ReactAgent(config=minimal_config)
+        breach = _StubRun(enter_raises=UsageLimitExceeded("Request limit exceeded"))
+        with patch.object(run_agent._pydantic_agent, "iter", return_value=breach):
+            with pytest.raises(RunUsageLimitError) as run_tier:
+                run_agent.run_sync("burn the turn")
+        # pydantic-ai's own wording, translated verbatim by str(e).
+        assert "Request limit exceeded" in str(run_tier.value)
 
 
 class TestReactAgentMultimodalPrompt:
