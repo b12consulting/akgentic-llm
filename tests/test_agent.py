@@ -836,21 +836,25 @@ class TestReactAgentRunCountEnforcement:
         agent = ReactAgent(config=_agent_limit_config(3))
         breach = UsageLimitExceeded("The next request would exceed the request_limit of 1")
         with patch.object(agent._pydantic_agent, "iter", side_effect=breach):
-            with pytest.raises(UsageLimitError) as exc_info:
+            with pytest.raises(RunUsageLimitError) as exc_info:
                 agent.run_sync("first")
         assert agent._agent_run_count == 1
         assert "request_limit of 1" in str(exc_info.value)
 
     def test_repeated_run_tier_failures_exhaust_the_agent_tier(self):
-        """Test the two tiers interact: a run-level loop cannot spin forever."""
+        """Test the two tiers interact: a run-level loop cannot spin forever.
+
+        Which tier fired is asserted by CLASS; the message assertions that follow
+        pin the wording, they do not identify the tier.
+        """
         agent = ReactAgent(config=_agent_limit_config(2))
         breach = UsageLimitExceeded("The next request would exceed the request_limit of 1")
         with patch.object(agent._pydantic_agent, "iter", side_effect=breach):
             for _ in range(2):
-                with pytest.raises(UsageLimitError) as run_tier:
+                with pytest.raises(RunUsageLimitError) as run_tier:
                     agent.run_sync("burn a turn")
                 assert "The next request would exceed" in str(run_tier.value)
-            with pytest.raises(UsageLimitError) as agent_tier:
+            with pytest.raises(AgentUsageLimitError) as agent_tier:
                 agent.run_sync("one turn too many")
         assert str(agent_tier.value) == "Exceeded the agent_request_limit of 2 (run_count=2)"
 

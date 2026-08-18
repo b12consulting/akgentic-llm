@@ -266,8 +266,8 @@ class ReactAgent:
                 rejects this call before it runs. Terminal for this agent.
             RunUsageLimitError: If pydantic-ai breaches a run-tier limit mid-run.
                 Recoverable — the agent may still have lifetime budget.
-            Both subclass UsageLimitError, so a caller that does not care which tier
-            fired can keep catching the base.
+            UsageLimitError: Base of both — catch this instead of the subclasses when
+                the caller does not care which tier fired.
         """
         # Pre-flight: reject before spending anything (a rejected run must not even
         # pay for compaction's summarizer call). Tokens first, so a token rejection
