@@ -2,7 +2,6 @@
 
 import asyncio
 import logging
-import traceback
 from collections.abc import Callable, Sequence
 from typing import Any, cast
 
@@ -37,6 +36,16 @@ logger = logging.getLogger(__name__)
 
 UserPrompt = str | list[str | BinaryContent]
 
+# What the MODEL reads as the tool result of the call the run-tier breach aborted.
+# Not a diagnostic: the operator's traceback travels the other channel
+# (``ErrorMessage.traceback``, formatted by ``Akgent._handle_failure``). Defined once
+# here so the call site and its test never drift into two wordings (ADR-016 §D2).
+RUN_LIMIT_HEALING_MESSAGE = (
+    "This turn's tool and request budget is exhausted, so this tool call was "
+    "aborted and no further tool calls are possible. Answer now using what you "
+    "already have, and say plainly what you could not verify."
+)
+
 
 def _evict_anyio_run_vars(loop: asyncio.AbstractEventLoop) -> None:
     """Remove anyio's per-loop run-vars entry so the closed loop can be GC'd.
@@ -59,7 +68,37 @@ def _evict_anyio_run_vars(loop: asyncio.AbstractEventLoop) -> None:
 
 
 class UsageLimitError(Exception):
-    """Raised when usage limits are exceeded during agent execution."""
+    """Raised when a usage limit is exceeded during agent execution.
+
+    Base of both tiers — catch this to handle either; catch a subclass to react to
+    one. Every breach raises one of the two subclasses below, never this class
+    directly, but it stays the documented catch-all: an ``except UsageLimitError``
+    written before the tiers were split still catches everything it used to
+    (ADR-016 §D1).
+    """
+
+    pass
+
+
+class RunUsageLimitError(UsageLimitError):
+    """One run() call exhausted its RunUsageLimits budget.
+
+    Requests, tool calls or tokens spent within the turn — pydantic-ai stopped the
+    run mid-graph. The agent may still have lifetime budget, so this is
+    **recoverable**: the turn may not call another tool, but the agent can be asked
+    to conclude with what it already gathered.
+    """
+
+    pass
+
+
+class AgentUsageLimitError(UsageLimitError):
+    """The agent has spent its AgentUsageLimits budget over its whole lifetime.
+
+    Raised pre-flight, by the token check or the run-count check, before the call
+    executes. **Terminal** for this agent — no follow-up run can be admitted,
+    because the budget that would pay for it is exactly the one that is spent.
+    """
 
     pass
 
@@ -232,9 +271,122 @@ class ReactAgent:
             Agent result output (type matches output_type if given, else result_type)
 
         Raises:
-            UsageLimitError: On either tier — the agent-lifetime budget (tokens or
-                runs) rejecting this call before it runs, or a run-tier limit
-                breached by pydantic-ai mid-run.
+            AgentUsageLimitError: If the agent-lifetime budget (tokens or runs)
+                rejects this call before it runs. Terminal for this agent.
+            RunUsageLimitError: If pydantic-ai breaches a run-tier limit mid-run.
+                Recoverable — the agent may still have lifetime budget.
+            UsageLimitError: Base of both — catch this instead of the subclasses when
+                the caller does not care which tier fired.
+        """
+        return await self._run_with_limits(
+            user_prompt, deps, output_type, self._config.run_usage_limits
+        )
+
+    async def conclude_without_tools(
+        self, reason: str, *, deps: Any = None, output_type: type[Any] | None = None
+    ) -> Any:
+        """Turn an interrupted turn into an answer: one follow-up run, no tools.
+
+        **Mechanism only** — nothing here decides *whether* to conclude; that policy
+        lives in the caller (ADR-016 §D3/§D4). ``run()`` never calls this itself and
+        keeps raising on every breach.
+
+        The tools are removed with ``override(tools=[], toolsets=[])``, the only
+        construct that *replaces* what is registered: a per-run ``toolsets=[]`` is
+        documented as **additional** toolsets and would leave every tool in place, so
+        the conclusion would happily call one. "Zero tool calls" is also not
+        expressible as a limit — ``tool_calls_limit`` is ``gt=0``.
+
+        The run carries its own ``RunUsageLimits(run_request_limit=1)`` rather than
+        the budget that was just exhausted; with no tools available, one request is
+        what the turn needs. It still goes through the normal agent-tier pre-flight,
+        so an agent that has *also* spent its lifetime budget raises
+        ``AgentUsageLimitError`` from here. That is the caller's signal to stop
+        trying, not a defect to swallow — the lifetime counter is what bounds the
+        retry loop by construction.
+
+        Args:
+            reason: Why the turn must conclude now. Reaches the model as the run's
+                user prompt, on top of the healed context — so the
+                ``ToolReturnPart`` written by ``_heal_unprocessed_tool_calls`` is
+                already there as the tool result the model reasons from.
+            deps: Optional dependency object (must match deps_type).
+            output_type: Optional per-call output type override (see ``run()``).
+
+        Returns:
+            Agent result output, exactly as ``run()`` returns it.
+
+        Raises:
+            AgentUsageLimitError: If the agent-lifetime budget rejects this call
+                pre-flight. Terminal — do not retry.
+            RunUsageLimitError: If even the single-request conclusion breaches a
+                run-tier limit.
+        """
+        with self._pydantic_agent.override(tools=[], toolsets=[]):
+            return await self._run_with_limits(
+                reason, deps, output_type, RunUsageLimits(run_request_limit=1)
+            )
+
+    def conclude_without_tools_sync(
+        self, reason: str, *, deps: Any = None, output_type: type[Any] | None = None
+    ) -> Any:
+        """Synchronous bridge over :meth:`conclude_without_tools`.
+
+        Mirrors ``run_sync`` and ``compact``: closed-agent guard, then
+        ``run_until_complete`` on the agent's own loop. There is deliberately no
+        ``asyncio.run()`` fallback and no second loop — a fresh loop per call would
+        leave pooled httpx connections attached to already-closed loops, making
+        ``aclose()`` raise on stop and leaking the pool.
+
+        Args:
+            reason: Why the turn must conclude now (see :meth:`conclude_without_tools`).
+            deps: Optional dependency object (must match deps_type).
+            output_type: Optional per-call output type override (see ``run()``).
+
+        Returns:
+            Agent result output, exactly as :meth:`conclude_without_tools` returns it.
+
+        Raises:
+            RuntimeError: If the agent has been closed.
+            UsageLimitError: Whatever :meth:`conclude_without_tools` raised.
+        """
+        if self._closed or self._loop.is_closed():
+            raise RuntimeError("ReactAgent is closed")
+        return self._loop.run_until_complete(
+            self.conclude_without_tools(reason, deps=deps, output_type=output_type)
+        )
+
+    async def _run_with_limits(
+        self,
+        user_prompt: UserPrompt,
+        deps: Any,
+        output_type: type[Any] | None,
+        limits: RunUsageLimits | None,
+    ) -> Any:
+        """Shared run core: pre-flight, compaction, one ``iter()`` turn, healing.
+
+        Everything ``run()`` does, with the run-tier budget as a parameter so the
+        tool-free conclusion can substitute its own without ``run()`` growing a
+        public knob for it. Reusing this core is what gives the conclusion the same
+        pre-flight, the same ``new_messages()`` drain, the same system-prompt
+        recording and the same usage fold — so a conclusion emits an
+        ``LlmUsageEvent`` like any other run.
+
+        Args:
+            user_prompt: The prompt for this turn.
+            deps: Optional dependency object.
+            output_type: Optional per-call output type override.
+            limits: The run-tier budget to bound this turn with, or None.
+
+        Returns:
+            Agent result output, or None when the run produced no result.
+
+        Raises:
+            AgentUsageLimitError: Raised pre-flight by either agent-tier check.
+            RunUsageLimitError: Raised when pydantic-ai breaches a run-tier limit.
+            Exception: Anything else the run raised, re-raised unchanged after the
+                context is healed — the object and its ``__traceback__`` are the
+                caller's, not this method's, to alter.
         """
         # Pre-flight: reject before spending anything (a rejected run must not even
         # pay for compaction's summarizer call). Tokens first, so a token rejection
@@ -246,7 +398,7 @@ class ReactAgent:
         # appends, so compacting here takes effect for the whole turn.
         await self._maybe_compact()
         user_prompt = self._fold_pending_operator_actions(user_prompt)
-        pydantic_limits = self._to_pydantic_limits(self._config.run_usage_limits)
+        pydantic_limits = self._to_pydantic_limits(limits)
 
         try:
             # Track messages added in THIS run to prevent duplicates
@@ -284,10 +436,15 @@ class ReactAgent:
                     self._fold_run_usage(run)
 
         except UsageLimitExceeded as e:
-            self._heal_unprocessed_tool_calls(traceback.format_exc())
-            raise UsageLimitError(str(e)) from e
-        except Exception:
-            self._heal_unprocessed_tool_calls(traceback.format_exc())
+            self._heal_unprocessed_tool_calls(RUN_LIMIT_HEALING_MESSAGE)
+            raise RunUsageLimitError(str(e)) from e
+        except Exception as e:
+            # Type and message — what a model can act on ("ReadTimeout: pool
+            # timeout" → route around it); the stack, which it cannot, is dropped
+            # here only. Bare `raise`, never `raise e`: the exception object and its
+            # __traceback__ must reach the caller unchanged, because that is what
+            # Akgent._handle_failure formats onto ErrorMessage.traceback.
+            self._heal_unprocessed_tool_calls(f"Tool call aborted: {type(e).__name__}: {e}")
             raise
 
     def _check_agent_token_budget(self) -> None:
@@ -295,9 +452,10 @@ class ReactAgent:
 
         Builds a pydantic-ai ``UsageLimits`` from ``agent_usage_limits``' three token
         fields and reuses its ``check_tokens()`` against the lifetime accumulator, so
-        an agent-tier breach reads exactly like a run-tier one and nothing downstream
-        has to parse text to tell the tiers apart. Unset limits (the default, all
-        ``None``) make the check a no-op.
+        an agent-tier breach carries pydantic-ai's own message wording. The tier is
+        carried by the **class** — ``AgentUsageLimitError`` here, ``RunUsageLimitError``
+        at the run-tier site — so nothing downstream has to parse text to tell the
+        tiers apart. Unset limits (the default, all ``None``) make the check a no-op.
 
         **A run may overshoot the budget, by construction.** A run's token cost is
         unknown until it completes, so this is "do not start a run once the budget is
@@ -310,7 +468,8 @@ class ReactAgent:
         lifetime one (ADR-013 §Out of scope, reopened for the token tier).
 
         Raises:
-            UsageLimitError: If lifetime usage has already exceeded a token limit.
+            AgentUsageLimitError: If lifetime usage has already exceeded a token
+                limit. A subclass of UsageLimitError.
         """
         limits = self._config.agent_usage_limits
         pydantic_limits = PydanticUsageLimits(
@@ -321,7 +480,7 @@ class ReactAgent:
         try:
             pydantic_limits.check_tokens(self._agent_usage)
         except UsageLimitExceeded as e:
-            raise UsageLimitError(str(e)) from e
+            raise AgentUsageLimitError(str(e)) from e
 
     def _fold_run_usage(self, run: AgentRun[Any, Any]) -> None:
         """Add one completed run's token usage to the agent-lifetime accumulator.
@@ -343,7 +502,7 @@ class ReactAgent:
 
         Check-then-consume: the counter advances **before** the call executes, so a
         ``run()`` that fails partway — including one that raises the run-tier
-        ``UsageLimitError`` — has already been counted. That ordering is deliberate:
+        ``RunUsageLimitError`` — has already been counted. That ordering is deliberate:
         an agent whose run-tier limit fires repeatedly must also exhaust its
         agent-tier budget, since both mean "this agent is burning too many turns"
         (ADR-013 §D2). Do not move the increment after the call.
@@ -353,11 +512,12 @@ class ReactAgent:
         ``agent_request_limit=None`` never blocks.
 
         Raises:
-            UsageLimitError: If the agent has already used its lifetime run budget.
+            AgentUsageLimitError: If the agent has already used its lifetime run
+                budget. A subclass of UsageLimitError.
         """
         limit = self._config.agent_usage_limits.agent_request_limit
         if limit is not None and self._agent_run_count >= limit:
-            raise UsageLimitError(
+            raise AgentUsageLimitError(
                 f"Exceeded the agent_request_limit of {limit} (run_count={self._agent_run_count})"
             )
         self._agent_run_count += 1
@@ -525,7 +685,10 @@ class ReactAgent:
 
         Raises:
             RuntimeError: If the agent has been closed
-            UsageLimitError: If usage limits exceeded
+            UsageLimitError: If usage limits are exceeded. run_sync() surfaces
+                whatever run() raised, so either subclass can arrive here:
+                RunUsageLimitError for a run-tier breach, AgentUsageLimitError for
+                an agent-tier one.
         """
         # Always run on the agent's own loop so the httpx connection pool stays
         # bound to ONE stable loop across calls. There is no asyncio.run()
@@ -614,18 +777,25 @@ class ReactAgent:
             total_tokens_limit=limits.total_tokens_limit,
         )
 
-    def _heal_unprocessed_tool_calls(self, error_detail: str) -> None:
-        """Complete any pending tool calls in context with error responses.
+    def _heal_unprocessed_tool_calls(self, model_message: str) -> None:
+        """Complete any pending tool calls in context with a message for the model.
 
         When the REACT loop fails mid-execution, the last message may be a
         ModelResponse with tool calls that never received results. This
         appends a ModelRequest with ToolReturnPart for each pending call,
         preventing the 'unprocessed tool calls' error on the next run().
 
+        The structural half is ADR-003 and unchanged: one part per dangling call,
+        appended as one request. What each part *carries* is a sentence written for
+        the model — the reader of a tool result — not a diagnostic for an operator.
+
         Args:
-            error_detail: Error detail string (typically a traceback) embedded
-                verbatim into each healing ``ToolReturnPart.content`` so the LLM
-                has visibility into the failure on the next turn.
+            model_message: The tool result the **model** reads on its next turn —
+                used verbatim as each healing ``ToolReturnPart.content``, with no
+                wrapper added. This is not a diagnostic channel: the operator's
+                traceback reaches the orchestrator through ``ErrorMessage.traceback``
+                instead. Each call site therefore supplies a complete, self-contained
+                sentence the model can act on (ADR-016 §D2, amending ADR-003).
         """
         messages = self._context.messages
         if not messages:
@@ -642,7 +812,7 @@ class ReactAgent:
         error_parts: list[ModelRequestPart] = [
             ToolReturnPart(
                 tool_name=call.tool_name,
-                content=f"Error: tool call aborted due to failure: {error_detail}",
+                content=model_message,
                 tool_call_id=call.tool_call_id,
             )
             for call in last.tool_calls

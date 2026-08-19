@@ -37,6 +37,7 @@ from akgentic.llm import (
     ToolReturnEvent,
     UsageLimitError,
 )
+from akgentic.llm.agent import RUN_LIMIT_HEALING_MESSAGE
 
 RUN_ID = uuid.UUID("cf92c35f-4ee9-4cff-8361-b8ce3827e021")
 
@@ -111,18 +112,24 @@ class TestHealingAppendsToolReturns:
         assert part.tool_name == "search"
         assert part.tool_call_id == "call_001"
 
-    def test_tool_return_content_includes_error_detail(self) -> None:
-        """AC-1/AC-2: ToolReturnPart.content carries the error detail string."""
+    def test_tool_return_content_is_exactly_the_message_passed_in(self) -> None:
+        """The content is the caller's string verbatim — no wrapper added (AC #2).
+
+        ``in`` would still pass with the old
+        ``"Error: tool call aborted due to failure: …"`` prefix back in place; the
+        equality is what pins its removal, and what makes each call site responsible
+        for supplying a complete sentence.
+        """
         agent = _make_agent()
         agent._context.add_message(_response_with_tool_calls(("search", "call_001")))
 
-        agent._heal_unprocessed_tool_calls("RuntimeError: deep trace")
+        agent._heal_unprocessed_tool_calls("RuntimeError: connection reset")
 
         healed = agent._context.messages[-1]
         assert isinstance(healed, ModelRequest)
         part = healed.parts[0]
         assert isinstance(part, ToolReturnPart)
-        assert "RuntimeError: deep trace" in str(part.content)
+        assert part.content == "RuntimeError: connection reset"
 
 
 # ---------------------------------------------------------------------------
@@ -300,7 +307,13 @@ class TestRunInvokesHealing:
 
     @pytest.mark.asyncio
     async def test_usage_limit_exceeded_heals_pending_tool_calls(self) -> None:
-        """AC-1: UsageLimitExceeded handler heals context and still raises."""
+        """AC-1: UsageLimitExceeded handler heals context and still raises.
+
+        Also AC #3: what lands in the model's context is the instruction sentence,
+        not a stack. The two no-traceback assertions are the regression guard —
+        restoring ``traceback.format_exc()`` at the call site turns them red while
+        the structural assertions above stay green.
+        """
         agent = _make_agent()
         agent._context.add_message(_response_with_tool_calls(("tool_a", "call_a")))
         before = len(agent._context.messages)
@@ -314,11 +327,20 @@ class TestRunInvokesHealing:
         assert len(messages) == before + 1
         healed = messages[-1]
         assert isinstance(healed, ModelRequest)
-        assert any(isinstance(p, ToolReturnPart) for p in healed.parts)
+        tool_returns = [p for p in healed.parts if isinstance(p, ToolReturnPart)]
+        assert len(tool_returns) == 1
+        content = str(tool_returns[0].content)
+        assert content == RUN_LIMIT_HEALING_MESSAGE
+        assert "Traceback (most recent call last)" not in content
+        assert "pydantic_ai" not in content
 
     @pytest.mark.asyncio
     async def test_generic_exception_heals_and_reraises(self) -> None:
-        """AC-2: generic Exception handler heals context and re-raises unchanged."""
+        """AC-2: generic Exception handler heals context and re-raises unchanged.
+
+        AC #4: the healed content names the exception's type and message — what a
+        model can act on — and carries no stack.
+        """
         agent = _make_agent()
         agent._context.add_message(_response_with_tool_calls(("tool_b", "call_b")))
         before = len(agent._context.messages)
@@ -339,3 +361,35 @@ class TestRunInvokesHealing:
         assert len(tool_returns) == 1
         assert tool_returns[0].tool_name == "tool_b"
         assert tool_returns[0].tool_call_id == "call_b"
+        content = str(tool_returns[0].content)
+        assert "MyBoom: kaboom" in content
+        assert "Traceback (most recent call last)" not in content
+
+    @pytest.mark.asyncio
+    async def test_generic_branch_preserves_the_exception_object_and_traceback(self) -> None:
+        """The traceback is removed from the LLM context ONLY — not from the caller.
+
+        The whole of FR3 rests on this: operators still receive the stack, because
+        ``Akgent._handle_failure`` formats it off the exception that leaves
+        ``run()``. What this pins is that the generic branch neither wraps, replaces
+        nor swallows that exception — a handler that raised a new error, or returned
+        instead of re-raising, would break debugging to fix a prompt. Asserted by
+        identity, which no message-level check can substitute for.
+
+        What it does NOT catch, deliberately, is ``raise e`` instead of the bare
+        ``raise``: ``raise e`` re-raises the *same* object and appends the current
+        frame to ``__traceback__`` rather than rebinding or truncating it, so it is
+        indistinguishable here. The bare form is required for the frame it does not
+        add, not for a guarantee this assertion could express.
+        """
+        agent = _make_agent()
+        agent._context.add_message(_response_with_tool_calls(("tool_c", "call_c")))
+        sentinel = RuntimeError("sentinel failure")
+
+        raising = _RaisingRun(sentinel)
+        with patch.object(agent._pydantic_agent, "iter", return_value=raising):
+            with pytest.raises(RuntimeError) as exc_info:
+                await agent.run("test")
+
+        assert exc_info.value is sentinel
+        assert exc_info.value.__traceback__ is not None

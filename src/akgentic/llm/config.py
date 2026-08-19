@@ -297,7 +297,7 @@ class RunUsageLimits(TokenUsageLimits):
     """Per-run usage budget: bounds a single ReactAgent.run() call.
 
     Enforced by pydantic-ai, which raises UsageLimitExceeded mid-run when a limit is hit;
-    ReactAgent surfaces that as UsageLimitError. Token counts reset every run.
+    ReactAgent surfaces that as RunUsageLimitError. Token counts reset every run.
 
     Attributes:
         run_request_limit: Maximum LLM API requests in one run (50 = the default brake)
@@ -333,8 +333,9 @@ class AgentUsageLimits(TokenUsageLimits):
 
     Both this tier's limits are enforced by pre-flight checks in ReactAgent.run(),
     against counters ReactAgent accumulates over its whole lifetime (and reseeds from
-    replayed usage events on restore). Breaching either raises UsageLimitError, the
-    same class the run tier raises, with pydantic-ai's own message text.
+    replayed usage events on restore). Breaching either raises AgentUsageLimitError,
+    a subclass of UsageLimitError, with pydantic-ai's own message text. The run tier
+    raises a different subclass, so the two are told apart by class.
 
     agent_request_limit is consumed BEFORE the call executes, so a run that fails
     partway still counts.
@@ -511,7 +512,7 @@ class RuntimeConfig(BaseModel):
           v1.107 had no such rule -- an already-successful output always won. The forced extra
           turn counts against run_usage_limits (run_request_limit, total_tokens_limit): a run
           that would have finished successfully on v1 (output wins, retry ignored) can instead
-          raise UsageLimitError on v2 if that turn pushes it past a run-tier ceiling.
+          raise RunUsageLimitError on v2 if that turn pushes it past a run-tier ceiling.
 
     Example:
         >>> # Default: resilient with standard HTTP settings

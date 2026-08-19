@@ -42,7 +42,8 @@ call any LLM without coupling to a specific vendor or framework primitive.
 
 - **ReactAgent** — a thin wrapper around pydantic-ai's `Agent.iter()` that persists message
   history across calls, deduplicates messages across tool-call iterations, and translates
-  pydantic-ai's `UsageLimitExceeded` into a framework-local `UsageLimitError`
+  pydantic-ai's `UsageLimitExceeded` into a framework-local `RunUsageLimitError` — one of the two
+  tiers under the exported base `UsageLimitError` (see [Usage limits](#usage-limits))
 - **Provider abstraction** — `create_model()` dispatches to one of six provider factories
   (OpenAI, Azure, Anthropic, Google, Mistral, NVIDIA), wrapping the result in pydantic-ai's
   `FallbackModel` when `ModelConfig.fallback_models` is non-empty; `get_output_type()` wraps
@@ -215,7 +216,7 @@ lifetime". Both share a token-only base (`TokenUsageLimits`, internal).
 #### RunUsageLimits — `ReactAgentConfig.run_usage_limits`
 
 Cumulative across all requests in a **single `run()` call**, and reset on the next one.
-Enforced by pydantic-ai; breaching any limit raises `UsageLimitError`.
+Enforced by pydantic-ai; breaching any limit raises `RunUsageLimitError`.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -237,7 +238,7 @@ RunUsageLimits(run_request_limit=None)                          # no safety brak
 > the run for another model turn (see [RuntimeConfig](#runtimeconfig)). That forced turn is
 > charged to this tier: it consumes one `run_request_limit` unit and its tokens count toward
 > `total_tokens_limit`. A run that completed on pydantic-ai v1 can therefore raise
-> `UsageLimitError` on v2 without the prompt or the tools having changed.
+> `RunUsageLimitError` on v2 without the prompt or the tools having changed.
 
 #### AgentUsageLimits — `ReactAgentConfig.agent_usage_limits`
 
@@ -255,13 +256,13 @@ refusal costs no run budget — against counters the agent accumulates over its 
 recomputes from persisted usage events on restore.
 
 `agent_request_limit`: once the agent has used its budget, every further call raises
-`UsageLimitError` — the same class a run-tier breach raises — with a message of the form
-`Exceeded the agent_request_limit of 100 (run_count=100)`.
+`AgentUsageLimitError` — the agent tier's own class, distinct from the run tier's — with a
+message of the form `Exceeded the agent_request_limit of 100 (run_count=100)`.
 
 Four consequences worth knowing before you set it:
 
 - **A run that fails still counts.** The budget is consumed before the call executes, not
-  after it returns — including when the call ends in a *run-tier* `UsageLimitError`. An
+  after it returns — including when the call ends in a run-tier `RunUsageLimitError`. An
   agent stuck in a failing loop therefore still runs out of lifetime budget, which is the
   point: both limits mean "this agent is burning too many turns".
 - **It counts runs *consumed*, never runs attempted.** A rejected call consumes nothing,
@@ -276,9 +277,10 @@ Four consequences worth knowing before you set it:
   nothing consumed nothing.
 
 The three token limits bound the agent's **lifetime** spend, summed across every run.
-Breaching one raises `UsageLimitError` with pydantic-ai's own message text — e.g.
-`Exceeded the total_tokens_limit of 1000000 (total_tokens=1000420)` — the same shape a
-run-tier breach produces, so nothing downstream has to parse text to tell the tiers apart.
+Breaching one raises `AgentUsageLimitError` with pydantic-ai's own message text — e.g.
+`Exceeded the total_tokens_limit of 1000000 (total_tokens=1000420)`. That wording is the same
+shape a run-tier breach produces, deliberately: the **class** is what carries the tier, so
+nothing downstream has to parse text to tell the two apart.
 
 Two consequences here too:
 
@@ -301,6 +303,47 @@ Note that only `run_usage_limits` participates in the compaction-threshold check
 the agent tier, so an `agent_usage_limits` token limit below the compaction threshold still
 constructs — but it does make the auto-trigger unreachable at runtime, because the agent
 refuses the run before compaction can fire.
+
+#### Telling the two tiers apart
+
+A breach raises **one of two classes**, both subclassing `UsageLimitError`:
+
+- **`UsageLimitError`** — the base, and the documented **catch-all**. It stays exported, and no
+  enforcement site raises it directly, so an `except UsageLimitError` written before the tiers
+  were split still catches everything it used to. The split is **additive**: there is nothing to
+  migrate and nothing is deprecated here.
+- **`RunUsageLimitError`** — one `run()` call exhausted its `RunUsageLimits` budget.
+  **Recoverable**: that turn may not call another tool, but the agent may still have lifetime
+  budget left, so it can be asked to answer with what it already gathered
+  (see [`conclude_without_tools()`](#reactagent-api)).
+- **`AgentUsageLimitError`** — the `AgentUsageLimits` lifetime budget is spent. Raised
+  **pre-flight** by either agent-tier check, before the call executes. **Terminal**: no follow-up
+  run can be admitted, because the budget that would pay for it is exactly the one that is spent.
+
+**Tell them apart with `isinstance`, never by message text.** The token-limit messages come from
+pydantic-ai and read alike at both tiers, by design — the class is what carries the tier. Nothing
+downstream should branch on an error string.
+
+Both names are exported from `akgentic.llm`, alongside the base:
+
+```python
+from akgentic.llm import AgentUsageLimitError, RunUsageLimitError, UsageLimitError
+
+try:
+    answer = await agent.run("...")
+except RunUsageLimitError:
+    ...  # this turn ran out of budget — the agent itself may still be usable
+except AgentUsageLimitError:
+    ...  # this agent is finished; a further run cannot be admitted
+```
+
+After a run-tier breach the context is left runnable rather than diagnostic: the tool calls the
+aborted turn never answered are healed with a short **model-facing instruction** — it tells the
+model this turn's budget is spent, that no further tool call is possible, and to answer now with
+what it already has — so that sentence, not a traceback, is the tool result a follow-up run
+reasons from. The operator still gets the stack: the breach leaves `run()` as a
+`RunUsageLimitError` chained from pydantic-ai's own `UsageLimitExceeded` (`raise ... from e`), and
+that exception's traceback is what reaches the event stream.
 
 #### Migrating from the pre-split surface
 
@@ -346,8 +389,8 @@ called in the same round as an already-successful output call raises `ModelRetry
 argument validation — the output is **suppressed** and the run continues for another model turn
 instead of ending there. pydantic-ai 1.107 had no such rule; an already-successful output always
 won. The forced extra turn is charged to `run_usage_limits` (`run_request_limit`,
-`total_tokens_limit`), so a run that finished cleanly on v1 can raise `UsageLimitError` on v2 if
-that turn pushes it past a run-tier ceiling. See [Usage limits](#usage-limits).
+`total_tokens_limit`), so a run that finished cleanly on v1 can raise `RunUsageLimitError` on v2
+if that turn pushes it past a run-tier ceiling. See [Usage limits](#usage-limits).
 
 > **Note: `parallel_tool_calls` currently reaches no model.** `ReactAgent.__init__` reads only
 > `retries`, `end_strategy` and `http_client_config` off `runtime_cfg`, and never passes a
@@ -474,6 +517,8 @@ class ReactAgent:
     # Execution
     async def run(self, user_prompt: UserPrompt, deps=None, output_type=None) -> Any: ...
     def run_sync(self, user_prompt: UserPrompt, deps=None, output_type=None) -> Any: ...
+    async def conclude_without_tools(self, reason: str, *, deps=None, output_type=None) -> Any: ...
+    def conclude_without_tools_sync(self, reason: str, *, deps=None, output_type=None) -> Any: ...
 
     # Context
     @property
@@ -500,6 +545,32 @@ class ReactAgent:
 
 `output_type` in `run()` overrides the construction-time `result_type` for that call only.
 Both are wrapped with `get_output_type()` to apply the provider-aware `NativeOutput` strategy.
+
+**`conclude_without_tools()` turns an interrupted turn into an answer — and it is a mechanism,
+not a policy.** `run()` never calls it and still raises on every breach; nothing in this package
+decides *whether* an interrupted turn should be concluded. That decision lives in
+**`akgentic-agent`** — do not go looking for it here, and do not read the method as an automatic
+recovery that `run()` performs for you. Note also the `*`: `deps` and `output_type` are
+**keyword-only** on both conclusion methods, unlike `run()`'s positional ones.
+
+What the mechanism does when a caller invokes it:
+
+- **The tools are removed with `override(tools=[], toolsets=[])`** — the only construct that
+  *replaces* what is registered. A per-run `toolsets=[]` is documented as **additional** toolsets
+  and would leave every tool in place. "Zero tool calls" is not expressible as a limit either:
+  `tool_calls_limit` is `gt=0`.
+- **The run carries its own `RunUsageLimits(run_request_limit=1)`**, not the budget that was just
+  exhausted. With no tools available, one request is what the turn needs.
+- **The agent-tier pre-flight still applies.** An agent whose *lifetime* budget is also spent
+  raises `AgentUsageLimitError` from the conclusion. That is the caller's signal to stop trying,
+  not a defect to swallow — the lifetime counter is what bounds a retry loop by construction.
+- **It emits an `LlmUsageEvent`** like any other run: it shares `run()`'s execution core, so the
+  usage fold, the system-prompt recording and the context drain are identical.
+
+`reason` reaches the model as the run's user prompt, layered on the healed context — so the
+healing instruction described under [Usage limits](#usage-limits) is already there as the tool
+result the model reasons from. `conclude_without_tools_sync()` is the synchronous bridge,
+mirroring `run_sync()`: closed-agent guard, then the agent's own loop.
 
 `event_loop=` is **deprecated and ignored**: `ReactAgent.__init__` always creates and owns its
 own loop, and `run_sync()` runs on that one. It is kept in the signature for one release so
@@ -1036,7 +1107,8 @@ blocked from merging until all steps are green.
 ```
 src/akgentic/llm/
     __init__.py     # Public API exports
-    agent.py        # ReactAgent, UsageLimitError, UserPrompt type alias
+    agent.py        # ReactAgent, UsageLimitError, RunUsageLimitError,
+                    #   AgentUsageLimitError, UserPrompt type alias
     compaction.py   # COMPACTION_STRATEGIES, SUMMARY_INSTRUCTIONS, CompactionStrategy,
                     #   CompactionResult, create_compaction()
     config.py       # ModelConfig, CompactionConfig, TokenUsageLimits, RunUsageLimits,

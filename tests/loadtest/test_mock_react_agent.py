@@ -7,6 +7,7 @@ guard, latency, scenario caching, and determinism.
 """
 
 import asyncio
+import inspect
 import time
 import warnings
 from pathlib import Path
@@ -634,6 +635,135 @@ def test_run_sync_after_close_raises() -> None:
     agent.close()
     with pytest.raises(RuntimeError):
         agent.run_sync("q", deps=_Deps("@Expert"))
+
+
+# ---------------------------------------------------------------------------
+# Epic 21 / FR5 — conclude_without_tools parity with ReactAgent
+# ---------------------------------------------------------------------------
+
+
+def test_conclude_without_tools_emits_no_tool_events() -> None:
+    """The mock's conclusion replays a state with NO tool events (AC #17).
+
+    ``@Manager``'s matching state carries a tool stub, so a plain ``run()`` on the
+    same prompt emits ``ToolCallEvent`` + ``ToolReturnEvent`` — the control that
+    gives this assertion teeth. "No tools" for the mock means that loop is skipped.
+    """
+    rec = _Recorder()
+    agent = _make_agent("@Manager", observer=rec)
+
+    out = agent.conclude_without_tools_sync(
+        "the sandpile model", deps=_Deps("@Manager"), output_type=_StructuredOutput
+    )
+
+    assert [m.recipient for m in out.messages] == ["@Assistant", "@Expert"]
+    assert not [e for e in rec.events if isinstance(e, (ToolCallEvent, ToolReturnEvent))]
+
+
+def test_run_on_the_same_state_does_emit_tool_events() -> None:
+    """Control for the test above: the state really does carry a tool stub."""
+    rec = _Recorder()
+    agent = _make_agent("@Manager", observer=rec)
+
+    agent.run_sync("the sandpile model", deps=_Deps("@Manager"),
+                   output_type=_StructuredOutput)
+
+    assert [e for e in rec.events if isinstance(e, ToolCallEvent)]
+    assert [e for e in rec.events if isinstance(e, ToolReturnEvent)]
+
+
+def test_conclude_without_tools_writes_no_tool_parts_to_context() -> None:
+    """No synthetic tool call/return parts reach the context either (AC #17)."""
+    agent = _make_agent("@Manager")
+    agent.conclude_without_tools_sync(
+        "the sandpile model", deps=_Deps("@Manager"), output_type=_StructuredOutput
+    )
+
+    messages = agent.context.messages
+    assert not [
+        p for m in messages if isinstance(m, ModelResponse)
+        for p in m.parts if isinstance(p, ToolCallPart)
+    ]
+    assert not [
+        p for m in messages if isinstance(m, ModelRequest)
+        for p in m.parts if isinstance(p, ToolReturnPart)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_conclude_without_tools_consumes_the_state() -> None:
+    """A conclusion is a real turn: it consumes the state it matched (AC #17).
+
+    The honest mirror of the real class, where a conclusion is an actual run. A
+    bypass that preserved the state for a later ``run()`` would make the mock
+    diverge from what it stands in for.
+    """
+    agent = _make_agent("@Manager")
+    deps = _Deps("@Manager")
+
+    first = await agent.conclude_without_tools(
+        "sandpile please", deps=deps, output_type=_StructuredOutput
+    )
+    second = await agent.run("sandpile again", deps=deps, output_type=_StructuredOutput)
+
+    assert len(first.messages) == 2
+    assert second.messages == []
+
+
+def test_conclude_without_tools_sync_after_close_raises() -> None:
+    """The sync bridge carries the mock's own closed-agent guard (AC #18)."""
+    agent = _make_agent("@Expert")
+    agent.close()
+    with pytest.raises(RuntimeError, match="MockReactAgent is closed"):
+        agent.conclude_without_tools_sync("wrap it up", deps=_Deps("@Expert"))
+
+
+def test_conclude_without_tools_sync_runs_on_the_owned_loop() -> None:
+    """The bridge uses ``run_until_complete`` on the mock's own loop (AC #18)."""
+    used_loops: list[asyncio.AbstractEventLoop] = []
+
+    async def stub_conclude(*_: Any, **__: Any) -> str:
+        used_loops.append(asyncio.get_running_loop())
+        return "ran-on-owned-loop"
+
+    agent = _make_agent("@Expert")
+    try:
+        with patch.object(MockReactAgent, "conclude_without_tools", new=stub_conclude):
+            first = agent.conclude_without_tools_sync("once", deps=_Deps("@Expert"))
+            second = agent.conclude_without_tools_sync("twice", deps=_Deps("@Expert"))
+        assert first == second == "ran-on-owned-loop"
+        assert used_loops == [agent._loop, agent._loop]
+        assert not agent._loop.is_closed()
+    finally:
+        agent.close()
+
+
+def test_conclusion_signatures_match_the_real_agent() -> None:
+    """Same signatures on both classes, so a substitution cannot pass falsely (AC #16).
+
+    A mock whose conclusion took different parameters would let an
+    ``akgentic-agent`` test go green on a call the real ``ReactAgent`` rejects —
+    which is exactly what drop-in parity exists to prevent.
+    """
+    for name in ("conclude_without_tools", "conclude_without_tools_sync"):
+        assert inspect.signature(getattr(MockReactAgent, name)) == inspect.signature(
+            getattr(ReactAgent, name)
+        )
+
+
+def test_mock_defines_no_usage_limit_exception_classes() -> None:
+    """The tier classes have exactly one definition, in ``akgentic.llm.agent`` (AC #19).
+
+    A second definition in the mock module would be a different class object, so an
+    ``except RunUsageLimitError`` written against the real agent would silently not
+    catch the mock's — divergence that no behavioural test would surface.
+    """
+    from akgentic.llm import agent as real_agent_module
+    from akgentic.llm.loadtest import mock_agent as mock_module
+
+    for name in ("UsageLimitError", "RunUsageLimitError", "AgentUsageLimitError"):
+        defined_here = getattr(mock_module, name, None)
+        assert defined_here is None or defined_here is getattr(real_agent_module, name)
 
 
 def test_real_and_mock_close_without_branching() -> None:

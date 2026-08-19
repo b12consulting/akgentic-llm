@@ -15,13 +15,25 @@ Key Concepts:
     - REACT pattern: Iterative agent execution with tool calls
     - RunUsageLimits: Per-run token/request budget, enforced by pydantic-ai
     - AgentUsageLimits: Agent-lifetime budget, enforced pre-flight on every run
+    - RunUsageLimitError: A run-tier breach — recoverable, the turn may not call
+      another tool but the agent still has lifetime budget
+    - AgentUsageLimitError: An agent-tier breach — terminal, the agent is finished
+    - UsageLimitError: Base of both; catch it to handle either tier, catch a
+      subclass to react to one. The tiers are told apart by class, never by
+      message text.
     - ContextManager: Message history tracking
     - PromptTemplate: Template-based prompts with parameter substitution
 """
 
 from importlib import metadata as _metadata
 
-from .agent import ReactAgent, UsageLimitError, UserPrompt
+from .agent import (
+    AgentUsageLimitError,
+    ReactAgent,
+    RunUsageLimitError,
+    UsageLimitError,
+    UserPrompt,
+)
 from .compaction import (
     COMPACTION_STRATEGIES,
     SUMMARY_INSTRUCTIONS,
@@ -76,7 +88,9 @@ __all__ = [
     "CompactionConfig",
     # Agent
     "ReactAgent",
-    "UsageLimitError",
+    "UsageLimitError",  # base of both tiers — catch it to handle either
+    "RunUsageLimitError",
+    "AgentUsageLimitError",
     "UserPrompt",
     # Context
     "ContextManager",

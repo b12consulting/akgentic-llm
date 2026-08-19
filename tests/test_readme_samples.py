@@ -39,6 +39,7 @@ from pydantic_ai.messages import ModelRequest, SystemPromptPart, UserPromptPart
 from akgentic.llm import (
     COMPACTION_STRATEGIES,
     SUMMARY_INSTRUCTIONS,
+    AgentUsageLimitError,
     AgentUsageLimits,
     CompactionConfig,
     CompactionResult,
@@ -54,10 +55,12 @@ from akgentic.llm import (
     ReactAgent,
     ReactAgentConfig,
     RuntimeConfig,
+    RunUsageLimitError,
     RunUsageLimits,
     SystemPromptPartSnapshot,
     ToolCallEvent,
     ToolReturnEvent,
+    UsageLimitError,
     UserPrompt,
     aggregate_usage,
     create_compaction,
@@ -281,6 +284,28 @@ def test_agent_usage_limits_table_defaults() -> None:
     assert defaults.total_tokens_limit is None
 
 
+def test_telling_the_two_tiers_apart_sample() -> None:
+    """§Usage limits — the ``except RunUsageLimitError`` / ``except AgentUsageLimitError`` sample.
+
+    The sample's three imports must resolve, and the claims the prose makes about
+    them must hold: both tiers subclass the exported base, so the pre-split
+    ``except UsageLimitError`` still catches either one, and the two tiers are
+    distinct classes rather than aliases. Asserted on the classes themselves —
+    the same discipline the section tells readers to apply.
+    """
+    assert issubclass(RunUsageLimitError, UsageLimitError)
+    assert issubclass(AgentUsageLimitError, UsageLimitError)
+    assert RunUsageLimitError is not AgentUsageLimitError
+    assert not issubclass(RunUsageLimitError, AgentUsageLimitError)
+    assert not issubclass(AgentUsageLimitError, RunUsageLimitError)
+
+    # "an `except UsageLimitError` written before the tiers were split still
+    # catches everything it used to" — the additive claim, exercised.
+    for tier in (RunUsageLimitError, AgentUsageLimitError):
+        with pytest.raises(UsageLimitError):
+            raise tier("breach")
+
+
 def test_agent_request_limit_is_enforced_not_merely_declared() -> None:
     """§Usage limits — the agent tier is enforced, which the docs once denied.
 
@@ -295,7 +320,10 @@ def test_agent_request_limit_is_enforced_not_merely_declared() -> None:
     agent = ReactAgent(config=config)
     try:
         agent._check_and_consume_agent_budget()  # consumes the only unit
-        with pytest.raises(Exception, match="agent_request_limit"):
+        # The tier is asserted by CLASS. `pytest.raises(Exception, match=...)`
+        # identified it by message text, which is the one thing the README tells
+        # readers never to branch on.
+        with pytest.raises(AgentUsageLimitError):
             agent._check_and_consume_agent_budget()
     finally:
         agent.close()

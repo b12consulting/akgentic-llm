@@ -105,14 +105,28 @@ class MockReactAgent:
         self, user_prompt: Any, deps: Any = None, output_type: type[Any] | None = None
     ) -> Any:
         """Replay the matching state's event stream and return its output."""
+        return await self._replay(user_prompt, deps, output_type, with_tools=True)
+
+    async def _replay(
+        self, prompt: Any, deps: Any, output_type: type[Any] | None, *, with_tools: bool
+    ) -> Any:
+        """Select, emit and consume one state — the turn body both entry points share.
+
+        ``with_tools`` is the *only* difference between a ``run()`` and a
+        conclusion, so the two keep one body: a step added to a turn here (an event,
+        a context write, a usage fold) reaches both, which is the drop-in parity
+        this class exists for. Two copies would let the conclusion drift silently —
+        the signature-equality test in the suite cannot see a missing emit.
+        """
         self._run_id = str(uuid.uuid4())
         name = self._agent_name(deps)
         script = self._scenario.agents[name]
-        state = self._select_state(script, user_prompt)
-        self._emit_request(user_prompt)
-        for stub in state.tools:
-            self._emit_tool_call(stub)
-            self._emit_tool_return(stub)
+        state = self._select_state(script, prompt)
+        self._emit_request(prompt)
+        if with_tools:
+            for stub in state.tools:
+                self._emit_tool_call(stub)
+                self._emit_tool_return(stub)
         self._emit_final_response(state)
         await self._sleep(self._latency_ms(state))
         return self._build_output(state, output_type)
@@ -131,6 +145,41 @@ class MockReactAgent:
         if self._closed or self._loop.is_closed():
             raise RuntimeError("MockReactAgent is closed")
         return self._loop.run_until_complete(self.run(user_prompt, deps, output_type))
+
+    async def conclude_without_tools(
+        self, reason: str, *, deps: Any = None, output_type: type[Any] | None = None
+    ) -> Any:
+        """Replay a state's stream **without any tool events** (mirrors ``ReactAgent``).
+
+        "No tools" is what the real class achieves by overriding the toolset away;
+        for the mock it is the same fact expressed in its own terms — the
+        ``state.tools`` loop that :meth:`run` walks is simply skipped, so no
+        ``ToolCallEvent`` / ``ToolReturnEvent`` is emitted. Everything else is a
+        normal turn: the state is selected on ``reason`` and **consumed**, exactly
+        as a ``run()`` would consume it. That is the honest mirror — a conclusion is
+        a real turn, not a peek.
+
+        No usage-limit exception is defined or raised here; the tier classes live in
+        ``akgentic.llm.agent`` and there is exactly one definition of each.
+        """
+        return await self._replay(reason, deps, output_type, with_tools=False)
+
+    def conclude_without_tools_sync(
+        self, reason: str, *, deps: Any = None, output_type: type[Any] | None = None
+    ) -> Any:
+        """Synchronous bridge around :meth:`conclude_without_tools`.
+
+        Same shape as ``run_sync``: closed-agent guard, then ``run_until_complete``
+        on the mock's own loop. No ``asyncio.run()`` fallback.
+
+        Raises:
+            RuntimeError: If the agent has been closed.
+        """
+        if self._closed or self._loop.is_closed():
+            raise RuntimeError("MockReactAgent is closed")
+        return self._loop.run_until_complete(
+            self.conclude_without_tools(reason, deps=deps, output_type=output_type)
+        )
 
     async def aclose(self) -> None:
         """No-op teardown (mirrors ``ReactAgent.aclose``; the mock holds no client)."""
