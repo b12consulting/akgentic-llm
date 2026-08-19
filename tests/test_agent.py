@@ -1,13 +1,25 @@
 """Unit tests for ReactAgent implementation."""
 
+import asyncio
+import inspect
 from dataclasses import dataclass
-from typing import TypeVar, get_type_hints
+from typing import Any, TypeVar, get_type_hints
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from pydantic_ai import BinaryContent
 from pydantic_ai.exceptions import UsageLimitExceeded
-from pydantic_ai.messages import ModelRequest, SystemPromptPart, UserPromptPart
+from pydantic_ai.messages import (
+    ModelMessage,
+    ModelRequest,
+    ModelResponse,
+    SystemPromptPart,
+    TextPart,
+    ToolCallPart,
+    ToolReturnPart,
+    UserPromptPart,
+)
+from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.usage import RunUsage
 
 from akgentic.llm import (
@@ -23,6 +35,7 @@ from akgentic.llm import (
     UsageLimitError,
     UserPrompt,
 )
+from akgentic.llm.agent import RUN_LIMIT_HEALING_MESSAGE
 from akgentic.llm.compaction import SummarizingCompaction
 from akgentic.llm.event import (
     LlmContextClearedEvent,
@@ -1379,6 +1392,246 @@ class TestUsageLimitErrorTierSplit:
                 run_agent.run_sync("burn the turn")
         # pydantic-ai's own wording, translated verbatim by str(e).
         assert "Request limit exceeded" in str(run_tier.value)
+
+
+def weather_lookup(city: str) -> str:
+    """Look up the weather for a city.
+
+    Args:
+        city: The city to look up.
+
+    Returns:
+        A canned forecast string.
+    """
+    return f"sunny in {city}"
+
+
+def _tool_capturing_model(seen: dict[str, list[str]]) -> FunctionModel:
+    """A model stub recording the tool names the agent OFFERED it on each request.
+
+    ``AgentInfo.function_tools`` is what the model may call, so it is the outcome
+    the no-tools claim is about — as opposed to whether ``override`` was called,
+    which is the implementation detail the epic explicitly refuses to assert on.
+    """
+
+    def stub(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        seen["tools"] = [t.name for t in info.function_tools]
+        return ModelResponse(parts=[TextPart(content="done")])
+
+    return FunctionModel(stub)
+
+
+class TestReactAgentConcludeWithoutTools:
+    """conclude_without_tools(): one follow-up run, no tools, its own budget."""
+
+    async def test_conclusion_offers_the_model_no_tools(self, minimal_config):
+        """The conclusion run reaches the model with an empty tool list (AC #9).
+
+        Asserted on what the model was **offered**, not on the ``override`` call.
+        A per-run ``toolsets=[]`` — the plausible wrong implementation, since
+        ``iter()`` accepts one — leaves every registered tool in place and fails
+        here; only ``override(tools=[], toolsets=[])`` replaces them.
+        """
+        agent = ReactAgent(config=minimal_config, tools=[weather_lookup])
+        seen: dict[str, list[str]] = {}
+
+        with agent.pydantic_agent.override(model=_tool_capturing_model(seen)):
+            await agent.conclude_without_tools("budget spent, answer now")
+
+        assert seen["tools"] == []
+
+    async def test_an_ordinary_run_still_offers_the_tool(self, minimal_config):
+        """Control case: the same agent, the same stub, ``run()`` (AC #9).
+
+        Without this the assertion above passes even if ``weather_lookup`` was
+        never registered — i.e. even if the conclusion removed nothing at all.
+        """
+        agent = ReactAgent(config=minimal_config, tools=[weather_lookup])
+        seen: dict[str, list[str]] = {}
+
+        with agent.pydantic_agent.override(model=_tool_capturing_model(seen)):
+            await agent.run("ordinary turn")
+
+        assert seen["tools"] == ["weather_lookup"]
+
+    async def test_conclusion_carries_its_own_single_request_limit(self):
+        """The conclusion is bounded by request_limit=1, never the config tier (AC #10).
+
+        The configured run tier is 7, so this distinguishes "uses its own budget"
+        from "uses whichever budget is set" — including the budget that was just
+        exhausted, which is the one it must not inherit.
+        """
+        config = ReactAgentConfig(
+            model_cfg=ModelConfig(provider="openai", model="gpt-4o"),
+            run_usage_limits=RunUsageLimits(run_request_limit=7),
+        )
+        agent = ReactAgent(config=config)
+        captured: dict = {}
+
+        with patch.object(
+            agent._pydantic_agent, "iter", side_effect=_capturing_stub_run(captured)
+        ):
+            await agent.conclude_without_tools("wrap it up")
+
+        assert captured["usage_limits"].request_limit == 1
+
+    async def test_reason_reaches_the_model_as_the_user_prompt(self, minimal_config):
+        """``reason`` is the run's prompt, not a log line (AC #11)."""
+        agent = ReactAgent(config=minimal_config)
+        captured: dict = {}
+
+        with patch.object(
+            agent._pydantic_agent, "iter", side_effect=_capturing_stub_run(captured)
+        ):
+            await agent.conclude_without_tools("your tool budget is spent; answer now")
+
+        assert captured["user_prompt"] == "your tool budget is spent; answer now"
+
+    async def test_conclusion_returns_the_runs_output(self, minimal_config):
+        """The conclusion returns the run output the way ``run()`` does (AC #8)."""
+        agent = ReactAgent(config=minimal_config)
+
+        with patch.object(
+            agent._pydantic_agent, "iter", return_value=_StubRun(output="concluded")
+        ):
+            result = await agent.conclude_without_tools("wrap it up")
+
+        assert result == "concluded"
+
+    def test_spent_run_budget_refuses_the_conclusion_before_any_model_call(self):
+        """An agent at its lifetime run limit cannot conclude (AC #12).
+
+        Terminal by design: the budget that would pay for the conclusion is exactly
+        the one that is spent. ``iter`` is asserted un-called — the refusal must be
+        pre-flight, not a model round-trip that then fails.
+        """
+        agent = ReactAgent(config=_agent_limit_config(1))
+        with patch.object(agent._pydantic_agent, "iter", side_effect=_StubRun):
+            agent.run_sync("the only run this agent gets")
+
+        with patch.object(agent._pydantic_agent, "iter", side_effect=_StubRun) as iter_call:
+            with pytest.raises(AgentUsageLimitError):
+                agent.conclude_without_tools_sync("wrap it up")
+
+        iter_call.assert_not_called()
+
+    def test_spent_token_budget_refuses_the_conclusion(self):
+        """The token half of the agent tier refuses the conclusion too (AC #12)."""
+        agent = ReactAgent(config=_agent_token_config(total_tokens_limit=100))
+        with patch.object(agent._pydantic_agent, "iter", side_effect=_stub_run_spending(80, 40)):
+            agent.run_sync("burn the lifetime token budget")
+
+        with patch.object(agent._pydantic_agent, "iter", side_effect=_StubRun) as iter_call:
+            with pytest.raises(AgentUsageLimitError):
+                agent.conclude_without_tools_sync("wrap it up")
+
+        iter_call.assert_not_called()
+
+    async def test_conclusion_runs_on_top_of_the_healed_context(self, minimal_config):
+        """The healing ToolReturnPart is in the history the conclusion is given (AC #13).
+
+        This is the whole point of healing before concluding: the tool result the
+        model reads as the reason it must answer now is already in the context the
+        follow-up run is handed.
+        """
+        agent = ReactAgent(config=minimal_config)
+        agent._context.add_message(
+            ModelResponse(parts=[ToolCallPart(tool_name="lookup", tool_call_id="c1", args="{}")])
+        )
+
+        breach = _StubRun(enter_raises=UsageLimitExceeded("Request limit exceeded"))
+        with patch.object(agent._pydantic_agent, "iter", return_value=breach):
+            with pytest.raises(RunUsageLimitError):
+                await agent.run("do the thing")
+
+        captured: dict = {}
+        with patch.object(
+            agent._pydantic_agent, "iter", side_effect=_capturing_stub_run(captured)
+        ):
+            await agent.conclude_without_tools("wrap it up")
+
+        healed = [
+            p
+            for m in captured["message_history"]
+            if isinstance(m, ModelRequest)
+            for p in m.parts
+            if isinstance(p, ToolReturnPart)
+        ]
+        assert [str(p.content) for p in healed] == [RUN_LIMIT_HEALING_MESSAGE]
+
+    def test_sync_bridge_returns_the_same_output(self, minimal_config):
+        """conclude_without_tools_sync() returns what the async form returns (AC #14)."""
+        agent = ReactAgent(config=minimal_config)
+
+        with patch.object(
+            agent._pydantic_agent, "iter", return_value=_StubRun(output="concluded")
+        ):
+            assert agent.conclude_without_tools_sync("wrap it up") == "concluded"
+
+    def test_sync_bridge_raises_after_close(self, minimal_config):
+        """The closed-agent guard is the same one run_sync/compact carry (AC #14)."""
+        agent = ReactAgent(config=minimal_config)
+        agent.close()
+        with pytest.raises(RuntimeError, match="ReactAgent is closed"):
+            agent.conclude_without_tools_sync("wrap it up")
+
+    def test_sync_bridge_runs_on_the_agents_own_loop(self, minimal_config):
+        """One loop strategy, not two (AC #14).
+
+        ``asyncio.run()`` or a fresh loop per call would detach the pooled httpx
+        connections from the loop that owns them, so ``aclose()`` raises on stop
+        and the pool leaks. Two calls, so a per-call loop shows up as two distinct
+        loops rather than one.
+        """
+        used_loops: list[asyncio.AbstractEventLoop] = []
+
+        async def stub_conclude(*_: Any, **__: Any) -> str:
+            used_loops.append(asyncio.get_running_loop())
+            return "ran-on-owned-loop"
+
+        agent = ReactAgent(config=minimal_config)
+        try:
+            with patch.object(ReactAgent, "conclude_without_tools", new=stub_conclude):
+                first = agent.conclude_without_tools_sync("once")
+                second = agent.conclude_without_tools_sync("twice")
+            assert first == second == "ran-on-owned-loop"
+            assert used_loops == [agent._loop, agent._loop]
+            assert not agent._loop.is_closed()
+        finally:
+            agent.close()
+
+    def test_run_still_raises_and_never_concludes_on_its_own(self, minimal_config):
+        """run()'s contract is unchanged (AC #15).
+
+        A run-tier breach propagates out of ``run()`` exactly as before, and the
+        conclusion is not attempted from inside it: exactly one ``iter()`` call, and
+        ``conclude_without_tools`` never invoked. Recovering inside ``run()`` would
+        make the run tier a brake nobody can observe.
+        """
+        agent = ReactAgent(config=minimal_config)
+        breach = _StubRun(enter_raises=UsageLimitExceeded("Request limit exceeded"))
+
+        with patch.object(agent._pydantic_agent, "iter", return_value=breach) as iter_call:
+            with patch.object(agent, "conclude_without_tools") as conclude:
+                with pytest.raises(RunUsageLimitError):
+                    agent.run_sync("burn the turn")
+
+        assert iter_call.call_count == 1
+        conclude.assert_not_called()
+
+    def test_run_signature_gained_no_limits_parameter(self):
+        """The limits override is internal; run()'s public signature is untouched (AC #15).
+
+        The extraction that makes the conclusion possible must not leak a knob onto
+        ``run()`` — a caller passing its own run-tier budget per call is a different
+        feature, and not this one.
+        """
+        assert list(inspect.signature(ReactAgent.run).parameters) == [
+            "self",
+            "user_prompt",
+            "deps",
+            "output_type",
+        ]
 
 
 class TestReactAgentMultimodalPrompt:

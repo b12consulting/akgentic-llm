@@ -132,6 +132,48 @@ class MockReactAgent:
             raise RuntimeError("MockReactAgent is closed")
         return self._loop.run_until_complete(self.run(user_prompt, deps, output_type))
 
+    async def conclude_without_tools(
+        self, reason: str, *, deps: Any = None, output_type: type[Any] | None = None
+    ) -> Any:
+        """Replay a state's stream **without any tool events** (mirrors ``ReactAgent``).
+
+        "No tools" is what the real class achieves by overriding the toolset away;
+        for the mock it is the same fact expressed in its own terms — the
+        ``state.tools`` loop that :meth:`run` walks is simply skipped, so no
+        ``ToolCallEvent`` / ``ToolReturnEvent`` is emitted. Everything else is a
+        normal turn: the state is selected on ``reason`` and **consumed**, exactly
+        as a ``run()`` would consume it. That is the honest mirror — a conclusion is
+        a real turn, not a peek.
+
+        No usage-limit exception is defined or raised here; the tier classes live in
+        ``akgentic.llm.agent`` and there is exactly one definition of each.
+        """
+        self._run_id = str(uuid.uuid4())
+        name = self._agent_name(deps)
+        script = self._scenario.agents[name]
+        state = self._select_state(script, reason)
+        self._emit_request(reason)
+        self._emit_final_response(state)
+        await self._sleep(self._latency_ms(state))
+        return self._build_output(state, output_type)
+
+    def conclude_without_tools_sync(
+        self, reason: str, *, deps: Any = None, output_type: type[Any] | None = None
+    ) -> Any:
+        """Synchronous bridge around :meth:`conclude_without_tools`.
+
+        Same shape as ``run_sync``: closed-agent guard, then ``run_until_complete``
+        on the mock's own loop. No ``asyncio.run()`` fallback.
+
+        Raises:
+            RuntimeError: If the agent has been closed.
+        """
+        if self._closed or self._loop.is_closed():
+            raise RuntimeError("MockReactAgent is closed")
+        return self._loop.run_until_complete(
+            self.conclude_without_tools(reason, deps=deps, output_type=output_type)
+        )
+
     async def aclose(self) -> None:
         """No-op teardown (mirrors ``ReactAgent.aclose``; the mock holds no client)."""
         return None
