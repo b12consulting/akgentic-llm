@@ -338,10 +338,12 @@ except AgentUsageLimitError:
 ```
 
 After a run-tier breach the context is left runnable rather than diagnostic: the tool calls the
-aborted turn never answered are healed with a short **model-facing instruction** — "this turn's
-budget is exhausted, answer now with what you already have" — so that sentence, not a traceback,
-is the tool result a follow-up run reasons from. The operator still gets the stack: the exception
-is re-raised unchanged and its traceback travels the event stream.
+aborted turn never answered are healed with a short **model-facing instruction** — it tells the
+model this turn's budget is spent, that no further tool call is possible, and to answer now with
+what it already has — so that sentence, not a traceback, is the tool result a follow-up run
+reasons from. The operator still gets the stack: the breach leaves `run()` as a
+`RunUsageLimitError` chained from pydantic-ai's own `UsageLimitExceeded` (`raise ... from e`), and
+that exception's traceback is what reaches the event stream.
 
 #### Migrating from the pre-split surface
 
