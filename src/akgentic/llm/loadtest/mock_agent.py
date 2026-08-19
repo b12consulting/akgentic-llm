@@ -105,14 +105,28 @@ class MockReactAgent:
         self, user_prompt: Any, deps: Any = None, output_type: type[Any] | None = None
     ) -> Any:
         """Replay the matching state's event stream and return its output."""
+        return await self._replay(user_prompt, deps, output_type, with_tools=True)
+
+    async def _replay(
+        self, prompt: Any, deps: Any, output_type: type[Any] | None, *, with_tools: bool
+    ) -> Any:
+        """Select, emit and consume one state — the turn body both entry points share.
+
+        ``with_tools`` is the *only* difference between a ``run()`` and a
+        conclusion, so the two keep one body: a step added to a turn here (an event,
+        a context write, a usage fold) reaches both, which is the drop-in parity
+        this class exists for. Two copies would let the conclusion drift silently —
+        the signature-equality test in the suite cannot see a missing emit.
+        """
         self._run_id = str(uuid.uuid4())
         name = self._agent_name(deps)
         script = self._scenario.agents[name]
-        state = self._select_state(script, user_prompt)
-        self._emit_request(user_prompt)
-        for stub in state.tools:
-            self._emit_tool_call(stub)
-            self._emit_tool_return(stub)
+        state = self._select_state(script, prompt)
+        self._emit_request(prompt)
+        if with_tools:
+            for stub in state.tools:
+                self._emit_tool_call(stub)
+                self._emit_tool_return(stub)
         self._emit_final_response(state)
         await self._sleep(self._latency_ms(state))
         return self._build_output(state, output_type)
@@ -148,14 +162,7 @@ class MockReactAgent:
         No usage-limit exception is defined or raised here; the tier classes live in
         ``akgentic.llm.agent`` and there is exactly one definition of each.
         """
-        self._run_id = str(uuid.uuid4())
-        name = self._agent_name(deps)
-        script = self._scenario.agents[name]
-        state = self._select_state(script, reason)
-        self._emit_request(reason)
-        self._emit_final_response(state)
-        await self._sleep(self._latency_ms(state))
-        return self._build_output(state, output_type)
+        return await self._replay(reason, deps, output_type, with_tools=False)
 
     def conclude_without_tools_sync(
         self, reason: str, *, deps: Any = None, output_type: type[Any] | None = None

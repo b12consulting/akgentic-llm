@@ -338,6 +338,14 @@ class ReactAgent:
         leave pooled httpx connections attached to already-closed loops, making
         ``aclose()`` raise on stop and leaking the pool.
 
+        Args:
+            reason: Why the turn must conclude now (see :meth:`conclude_without_tools`).
+            deps: Optional dependency object (must match deps_type).
+            output_type: Optional per-call output type override (see ``run()``).
+
+        Returns:
+            Agent result output, exactly as :meth:`conclude_without_tools` returns it.
+
         Raises:
             RuntimeError: If the agent has been closed.
             UsageLimitError: Whatever :meth:`conclude_without_tools` raised.
@@ -369,6 +377,16 @@ class ReactAgent:
             deps: Optional dependency object.
             output_type: Optional per-call output type override.
             limits: The run-tier budget to bound this turn with, or None.
+
+        Returns:
+            Agent result output, or None when the run produced no result.
+
+        Raises:
+            AgentUsageLimitError: Raised pre-flight by either agent-tier check.
+            RunUsageLimitError: Raised when pydantic-ai breaches a run-tier limit.
+            Exception: Anything else the run raised, re-raised unchanged after the
+                context is healed — the object and its ``__traceback__`` are the
+                caller's, not this method's, to alter.
         """
         # Pre-flight: reject before spending anything (a rejected run must not even
         # pay for compaction's summarizer call). Tokens first, so a token rejection
@@ -760,12 +778,16 @@ class ReactAgent:
         )
 
     def _heal_unprocessed_tool_calls(self, model_message: str) -> None:
-        """Complete any pending tool calls in context with error responses.
+        """Complete any pending tool calls in context with a message for the model.
 
         When the REACT loop fails mid-execution, the last message may be a
         ModelResponse with tool calls that never received results. This
         appends a ModelRequest with ToolReturnPart for each pending call,
         preventing the 'unprocessed tool calls' error on the next run().
+
+        The structural half is ADR-003 and unchanged: one part per dangling call,
+        appended as one request. What each part *carries* is a sentence written for
+        the model — the reader of a tool result — not a diagnostic for an operator.
 
         Args:
             model_message: The tool result the **model** reads on its next turn —
