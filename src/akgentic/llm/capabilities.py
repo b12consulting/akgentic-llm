@@ -259,9 +259,14 @@ class EventSourcingCapability(AbstractCapability[Any]):
         changing which object it is, while ``cursor`` still counts from before the shift.
 
         ``cursor`` is the fallback for the one edit identity cannot follow — a rebuild that
-        replaces messages with equal copies, which leaves their positions intact. An edit that
-        rebuilds *and* shifts in the same pass defeats both; pydantic-ai's own layered
-        equivalent has the same blind spot and reaches for ``run_id`` there.
+        replaces messages with equal copies, which leaves their positions intact.
+
+        Two edits defeat both bounds, because each destroys the anchor *and* moves what is
+        behind it: rebuilding and shifting in the same pass, and removing the anchor message
+        itself. Both fall back to a cursor that no longer describes the list, which duplicates
+        or skips exactly as an unanchored cursor did. pydantic-ai's own layered equivalent has
+        the same blind spot and reaches for ``run_id`` there; this one does not, and a
+        processor that summarises or redacts durable history is the shape that reaches it.
         """
         tail = self._recorded_tail
         if tail is not None:

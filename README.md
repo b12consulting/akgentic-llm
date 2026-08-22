@@ -605,20 +605,41 @@ libraries.
 message-transforming function via `before_model_request`, exactly the domain-specific-
 transformation use case ADR-011 names:
 
+**Write the processor to be idempotent.** It runs on **every model request**, not once per
+run, so an unconditional prepend stacks one block per step within a single run. Injected
+content is also durable — it lands in the history the run persists — so on a first run the
+block is recorded like any other message, and an unguarded prepend would then sit on top of
+the copy already persisted. Guard the injection on what is already there, as below.
+
 ```python
 from pydantic_ai.capabilities import ProcessHistory
+from pydantic_ai.messages import ModelRequest, UserPromptPart
 from akgentic.llm import ReactAgent, ReactAgentConfig, ModelConfig
+
+SOURCE_REFERENCES = "... a deployment's source-reference block ..."
+
+def _is_source_reference(message):
+    return (
+        isinstance(message, ModelRequest)
+        and len(message.parts) == 1
+        and isinstance(message.parts[0], UserPromptPart)
+        and message.parts[0].content == SOURCE_REFERENCES
+    )
 
 def inject_source_reference(messages):
     """Domain-specific history transformation — not a framework concern."""
-    # ... prepend a deployment's source-reference block, etc.
-    return messages
+    if messages and _is_source_reference(messages[0]):
+        return messages
+    return [ModelRequest(parts=[UserPromptPart(content=SOURCE_REFERENCES)]), *messages]
 
 agent = ReactAgent(
     config=ReactAgentConfig(model_cfg=ModelConfig(provider="openai", model="gpt-4o")),
     capabilities=[ProcessHistory(processor=inject_source_reference)],
 )
 ```
+
+Prepending is also the only safe direction: pydantic-ai rejects a processed list that is empty
+or does not end with a `ModelRequest`.
 
 **Ordering caveats — none is guessable from the signature:**
 - A capability's `before_model_request` hook runs **after** compaction: `ContextManager`

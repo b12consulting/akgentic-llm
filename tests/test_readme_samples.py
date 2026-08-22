@@ -574,11 +574,30 @@ def test_capabilities_process_history_sample(agents: Any) -> None:
 
     ``ProcessHistory`` is a pydantic-ai v2 built-in; the import in this sample is
     the one that must not rot when the dependency moves.
+
+    The sample's processor is idempotent because it runs on every model request, not
+    once per run. That is asserted here rather than only stated: applying it twice must
+    leave one block, or the documented example is one a deployment cannot copy.
     """
+    source_references = "... a deployment's source-reference block ..."
+
+    def _is_source_reference(message):  # noqa: ANN001, ANN202
+        return (
+            isinstance(message, ModelRequest)
+            and len(message.parts) == 1
+            and isinstance(message.parts[0], UserPromptPart)
+            and message.parts[0].content == source_references
+        )
 
     def inject_source_reference(messages):  # noqa: ANN001, ANN202
         """Domain-specific history transformation — not a framework concern."""
-        return messages
+        if messages and _is_source_reference(messages[0]):
+            return messages
+        return [ModelRequest(parts=[UserPromptPart(content=source_references)]), *messages]
+
+    once = inject_source_reference([ModelRequest(parts=[UserPromptPart(content="hello")])])
+    assert inject_source_reference(once) == once, "the documented processor is not idempotent"
+    assert len(once) == 2
 
     agent = agents(
         ReactAgentConfig(model_cfg=ModelConfig(provider="openai", model="gpt-4o")),

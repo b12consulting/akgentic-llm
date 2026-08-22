@@ -696,8 +696,11 @@ async def test_a_capability_that_prepends_does_not_re_persist_the_previous_run()
         assert sum(1 for m in persisted if m is response) == 1, (
             "the first run's response reappeared in the second run's persisted delta"
         )
-    # Nothing skipped either: a fix that stops duplicating by dropping fails here.
-    assert {id(m) for m in second.new_messages()} <= {id(m) for m in persisted}
+    # Nothing skipped either, in either run: a fix that stops duplicating by dropping fails
+    # here. Both runs, because the co-mount shifts the first run's messages too.
+    persisted_ids = {id(m) for m in persisted}
+    assert {id(m) for m in first.new_messages()} <= persisted_ids
+    assert {id(m) for m in second.new_messages()} <= persisted_ids
     assert context.messages == persisted
 
 
