@@ -69,8 +69,7 @@ def _system_request(
     Optionally appends a UserPromptPart to mirror a realistic first request.
     """
     request_parts: list[object] = [
-        SystemPromptPart(content=content, dynamic_ref=dynamic_ref)
-        for dynamic_ref, content in parts
+        SystemPromptPart(content=content, dynamic_ref=dynamic_ref) for dynamic_ref, content in parts
     ]
     if user is not None:
         request_parts.append(UserPromptPart(content=user))

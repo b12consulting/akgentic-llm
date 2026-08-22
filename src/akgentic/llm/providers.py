@@ -411,8 +411,7 @@ def _create_google_model(
     api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
     if not api_key:
         raise ValueError(
-            "GOOGLE_API_KEY or GEMINI_API_KEY environment variable is required "
-            "for Google provider"
+            "GOOGLE_API_KEY or GEMINI_API_KEY environment variable is required for Google provider"
         )
     settings = _build_core_settings(config)
     return GoogleModel(

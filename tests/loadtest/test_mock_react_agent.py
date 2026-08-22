@@ -32,9 +32,7 @@ from akgentic.llm.loadtest import (
 )
 from akgentic.llm.loadtest.scenario import SCENARIO_ENV_VAR, _resolve_scenario_ref
 
-SANDPILE = str(
-    Path(__file__).parent / "scenarios" / "sandpile-research.yaml"
-)
+SANDPILE = str(Path(__file__).parent / "scenarios" / "sandpile-research.yaml")
 
 
 # ---------------------------------------------------------------------------
@@ -97,8 +95,14 @@ def test_drop_in_surface() -> None:
     """Every ReactAgent member used by BaseAgent/state-restore is present."""
     agent = _make_agent("@Expert")
     assert hasattr(agent, "context")
-    for member in ("run", "run_sync", "subscribe_context",
-                   "restore_context", "system_prompt", "tool"):
+    for member in (
+        "run",
+        "run_sync",
+        "subscribe_context",
+        "restore_context",
+        "system_prompt",
+        "tool",
+    ):
         assert callable(getattr(agent, member))
 
     def fn() -> None:  # decorator passthrough
@@ -219,12 +223,10 @@ def test_identity_resolved_from_deps() -> None:
 def test_state_matching() -> None:
     """A matching `when` selects the state; a non-match falls to default."""
     agent = _make_agent("@Manager")
-    hit = agent.run_sync("about sandpile", deps=_Deps("@Manager"),
-                         output_type=_StructuredOutput)
+    hit = agent.run_sync("about sandpile", deps=_Deps("@Manager"), output_type=_StructuredOutput)
     assert len(hit.messages) == 2
 
-    miss = agent.run_sync("unrelated topic", deps=_Deps("@Manager"),
-                          output_type=_StructuredOutput)
+    miss = agent.run_sync("unrelated topic", deps=_Deps("@Manager"), output_type=_StructuredOutput)
     assert miss.messages == []
 
 
@@ -257,8 +259,7 @@ def test_event_stream_order() -> None:
     """Observer sees inbound request, tool call/return, then final response."""
     rec = _Recorder()
     agent = _make_agent("@Manager", observer=rec)
-    agent.run_sync("the sandpile model", deps=_Deps("@Manager"),
-                   output_type=_StructuredOutput)
+    agent.run_sync("the sandpile model", deps=_Deps("@Manager"), output_type=_StructuredOutput)
 
     kinds = [type(e).__name__ for e in rec.events]
     # Key subsequence in order: inbound msg, tool-call msg+event, tool-return
@@ -278,16 +279,21 @@ def test_tool_calls_simulated_not_executed() -> None:
     """The synthetic call/return parts exist; no real tool is referenced."""
     rec = _Recorder()
     agent = _make_agent("@Manager", observer=rec)
-    agent.run_sync("the sandpile model", deps=_Deps("@Manager"),
-                   output_type=_StructuredOutput)
+    agent.run_sync("the sandpile model", deps=_Deps("@Manager"), output_type=_StructuredOutput)
     messages = agent.context.messages
     call_parts = [
-        p for m in messages if isinstance(m, ModelResponse)
-        for p in m.parts if isinstance(p, ToolCallPart)
+        p
+        for m in messages
+        if isinstance(m, ModelResponse)
+        for p in m.parts
+        if isinstance(p, ToolCallPart)
     ]
     return_parts = [
-        p for m in messages if isinstance(m, ModelRequest)
-        for p in m.parts if isinstance(p, ToolReturnPart)
+        p
+        for m in messages
+        if isinstance(m, ModelRequest)
+        for p in m.parts
+        if isinstance(p, ToolReturnPart)
     ]
     assert call_parts and return_parts
     args = call_parts[0].args
@@ -346,8 +352,9 @@ def test_sandpile_manager() -> None:
     """@Manager: simulated update_planning + instruction/notification routing."""
     rec = _Recorder()
     agent = _make_agent("@Manager", observer=rec)
-    out = agent.run_sync("the sandpile model", deps=_Deps("@Manager"),
-                         output_type=_StructuredOutput)
+    out = agent.run_sync(
+        "the sandpile model", deps=_Deps("@Manager"), output_type=_StructuredOutput
+    )
     assert [m.recipient for m in out.messages] == ["@Assistant", "@Expert"]
     assert "web search" in out.messages[0].message.lower()
     call = next(e for e in rec.events if isinstance(e, ToolCallEvent))
@@ -358,8 +365,9 @@ def test_sandpile_assistant() -> None:
     """@Assistant: simulated web_search + findings routed to @Expert."""
     rec = _Recorder()
     agent = _make_agent("@Assistant", observer=rec)
-    out = agent.run_sync("research the sandpile model", deps=_Deps("@Assistant"),
-                         output_type=_StructuredOutput)
+    out = agent.run_sync(
+        "research the sandpile model", deps=_Deps("@Assistant"), output_type=_StructuredOutput
+    )
     assert [m.recipient for m in out.messages] == ["@Expert"]
     assert out.messages[0].message_type == "response"
     call = next(e for e in rec.events if isinstance(e, ToolCallEvent))
@@ -370,10 +378,8 @@ def test_sandpile_expert() -> None:
     """@Expert: empty StructuredOutput for both inbound messages."""
     agent = _make_agent("@Expert")
     deps = _Deps("@Expert")
-    a = agent.run_sync("notification from @Manager", deps=deps,
-                       output_type=_StructuredOutput)
-    b = agent.run_sync("notification from @Assistant", deps=deps,
-                       output_type=_StructuredOutput)
+    a = agent.run_sync("notification from @Manager", deps=deps, output_type=_StructuredOutput)
+    b = agent.run_sync("notification from @Assistant", deps=deps, output_type=_StructuredOutput)
     assert a.messages == [] and b.messages == []
 
 
@@ -389,8 +395,7 @@ def test_latency_applied() -> None:
         agent = _make_agent("@Manager")
         agent._scenario.agents["@Manager"].states[0].latency_ms = 50
         start = time.perf_counter()
-        await agent.run("the sandpile model", deps=_Deps("@Manager"),
-                        output_type=_StructuredOutput)
+        await agent.run("the sandpile model", deps=_Deps("@Manager"), output_type=_StructuredOutput)
         assert time.perf_counter() - start >= 0.045
 
     asyncio.run(_run())
@@ -429,8 +434,14 @@ def test_no_sibling_import() -> None:
     src = Path(__file__).parents[2] / "src" / "akgentic" / "llm" / "loadtest"
     for module in ("mock_agent.py", "scenario.py", "__init__.py"):
         text = (src / module).read_text(encoding="utf-8")
-        for sibling in ("akgentic.core", "akgentic.tool", "akgentic.agent",
-                        "akgentic.team", "akgentic.catalog", "akgentic.infra"):
+        for sibling in (
+            "akgentic.core",
+            "akgentic.tool",
+            "akgentic.agent",
+            "akgentic.team",
+            "akgentic.catalog",
+            "akgentic.infra",
+        ):
             assert sibling not in text
 
 
@@ -470,8 +481,7 @@ def test_event_loop_arg_accepted_and_ignored() -> None:
 def test_restore_context_filters_llm_messages() -> None:
     """restore_context loads only LlmMessageEvent payloads into the context."""
     agent = _make_agent("@Manager")
-    agent.run_sync("the sandpile model", deps=_Deps("@Manager"),
-                   output_type=_StructuredOutput)
+    agent.run_sync("the sandpile model", deps=_Deps("@Manager"), output_type=_StructuredOutput)
     snapshot_messages = agent.context.messages
 
     class _Carrier:
@@ -490,8 +500,11 @@ def test_restore_context_filters_llm_messages() -> None:
 def test_multimodal_list_prompt_matches() -> None:
     """A multimodal list prompt is flattened to text for state matching."""
     agent = _make_agent("@Manager")
-    out = agent.run_sync(["please discuss the", "sandpile model"],
-                         deps=_Deps("@Manager"), output_type=_StructuredOutput)
+    out = agent.run_sync(
+        ["please discuss the", "sandpile model"],
+        deps=_Deps("@Manager"),
+        output_type=_StructuredOutput,
+    )
     assert len(out.messages) == 2
 
 
@@ -502,10 +515,8 @@ def test_regex_and_from_sender_matchers() -> None:
         "agents": {
             "@A": {
                 "states": [
-                    {"id": "rx", "when": {"regex": r"\bfoo\d+"},
-                     "respond": {"text": "rx-hit"}},
-                    {"id": "snd", "when": {"from_sender": "@Boss"},
-                     "respond": {"text": "snd-hit"}},
+                    {"id": "rx", "when": {"regex": r"\bfoo\d+"}, "respond": {"text": "rx-hit"}},
+                    {"id": "snd", "when": {"from_sender": "@Boss"}, "respond": {"text": "snd-hit"}},
                 ],
                 "default": {"respond": {"text": "default"}},
             }
@@ -665,8 +676,7 @@ def test_run_on_the_same_state_does_emit_tool_events() -> None:
     rec = _Recorder()
     agent = _make_agent("@Manager", observer=rec)
 
-    agent.run_sync("the sandpile model", deps=_Deps("@Manager"),
-                   output_type=_StructuredOutput)
+    agent.run_sync("the sandpile model", deps=_Deps("@Manager"), output_type=_StructuredOutput)
 
     assert [e for e in rec.events if isinstance(e, ToolCallEvent)]
     assert [e for e in rec.events if isinstance(e, ToolReturnEvent)]
@@ -681,12 +691,18 @@ def test_conclude_without_tools_writes_no_tool_parts_to_context() -> None:
 
     messages = agent.context.messages
     assert not [
-        p for m in messages if isinstance(m, ModelResponse)
-        for p in m.parts if isinstance(p, ToolCallPart)
+        p
+        for m in messages
+        if isinstance(m, ModelResponse)
+        for p in m.parts
+        if isinstance(p, ToolCallPart)
     ]
     assert not [
-        p for m in messages if isinstance(m, ModelRequest)
-        for p in m.parts if isinstance(p, ToolReturnPart)
+        p
+        for m in messages
+        if isinstance(m, ModelRequest)
+        for p in m.parts
+        if isinstance(p, ToolReturnPart)
     ]
 
 

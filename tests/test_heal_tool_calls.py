@@ -234,9 +234,7 @@ class TestWarningLog:
             _heal_through_the_capability(agent, "error")
 
         assert not any(
-            "Healing" in r.getMessage()
-            for r in caplog.records
-            if r.levelno == logging.WARNING
+            "Healing" in r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
         )
 
 
@@ -291,9 +289,7 @@ class TestObserverEventsOnHeal:
         capture = _EventCapture()
         agent.subscribe_context(capture)
 
-        agent._context.add_message(
-            _response_with_tool_calls(("t1", "c1"), ("t2", "c2"))
-        )
+        agent._context.add_message(_response_with_tool_calls(("t1", "c1"), ("t2", "c2")))
         # Drain events from adding the ModelResponse so we only inspect heal-time events.
         capture.events.clear()
 

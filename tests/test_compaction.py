@@ -103,7 +103,9 @@ def test_compaction_result_is_frozen() -> None:
 def test_builtins_satisfy_protocol() -> None:
     assert isinstance(NoOpCompaction(), CompactionStrategy)
     assert isinstance(SlidingWindowCompaction(4), CompactionStrategy)
-    assert isinstance(SummarizingCompaction(CompactionConfig(), ModelConfig(), None), CompactionStrategy)
+    assert isinstance(
+        SummarizingCompaction(CompactionConfig(), ModelConfig(), None), CompactionStrategy
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -141,7 +143,9 @@ def test_registry_is_mutable_open_extension() -> None:
     sentinel = NoOpCompaction()
     COMPACTION_STRATEGIES["custom_test"] = lambda cfg, mc, hc=None: sentinel
     try:
-        assert create_compaction(CompactionConfig(strategy="custom_test"), ModelConfig()) is sentinel
+        assert (
+            create_compaction(CompactionConfig(strategy="custom_test"), ModelConfig()) is sentinel
+        )
     finally:
         del COMPACTION_STRATEGIES["custom_test"]
 
@@ -348,7 +352,11 @@ def test_format_request_part_branches() -> None:
     long_ret = _format_request_part(
         ToolReturnPart(tool_name="f", tool_call_id="c1", content="x" * 4000)
     )
-    assert long_ret is not None and long_ret.startswith("TOOL_RESULT (f):") and "[truncated]" in long_ret
+    assert (
+        long_ret is not None
+        and long_ret.startswith("TOOL_RESULT (f):")
+        and "[truncated]" in long_ret
+    )
     retry_tool = _format_request_part(
         RetryPromptPart(content="bad", tool_name="f", tool_call_id="c1")
     )
@@ -684,9 +692,7 @@ def test_split_exempts_mixed_system_user_message() -> None:
     ],
     ids=["pure-system", "mixed-system-user", "no-system", "empty-parts"],
 )
-def test_is_system_predicate_single_source_and_parity(
-    msg: ModelMessage, is_system: bool
-) -> None:
+def test_is_system_predicate_single_source_and_parity(msg: ModelMessage, is_system: bool) -> None:
     """AC6: one predicate object, shared by both call sites; split partition agrees with it."""
     # Single source of truth: context delegates to compaction's predicate (same object).
     assert ctx._is_system_message is _is_system_message

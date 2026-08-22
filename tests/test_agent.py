@@ -1581,9 +1581,7 @@ class TestReactAgentConcludeWithoutTools:
         agent = ReactAgent(config=config)
         captured: dict = {}
 
-        with patch.object(
-            agent._pydantic_agent, "iter", side_effect=_capturing_stub_run(captured)
-        ):
+        with patch.object(agent._pydantic_agent, "iter", side_effect=_capturing_stub_run(captured)):
             await agent.conclude_without_tools("wrap it up")
 
         assert captured["usage_limits"].request_limit == 1
@@ -1593,9 +1591,7 @@ class TestReactAgentConcludeWithoutTools:
         agent = ReactAgent(config=minimal_config)
         captured: dict = {}
 
-        with patch.object(
-            agent._pydantic_agent, "iter", side_effect=_capturing_stub_run(captured)
-        ):
+        with patch.object(agent._pydantic_agent, "iter", side_effect=_capturing_stub_run(captured)):
             await agent.conclude_without_tools("your tool budget is spent; answer now")
 
         assert captured["user_prompt"] == "your tool budget is spent; answer now"
@@ -1604,9 +1600,7 @@ class TestReactAgentConcludeWithoutTools:
         """The conclusion returns the run output the way ``run()`` does (AC #8)."""
         agent = ReactAgent(config=minimal_config)
 
-        with patch.object(
-            agent._pydantic_agent, "iter", return_value=_StubRun(output="concluded")
-        ):
+        with patch.object(agent._pydantic_agent, "iter", return_value=_StubRun(output="concluded")):
             result = await agent.conclude_without_tools("wrap it up")
 
         assert result == "concluded"
@@ -1686,9 +1680,7 @@ class TestReactAgentConcludeWithoutTools:
         """conclude_without_tools_sync() returns what the async form returns (AC #14)."""
         agent = ReactAgent(config=minimal_config)
 
-        with patch.object(
-            agent._pydantic_agent, "iter", return_value=_StubRun(output="concluded")
-        ):
+        with patch.object(agent._pydantic_agent, "iter", return_value=_StubRun(output="concluded")):
             assert agent.conclude_without_tools_sync("wrap it up") == "concluded"
 
     def test_sync_bridge_raises_after_close(self, minimal_config):
@@ -1960,9 +1952,7 @@ class TestReactAgentRestoreContext:
         events = [
             FakeEventMessage(event=LlmMessageEvent(message=msg1)),
             FakeEventMessage(
-                event=ToolCallEvent(
-                    run_id="r1", tool_name="t", tool_call_id="c1", arguments="{}"
-                )
+                event=ToolCallEvent(run_id="r1", tool_name="t", tool_call_id="c1", arguments="{}")
             ),
             FakeEventMessage(event=LlmMessageEvent(message=msg2)),
         ]
@@ -1979,9 +1969,7 @@ class TestReactAgentRestoreContext:
 
         events = [
             FakeEventMessage(
-                event=ToolCallEvent(
-                    run_id="r1", tool_name="t", tool_call_id="c1", arguments="{}"
-                )
+                event=ToolCallEvent(run_id="r1", tool_name="t", tool_call_id="c1", arguments="{}")
             ),
             FakeEventMessage(event="arbitrary string"),
         ]
@@ -2010,9 +1998,7 @@ class TestReactAgentRestoreContext:
 
         events = [
             FakeEventMessage(
-                event=ToolCallEvent(
-                    run_id="r1", tool_name="t", tool_call_id="c1", arguments="{}"
-                )
+                event=ToolCallEvent(run_id="r1", tool_name="t", tool_call_id="c1", arguments="{}")
             ),
         ]
 
@@ -2269,9 +2255,7 @@ class TestReactAgentRestoreSeedsSystemPromptHash:
 
         first = LlmSystemPromptEvent(run_id="r1", parts=(), content_hash="first-hash")
         second = LlmSystemPromptEvent(run_id="r2", parts=(), content_hash="second-hash")
-        agent.restore_context(
-            [FakeEventMessage(event=first), FakeEventMessage(event=second)]
-        )
+        agent.restore_context([FakeEventMessage(event=first), FakeEventMessage(event=second)])
 
         assert agent.context._last_system_prompt_hash == "second-hash"
 

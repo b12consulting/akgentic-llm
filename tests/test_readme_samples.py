@@ -179,9 +179,7 @@ def test_quick_start_tools_and_output_type_sample(agents: Any) -> None:
 
     agent = agents(
         ReactAgentConfig(
-            model_cfg=ModelConfig(
-                provider="anthropic", model="claude-3-5-sonnet-20241022"
-            ),
+            model_cfg=ModelConfig(provider="anthropic", model="claude-3-5-sonnet-20241022"),
             run_usage_limits=RunUsageLimits(run_request_limit=10, total_tokens_limit=20_000),
         ),
         tools=[fetch_data],
@@ -763,8 +761,7 @@ def test_observer_sample_imports_and_dispatches() -> None:
                 seen.append(f"Tool returned: {event.tool_name} ({status})")
             elif isinstance(event, LlmUsageEvent):
                 seen.append(
-                    f"Usage: {event.model_name} — "
-                    f"{event.input_tokens}in/{event.output_tokens}out"
+                    f"Usage: {event.model_name} — {event.input_tokens}in/{event.output_tokens}out"
                 )
             elif isinstance(event, LlmSystemPromptEvent):
                 seen.append(f"System prompt for run {event.run_id} ({event.content_hash[:8]}):")
@@ -774,8 +771,7 @@ def test_observer_sample_imports_and_dispatches() -> None:
                 seen.append(f"New message: {event.message}")
             elif isinstance(event, LlmContextCompactedEvent):
                 seen.append(
-                    f"Compacted {event.replaced_message_count} msg(s) "
-                    f"via '{event.strategy_id}'"
+                    f"Compacted {event.replaced_message_count} msg(s) via '{event.strategy_id}'"
                 )
             elif isinstance(event, LlmContextClearedEvent):
                 seen.append(f"Cleared {event.cleared_message_count} msg(s)")
@@ -914,8 +910,7 @@ def test_compaction_tracer_sample(agents: Any) -> None:
                 lines.append(f"  summary: {event.summary[:120]}…")
             elif isinstance(event, LlmContextClearedEvent):
                 lines.append(
-                    f"cleared @ run {event.run_id}: dropped "
-                    f"{event.cleared_message_count} msg(s)"
+                    f"cleared @ run {event.run_id}: dropped {event.cleared_message_count} msg(s)"
                 )
 
     tracer = CompactionTracer()
@@ -980,9 +975,7 @@ async def test_custom_compaction_strategy_sample() -> None:
 
     class KeepLastOnly:
         async def compact(self, messages):  # noqa: ANN001, ANN202
-            return CompactionResult(
-                summary="", replaced_message_count=max(0, len(messages) - 1)
-            )
+            return CompactionResult(summary="", replaced_message_count=max(0, len(messages) - 1))
 
     model_cfg = ModelConfig(provider="openai", model="gpt-4o")
     original = dict(COMPACTION_STRATEGIES)
@@ -1107,9 +1100,7 @@ def test_dynamic_system_prompts_sample(agents: Any) -> None:
     def get_current_workspace() -> str:
         return "/srv/workspace"
 
-    agent = agents(
-        ReactAgentConfig(model_cfg=ModelConfig(provider="openai", model="gpt-4o"))
-    )
+    agent = agents(ReactAgentConfig(model_cfg=ModelConfig(provider="openai", model="gpt-4o")))
 
     # Built-in utilities
     agent.system_prompt(current_datetime_prompt)

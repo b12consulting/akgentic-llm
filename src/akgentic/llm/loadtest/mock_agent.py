@@ -326,8 +326,10 @@ class MockReactAgent:
 
     def _build_output(self, state: ScenarioState, output_type: type[Any] | None) -> Any:
         """Validate a structured ``output_type`` or return the response text."""
-        if output_type is not None and output_type is not str and hasattr(
-            output_type, "model_validate"
+        if (
+            output_type is not None
+            and output_type is not str
+            and hasattr(output_type, "model_validate")
         ):
             messages = [m.model_dump() for m in state.respond.messages]
             return output_type.model_validate({"messages": messages})

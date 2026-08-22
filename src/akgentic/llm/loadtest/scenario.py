@@ -98,8 +98,7 @@ def _resolve_scenario_ref(config: Any) -> str:
     if env_ref:
         return env_ref
     raise ValueError(
-        "No mock scenario resolved from config.model_cfg.model or "
-        f"${SCENARIO_ENV_VAR}"
+        f"No mock scenario resolved from config.model_cfg.model or ${SCENARIO_ENV_VAR}"
     )
 
 
