@@ -158,6 +158,21 @@ def _counting_model(requests: list[str]) -> FunctionModel:
     return FunctionModel(stub)
 
 
+def _history_recording_model(seen: list[list[ModelMessage]]) -> FunctionModel:
+    """A ``_text_model`` that records the history list it is handed on each request.
+
+    The only way to assert what auto-compaction actually delivered: the strategy's call
+    count says a fold was computed, and the observer says an event was emitted, but neither
+    says the RUN read the folded history. This does.
+    """
+
+    def stub(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        seen.append(list(messages))
+        return ModelResponse(parts=[TextPart(content="ok")])
+
+    return FunctionModel(stub)
+
+
 def _tool_then_text_model(tool_name: str) -> FunctionModel:
     """Calls ``tool_name`` on the first request of a run, then answers on the second.
 
@@ -2701,6 +2716,42 @@ class TestReactAgentAutoCompaction:
         assert agent._compaction is fake
 
     @pytest.mark.asyncio
+    async def test_the_fold_reaches_the_model_on_the_path_react_agent_actually_drives(self):
+        """An auto-compacted ``ReactAgent`` run hands the MODEL the folded history.
+
+        The capability-level proof
+        (``test_capabilities.test_the_model_receives_exactly_the_post_fold_durable_history``)
+        mounts ``CompactionCapability`` on a **bare** ``Agent``. That leaves the shipped
+        path — this class's own mount plus ``_run_with_limits``' ``message_history=
+        self._context.messages`` hand-off — pinned nowhere: disabling the live write in
+        ``compact_now`` turns two ``test_capabilities.py`` tests red and **zero** tests in
+        this file. Auto-compaction would be dead code end to end and every test here would
+        still be green, because every other one of them asserts on the strategy's call count
+        or on the observer's events, never on what the model was handed.
+
+        Both halves are asserted: the summary arrived, and the message it replaced did not.
+        """
+        seen: list[list[ModelMessage]] = []
+        agent = ReactAgent(config=_over_budget_config())
+        agent._compactor.strategy = _RecordingCompaction(CompactionResult("S", 1))
+        agent._context.add_message(ModelRequest(parts=[UserPromptPart(content="earlier")]))
+        agent._context._last_input_tokens = 900  # over the 850 threshold
+
+        with agent.pydantic_agent.override(model=_history_recording_model(seen)):
+            await agent.run("q")
+
+        assert seen, "the model was never called"
+        prompts = [
+            p.content
+            for m in seen[0]
+            if isinstance(m, ModelRequest)
+            for p in m.parts
+            if isinstance(p, UserPromptPart)
+        ]
+        assert "[Conversation summary] S" in prompts, "the fold never reached the run"
+        assert "earlier" not in prompts, "the folded-away message came back"
+
+    @pytest.mark.asyncio
     async def test_the_persistence_cursor_opens_against_the_post_fold_history(self):
         """The synthetic summary is never persisted as a message event (AC #6).
 
@@ -2746,10 +2797,24 @@ class TestReactAgentAutoCompaction:
             if isinstance(p, UserPromptPart) and str(p.content).startswith("[Conversation summary]")
         ]
         assert summaries == [], "the synthetic summary was persisted as a message event"
-        # The run's own messages all reached the observer: one request, one response.
-        after_compaction = persisted[persisted.index(agent.context.messages[-1]) :]
-        assert after_compaction, "the run's own messages were not persisted"
-        assert agent.context.messages[-1] in persisted
+        # The other half, and it has to be COUNTED rather than merely located: a persistence
+        # sweep that emitted nothing at all would satisfy the assertion above, and one that
+        # emitted only the tail would satisfy any single-message membership check. Scoped to
+        # the events after the fold, since the setup's own add_message emits one too.
+        fold_at = observer.events.index(compacted[0])
+        after_fold = [
+            e.message for e in observer.events[fold_at:] if isinstance(e, LlmMessageEvent)
+        ]
+        assert [type(m) for m in after_fold] == [ModelRequest, ModelResponse]
+        prompts = [
+            p.content
+            for m in after_fold
+            if isinstance(m, ModelRequest)
+            for p in m.parts
+            if isinstance(p, UserPromptPart)
+        ]
+        assert prompts == ["q"], "the run's own prompt was not the one persisted"
+        assert after_fold[-1] is agent.context.messages[-1]
 
 
 class TestReactAgentManualCompact:

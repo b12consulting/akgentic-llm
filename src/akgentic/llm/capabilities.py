@@ -47,12 +47,22 @@ owed its own decision. What a co-mounted capability needs from the order does **
 where it sits: the closing sweep is in ``wrap_run``'s ``finally``, outside every capability's
 node hooks whatever the order, so durable ``after_*`` edits are always the ones persisted.
 
-**The ``wrap_run`` context is a snapshot, not the live list** (pydantic-ai 2.27.1, verified by
-running it). ``run_ctx`` is built once, before the graph starts; ``UserPromptNode.run`` then
-*rebinds* ``state.message_history`` to a different list object, so ``wrap_run``'s own
-``ctx.messages`` stops tracking the run and stays frozen at the incoming history. Node hooks
-get a freshly built ``RunContext`` per node and therefore do see the live list, which is why
-both node hooks re-anchor the reference the closing sweep later reads — ``before_node_run``
+**The ``wrap_run`` context stops tracking the run — but it is not a detached copy** (pydantic-ai
+2.27.1, verified by running it, both halves). ``run_ctx`` is built once, before the graph starts,
+holding ``state.message_history`` *itself*; ``UserPromptNode.run`` then normalises that object
+in place and *rebinds* ``state.message_history`` to the result, so from that point on
+``wrap_run``'s own ``ctx.messages`` no longer follows the run and stays frozen at the incoming
+history.
+
+Read that as a rule about **when**, not about **what**: a write performed before ``handler()``
+lands in the object the normalisation reads, so it does reach the run — that is the anchor
+``CompactionCapability``'s fold uses, and it is what the two fold-anchor probes in
+``tests/test_capabilities.py`` pin. A write performed after ``handler()``, or a *rebind* of the
+name at any point, is silently lost. Do not infer from "frozen" that ``ctx.messages`` cannot be
+written; infer that it can only be written early, and only in place.
+
+Node hooks get a freshly built ``RunContext`` per node and therefore do see the live list, which
+is why both node hooks re-anchor the reference the closing sweep later reads — ``before_node_run``
 included, so a run that dies inside its very first model request (where ``after_node_run`` has
 not once fired against the rebound list) still has its messages swept.
 

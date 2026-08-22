@@ -1345,6 +1345,14 @@ async def test_the_model_receives_exactly_the_post_fold_durable_history() -> Non
     request is built, so the two are not the same claim. Drop the live write and the model
     sees the unfolded history; drop the durable write and ``context.messages`` still holds
     it.
+
+    **Asserted at PART level, deliberately.** A message-level slice comparison cannot express
+    this claim here and is silently vacuous if written: ``_clean_message_history`` merges
+    consecutive ``ModelRequest``s, so the folded summary request and the run's own prompt
+    arrive as ONE message. ``seen[0]`` is therefore length 1, and any
+    ``seen[0][:-1] == context.messages[:len(seen[0]) - 1]`` form reduces to ``[] == []`` —
+    green under every mutation. The parts survive the merge intact, so they are what carries
+    the identity claim.
     """
     seen: list[list[ModelMessage]] = []
     context, _ = _seeded_context(used=900)
@@ -1357,8 +1365,14 @@ async def test_the_model_receives_exactly_the_post_fold_durable_history() -> Non
     await agent.run("next question", message_history=context.messages)
 
     assert seen, "the model was never called"
-    # What the model was handed, minus the run's own prompt appended after the fold.
-    assert seen[0][:-1] == context.messages[: len(seen[0]) - 1]
+    # Every part of the durable history reached the model, in order and unaltered, ahead of
+    # the run's own prompt — which is the byte-identity claim, stated where the merge cannot
+    # hide it.
+    durable_parts = [p for m in context.messages for p in m.parts]
+    seen_parts = [p for m in seen[0] for p in m.parts]
+    assert durable_parts, "the durable history was never folded"
+    assert seen_parts[: len(durable_parts)] == durable_parts
+    assert len(seen_parts) == len(durable_parts) + 1, "only the run's own prompt was added"
     folded = [
         p.content
         for m in seen[0]
