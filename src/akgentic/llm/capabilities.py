@@ -98,6 +98,9 @@ class EventSourcingCapability(AbstractCapability[Any]):
     taken before ``UserPromptNode`` rebinds the list, and never grows.
     """
 
+    _rebound: bool = field(default=False, init=False)
+    """Whether the cursor has been re-opened against the post-rebind history list."""
+
     async def for_run(self, ctx: RunContext[Any]) -> AbstractCapability[Any]:
         """Return a fresh instance bound to the same ``ContextManager``.
 
@@ -117,7 +120,9 @@ class EventSourcingCapability(AbstractCapability[Any]):
 
         The cursor opens at the incoming history length **before** ``handler()`` runs, which
         is what keeps a run started with a non-empty ``message_history`` from re-persisting
-        messages an earlier run already recorded.
+        messages an earlier run already recorded. It is re-opened against the normalised copy
+        the graph actually appends to as soon as a node hook hands that list over
+        (``_anchor``); this seeding covers the case where no node ever runs.
 
         The ``finally`` sweeps first and records the system prompt second — in that order,
         because ``record_system_prompt`` scans the first ``ModelRequest`` in the
@@ -145,7 +150,7 @@ class EventSourcingCapability(AbstractCapability[Any]):
         against the rebound list. Anchoring on the way *in* means the closing sweep still has
         the live list to sweep.
         """
-        self._history = ctx.messages
+        self._anchor(ctx.messages)
         return node
 
     async def after_node_run(
@@ -156,9 +161,34 @@ class EventSourcingCapability(AbstractCapability[Any]):
         result: NodeResult[Any],
     ) -> NodeResult[Any]:
         """Persist whatever the completed node added, and pass the result through untouched."""
-        self._history = ctx.messages
+        self._anchor(ctx.messages)
         self._sweep()
         return result
+
+    def _anchor(self, messages: list[ModelMessage]) -> None:
+        """Point the sweep at the live durable history, re-opening the cursor on the rebind.
+
+        ``UserPromptNode`` does not hand the run the list it was given: it rebinds
+        ``state.message_history`` to a *normalised copy* of it — consecutive ``ModelRequest``s
+        merged, orphaned tool results dropped, dangling calls repaired — so the copy's length
+        is not the snapshot's. The cursor ``wrap_run`` opened is an index into the snapshot;
+        carried onto the copy unchanged it lands at the wrong offset, and a copy that came out
+        shorter means the run's own opening messages sit *behind* the cursor and are silently
+        never persisted. Two back-to-back ``record_operator_action`` calls are enough to
+        trigger it — they merge into one request, and the user's next prompt disappears.
+
+        So the cursor is re-opened against the list the sweep will actually index, the first
+        time a node hook hands that list over. That is ``before_node_run`` of the node
+        *after* ``UserPromptNode``: the per-node ``RunContext`` is built before its node runs,
+        so nothing this run produced is in the list yet. Later re-anchors keep the cursor —
+        pydantic-ai rewrites history in place from then on, never by rebinding.
+        """
+        if messages is self._history:
+            return
+        self._history = messages
+        if not self._rebound:
+            self._rebound = True
+            self._run_start = self._cursor = len(messages)
 
     def _sweep(self) -> None:
         """Persist every durable message past the cursor, then advance it.

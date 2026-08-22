@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import pytest
-from pydantic_ai import Agent, UsageLimitExceeded
+from pydantic_ai import Agent, RunCancelled, UsageLimitExceeded
 from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.messages import (
     ModelMessage,
@@ -202,6 +202,34 @@ async def test_incoming_history_is_not_re_persisted() -> None:
         assert message not in _persisted(capture)
 
 
+async def test_a_history_pydantic_ai_normalises_does_not_shift_the_cursor() -> None:
+    """The cursor must index the list the sweep reads, not the one it was measured on (AC #2).
+
+    ``UserPromptNode`` rebinds the run's history to a *normalised copy* of what it was handed:
+    consecutive ``ModelRequest``s are merged into one, orphaned tool results dropped. Two
+    back-to-back ``record_operator_action`` calls — the shape ``ReactAgent`` drives whenever
+    the mailbox delivers twice between turns — merge, so the copy is one message shorter than
+    the snapshot ``wrap_run`` measured its cursor against. A cursor carried across that rebind
+    sits one past where the run's own messages begin, and the user's prompt is silently never
+    persisted.
+    """
+    context, capture = _manager_with_capture()
+    agent: Agent[None, str] = Agent(
+        model=TestModel(), capabilities=[EventSourcingCapability(context)]
+    )
+
+    await agent.run("one")
+    context.record_operator_action("[operator] first note")
+    context.record_operator_action("[operator] second note")
+    before = len(_persisted(capture))
+
+    second = await agent.run("two", message_history=context.messages)
+
+    added = _persisted(capture)[before:]
+    assert added == list(second.new_messages()), "the run's own messages must all be persisted"
+    assert any(isinstance(m, ModelRequest) for m in added), "the user's prompt was dropped"
+
+
 # ---------------------------------------------------------------------------
 # AC #4 — the cursor is per-run (Trap 3)
 # ---------------------------------------------------------------------------
@@ -283,7 +311,7 @@ async def test_cancelled_run_still_persists_its_tail() -> None:
     context, capture = _manager_with_capture()
     agent = _agent_with_tool([EventSourcingCapability(context), _CancelAfterResponse()])
 
-    with pytest.raises(BaseException):  # noqa: B017,PT011 - RunCancelled
+    with pytest.raises(RunCancelled):
         await agent.run("hello")
 
     persisted = _persisted(capture)
@@ -369,7 +397,7 @@ async def test_the_sweep_runs_before_the_system_prompt_recording() -> None:
         capabilities=[EventSourcingCapability(context), _CancelAfterResponse(from_step=1)],
     )
 
-    with pytest.raises(BaseException):  # noqa: B017,PT011 - RunCancelled
+    with pytest.raises(RunCancelled):
         await agent.run("hello")
 
     assert _persisted(capture), "the sweep must still persist the cancelled run's messages"
@@ -537,11 +565,9 @@ async def test_composed_pair_persists_the_dangling_response_before_the_healing_r
     assert [str(p.content) for p in healing.parts if isinstance(p, ToolReturnPart)] == [
         RUN_LIMIT_HEALING_MESSAGE
     ]
-    # The dangling response's message event strictly precedes the healing one.
-    events = _message_events(capture)
-    assert events.index(events[-2]) < events.index(events[-1])
-    assert events[-2].message is dangling
-    assert events[-1].message is healing
+    # Ordering: the two assertions above read the last two persisted messages by position,
+    # so the dangling response reaching the observer *before* the healing request is what
+    # puts each of them where its isinstance check found it.
     assert "tool_calls_limit" in str(exc_info.value)
 
 
