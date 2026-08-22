@@ -234,10 +234,17 @@ class LifetimeBudgetCapability(AbstractCapability[Any]):
 
         The fold is in a ``finally`` because tokens a failed run burned were still burned —
         the provider billed them either way. Its anchor is ``ctx.usage``, which is
-        ``GraphAgentState.usage``: the graph creates it once per run and only ever mutates it
-        in place (``ctx.state.usage.incr(...)``, ``.requests += 1``), so it holds the run's
-        real cost whether the run returned or raised. It is not this capability's own
-        accumulator and must never become it.
+        ``GraphAgentState.usage``: the graph only ever mutates it in place
+        (``ctx.state.usage.incr(...)``, ``.requests += 1``) and never rebinds it, so it holds
+        the run's real cost whether the run returned or raised. It is not this capability's
+        own accumulator and must never become it.
+
+        **Do not reuse one ``RunUsage`` across runs as ``Agent.run(usage=…)``.** That object
+        becomes ``GraphAgentState.usage`` verbatim (``usage or RunUsage()``), so ``ctx.usage``
+        is then a *running total*, not this run's cost, and folding it adds every earlier run
+        again. ``ReactAgent`` passes no ``usage=`` at all, which is what makes the fold exact;
+        a caller mounting this capability on a bare ``Agent`` must do the same, or pass a
+        fresh object per run.
 
         Raises:
             AgentUsageLimitError: If either lifetime budget is already spent.

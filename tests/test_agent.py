@@ -777,7 +777,6 @@ class _StubRun:
         self,
         *args,
         output="ok",
-        spent=None,
         new_messages=None,
         yields=False,
         enter_raises=None,
@@ -789,7 +788,7 @@ class _StubRun:
         self.result = MagicMock(output=output)
         # Non-End sentinel: run() reads this before its loop, then breaks on `result`.
         self.next_node = MagicMock()
-        self._usage = spent if spent is not None else RunUsage()
+        self._usage = RunUsage()
         self._new_messages = new_messages if new_messages is not None else []
         self._yields = yields
         self._enter_raises = enter_raises
@@ -819,33 +818,22 @@ class _StubRun:
         return self._new_messages
 
 
-def _spend_through_the_run_anchor(kwargs: dict, spend: RunUsage) -> None:
-    """Report a run's cost the way pydantic-ai does: in place, on the handed-in RunUsage.
-
-    ``ReactAgent`` folds the ``RunUsage`` it passes as ``run(usage=...)``, because that
-    object is the only anchor that survives a run which raised. A double that only set
-    ``_StubRun.usage`` would therefore report a cost of zero.
-    """
-    handed_in = kwargs.get("usage")
-    if handed_in is not None:
-        handed_in.incr(spend)
-
-
 def _capturing_stub_run(captured: dict, **stub_kwargs):
     """iter() ``side_effect`` that records the call's real kwargs into `captured`.
 
     Complements passing ``captured=`` directly into ``_StubRun(...)`` (which only
     works with ``return_value=``, a single fixed instance): a ``side_effect=``
     factory must be invoked fresh, with ``iter()``'s actual args/kwargs, on every
-    call — this returns such a factory. A ``spent=`` is reported through the
-    handed-in accumulator as well, since that is what the fold reads.
+    call — this returns such a factory.
+
+    It reports no token spend, and cannot: the lifetime fold's anchor is
+    ``wrap_run``'s ``ctx.usage``, which a stubbed ``iter()`` never reaches, and
+    ``ReactAgent`` no longer passes a ``run(usage=...)`` for a double to write
+    through. A test whose subject is the spend drives ``_spending_model`` instead.
     """
 
     def factory(*args, **kwargs):
         captured.update(kwargs)
-        spent = stub_kwargs.get("spent")
-        if spent is not None:
-            _spend_through_the_run_anchor(kwargs, spent)
         return _StubRun(**stub_kwargs)
 
     return factory
@@ -1357,9 +1345,14 @@ class TestReactAgentTokenBudgetEnforcement:
         the object the run spends through is now the one pydantic-ai's graph creates and
         hands to every hook as ``ctx.usage``, and ``LifetimeBudgetCapability`` folds it in
         rather than being it. The mutation this exists to kill — making the capability's
-        accumulator the run's own budget object — raises nothing and logs nothing: it
-        checks the RUN tier's limits against lifetime totals, silently turning a per-run
-        cap into a lifetime one. No other test in this file goes red for it.
+        accumulator the run's own budget object (``usage=self._budget.usage`` on the
+        ``run()`` call) — raises nothing and logs nothing: it checks the RUN tier's limits
+        against lifetime totals, silently turning a per-run cap into a lifetime one.
+
+        Under the pre-capability shape no other test in this file went red for it. It now
+        also inflates every lifetime token total, so several token tests fall over too —
+        but on arithmetic, not on the claim. This is the only test that names it: it asserts
+        the accumulator's IDENTITY, and that each run is handed a total of zero.
         """
         probe = _RunUsageProbe()
         # Mounted as a CALLER capability, so it sits inside the budget's wrap_run and
