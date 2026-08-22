@@ -620,7 +620,7 @@ agent = ReactAgent(
 )
 ```
 
-**Ordering caveats — neither is guessable from the signature:**
+**Ordering caveats — none is guessable from the signature:**
 - A capability's `before_model_request` hook runs **after** compaction: `ContextManager`
   rewrites messages first, the result is passed as `message_history`, and only then does the
   capability chain run. A capability sees only the **post-compaction** history — it never sees
@@ -635,10 +635,11 @@ agent = ReactAgent(
   This is pydantic-ai's internal pipeline behaviour, **not a documented public guarantee**, and
   it could change in a future release — a capability should still avoid orphaning tool calls on
   purpose.
-- Your capabilities sit **inside** the two internal ones, so `before_*` hooks fire after theirs
-  and `after_*` hooks before theirs. Your durable `after_*` edits are what gets persisted:
-  `EventSourcingCapability`'s closing sweep lives in `wrap_run`'s `finally`, outside every
-  capability's node hooks.
+- Your capabilities sit **inside** the two internal ones — unless one of them declares its own
+  ordering constraints, see [Run-loop capabilities](#run-loop-capabilities) — so `before_*` hooks
+  fire after theirs and `after_*` hooks before theirs. Your durable `after_*` edits are what gets
+  persisted: `EventSourcingCapability`'s closing sweep lives in `wrap_run`'s `finally`, outside
+  every capability's node hooks.
 
 ### Run-loop capabilities
 
@@ -657,6 +658,15 @@ and `wrap_run`s nest with the first wrapping all the rest. Assembling your own s
 same shape — the persistence you rely on is the outer layer, not a peer of your own hooks. Note
 that the guarantee in the caveat above holds regardless of list position, because the closing
 sweep sits in `wrap_run`'s `finally` rather than in a node hook.
+
+List position is not the last word, though. If **any** capability in the chain declares
+`get_ordering()` — a fixed `position`, or a `wraps=` / `wrapped_by=` constraint — pydantic-ai
+topologically re-sorts the whole chain to satisfy it, keeping the given order only as a
+tiebreaker. Neither class here declares one, so the shipped stack is the list above; a caller
+capability that declares `position='outermost'` moves itself ahead of both. Persistence survives
+that (same reason as above). `on_run_error` precedence does not: pydantic-ai walks that hook
+from the innermost capability outwards, and this package states no contract today about a
+recovering capability pre-empting `HealingCapability`.
 
 **Durable state only.** Persist from `RunContext.messages` **inside a node hook**. Never from
 `ModelRequestContext.messages` mid-chain: that request copy legitimately carries other

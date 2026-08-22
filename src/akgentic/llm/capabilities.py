@@ -20,10 +20,13 @@ history after the ``before_model_request`` chain anyway.
 list order, ``after_*`` in reverse, and ``wrap_run``s nest with the first one wrapping all the
 rest (pydantic-ai 2.27.1 — ``capabilities/combined.py`` builds each chain over
 ``reversed(self.capabilities)``). ``ReactAgent`` mounts
-``[EventSourcingCapability, HealingCapability, *yours]``. What a co-mounted capability needs
-from that does **not** depend on where it sits: the closing sweep is in ``wrap_run``'s
-``finally``, outside every capability's node hooks whatever the order, so durable ``after_*``
-edits are always the ones persisted.
+``[EventSourcingCapability, HealingCapability, *yours]``. That list order is not final, though:
+if **any** capability in the chain declares ``get_ordering()`` (a fixed ``position``, or a
+``wraps=`` / ``wrapped_by=`` constraint) pydantic-ai topologically re-sorts the whole chain to
+satisfy it, so a caller capability can legitimately end up outside these two. Neither class
+here declares one. What a co-mounted capability needs from the order does **not** depend on
+where it sits: the closing sweep is in ``wrap_run``'s ``finally``, outside every capability's
+node hooks whatever the order, so durable ``after_*`` edits are always the ones persisted.
 
 **The ``wrap_run`` context is a snapshot, not the live list** (pydantic-ai 2.27.1, verified by
 running it). ``run_ctx`` is built once, before the graph starts; ``UserPromptNode.run`` then
