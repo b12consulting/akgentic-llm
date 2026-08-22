@@ -20,7 +20,13 @@ authors = [
 keywords = ["llm", "agents", "ai", "pydantic-ai", "react"]
 
 dependencies = [
-    "pydantic-ai[mistral]>=2,<3",
+    # Ceiling pinned to a reproduced upstream break, NOT a precautionary cap: pydantic-ai 2.32.0
+    # switched its HTTP client to httpx2 (github.com/pydantic/httpx2, a fork — not encode's httpx
+    # at 2.x), so the provider constructors now want httpx2.AsyncClient while create_http_client()
+    # returns httpx.AsyncClient. 2.31.0 is the last httpx release. Lifting this is a workspace
+    # decision, not a dependency sweep: the FastAPI/Starlette tier stays on encode httpx, so
+    # adoption is permanently dual-stack. See decisions/adr-020 for the lift conditions.
+    "pydantic-ai[mistral]>=2,<2.32",
     # NEVER cap this: genai-prices ships the price table itself, so an upper bound
     # freezes prices and the framework reports stale costs. The floor is the v2
     # pricing-data line; a ceiling here also transitively caps pydantic-ai, since
