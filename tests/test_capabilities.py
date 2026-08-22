@@ -16,7 +16,7 @@ from typing import Any
 
 import pytest
 from pydantic_ai import Agent, RunCancelled, UsageLimitExceeded
-from pydantic_ai.capabilities import AbstractCapability
+from pydantic_ai.capabilities import AbstractCapability, ProcessHistory
 from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
@@ -604,3 +604,140 @@ async def test_composed_pair_leaves_a_successful_run_unhealed() -> None:
 
     assert _persisted(capture) == list(result.all_messages())
     assert _healing_contents(capture) == []
+
+
+# ---------------------------------------------------------------------------
+# Story 23.4 — the sweep survives a co-mounted capability that changes the
+# length of durable history
+# ---------------------------------------------------------------------------
+
+REFERENCE_BLOCK = "[source references]"
+"""The marker a deployment's injected source-reference block carries."""
+
+
+def _is_reference_block(message: ModelMessage) -> bool:
+    """Whether ``message`` is the reference block standing on its own."""
+    return (
+        isinstance(message, ModelRequest)
+        and len(message.parts) == 1
+        and isinstance(part := message.parts[0], UserPromptPart)
+        and part.content == REFERENCE_BLOCK
+    )
+
+
+def _prepend_reference_block(messages: list[ModelMessage]) -> list[ModelMessage]:
+    """Prepend a source-reference block — the seam ``README.md`` documents.
+
+    Idempotent, because a ``ProcessHistory`` processor runs on **every** model request rather
+    than once per run: an unconditional prepend would stack one block per step. Prepending is
+    also the only safe direction — pydantic-ai rejects a processed list that does not end with
+    a ``ModelRequest``.
+
+    Across runs it does prepend again: the block persisted by the previous run is merged into
+    the following user request when pydantic-ai normalises the incoming history, so it is no
+    longer a message of its own for this check to find. That is exactly the shift the sweep
+    has to survive.
+    """
+    if messages and _is_reference_block(messages[0]):
+        return messages
+    return [ModelRequest(parts=[UserPromptPart(content=REFERENCE_BLOCK)]), *messages]
+
+
+def _drop_oldest_message(messages: list[ModelMessage]) -> list[ModelMessage]:
+    """Drop the oldest message — the removal mirror of ``_prepend_reference_block``.
+
+    Bounded by pydantic-ai's own validation of a processed list: never empty, and the trailing
+    ``ModelRequest`` is the one message it can never take. One message per model request, so a
+    single-step run drops exactly one.
+    """
+    return messages[1:] if len(messages) > 1 else messages
+
+
+def _usage_event_count(capture: EventCapture) -> int:
+    """How many ``LlmUsageEvent``s the observer saw."""
+    return len([e for e in capture.events if isinstance(e, LlmUsageEvent)])
+
+
+async def _two_runs(
+    extra: list[Any],
+) -> tuple[ContextManager, EventCapture, AgentRunResult[str], AgentRunResult[str]]:
+    """Drive two consecutive runs on one ``ContextManager``, ``extra`` co-mounted.
+
+    The second run is handed the context's own messages, so a message the first run recorded
+    is in front of the second run's cursor — which is what makes a duplicate observable.
+    """
+    context, capture = _manager_with_capture()
+    agent: Agent[None, str] = Agent(
+        model=TestModel(), capabilities=[EventSourcingCapability(context), *extra]
+    )
+
+    first = await agent.run("one")
+    second = await agent.run("two", message_history=context.messages)
+    return context, capture, first, second
+
+
+async def test_a_capability_that_prepends_does_not_re_persist_the_previous_run() -> None:
+    """A co-mounted prepend must not make the sweep record a message twice (AC #1, #2, #4).
+
+    pydantic-ai writes a ``before_model_request`` chain's processed list back into durable
+    history **in place** — the same list object, new contents. A capability that prepends a
+    message therefore shifts every index the cursor was measured against, and a sweep that
+    trusts the cursor alone re-records the message the shift moved under it: a phantom
+    ``LlmMessageEvent``, a duplicated turn re-sent to the model on the next run, and its
+    tokens counted twice when the context is restored.
+    """
+    context, capture, first, second = await _two_runs(
+        [ProcessHistory(processor=_prepend_reference_block)]
+    )
+
+    persisted = _persisted(capture)
+    assert len(persisted) == len({id(m) for m in persisted}), "a message was persisted twice"
+    for response in [m for m in first.all_messages() if isinstance(m, ModelResponse)]:
+        assert sum(1 for m in persisted if m is response) == 1, (
+            "the first run's response reappeared in the second run's persisted delta"
+        )
+    # Nothing skipped either: a fix that stops duplicating by dropping fails here.
+    assert {id(m) for m in second.new_messages()} <= {id(m) for m in persisted}
+    assert context.messages == persisted
+
+
+async def test_a_capability_that_prepends_does_not_change_the_usage_event_count() -> None:
+    """The co-mount must not add a usage event (AC #4).
+
+    ``restore_context`` seeds the lifetime budget by summing ``LlmUsageEvent``s, so a
+    re-persisted ``ModelResponse`` double-counts its tokens. Stated as a differential against
+    the same two runs with nothing co-mounted, so it does not depend on how many usage events
+    a ``TestModel`` run happens to produce.
+    """
+    _, plain, _, _ = await _two_runs([])
+    _, prepending, _, _ = await _two_runs([ProcessHistory(processor=_prepend_reference_block)])
+
+    assert _usage_event_count(prepending) == _usage_event_count(plain)
+
+
+async def test_a_capability_that_removes_does_not_skip_the_run_s_own_messages() -> None:
+    """The removal mirror: a shift the other way must not drop a message (AC #2, #3).
+
+    Position and identity have mirror blind spots — position breaks on insertion and removal,
+    identity on a rebuild. A removal ahead of the cursor leaves the cursor sitting past where
+    the run's own messages begin, and everything behind it is silently never persisted.
+    """
+    context, capture, _, second = await _two_runs([ProcessHistory(processor=_drop_oldest_message)])
+
+    persisted = _persisted(capture)
+    assert {id(m) for m in second.new_messages()} <= {id(m) for m in persisted}
+    assert len(persisted) == len({id(m) for m in persisted}), "a message was persisted twice"
+    assert context.messages == persisted
+
+
+async def test_two_plain_runs_persist_every_message_each_run_produced() -> None:
+    """The same no-skipping contract with nothing co-mounted (AC #2).
+
+    The baseline the two tests above are differentials against: whatever the sweep's bound is
+    derived from, a run's own messages all reach the observer on the plain path too.
+    """
+    _, capture, first, second = await _two_runs([])
+
+    persisted_ids = {id(m) for m in _persisted(capture)}
+    assert {id(m) for m in first.new_messages()} <= persisted_ids
+    assert {id(m) for m in second.new_messages()} <= persisted_ids
