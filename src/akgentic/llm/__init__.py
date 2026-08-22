@@ -34,6 +34,10 @@ from .agent import (
     UsageLimitError,
     UserPrompt,
 )
+from .capabilities import (
+    EventSourcingCapability,
+    HealingCapability,
+)
 from .compaction import (
     COMPACTION_STRATEGIES,
     SUMMARY_INSTRUCTIONS,
@@ -101,6 +105,9 @@ __all__ = [
     "SystemPromptPartSnapshot",
     "ToolCallEvent",
     "ToolReturnEvent",
+    # Run-loop capabilities
+    "EventSourcingCapability",
+    "HealingCapability",
     # Compaction
     "LlmContextCompactedEvent",
     "LlmContextClearedEvent",

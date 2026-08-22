@@ -17,6 +17,7 @@ from pydantic_ai.messages import (
 )
 from pydantic_ai.usage import RunUsage
 
+from .capabilities import RUN_LIMIT_HEALING_MESSAGE
 from .compaction import CompactionResult, CompactionStrategy, create_compaction
 from .config import ReactAgentConfig, RunUsageLimits
 from .context import ContextManager
@@ -35,16 +36,6 @@ from .providers import create_http_client, create_model, get_output_type
 logger = logging.getLogger(__name__)
 
 UserPrompt = str | list[str | BinaryContent]
-
-# What the MODEL reads as the tool result of the call the run-tier breach aborted.
-# Not a diagnostic: the operator's traceback travels the other channel
-# (``ErrorMessage.traceback``, formatted by ``Akgent._handle_failure``). Defined once
-# here so the call site and its test never drift into two wordings (ADR-016 §D2).
-RUN_LIMIT_HEALING_MESSAGE = (
-    "This turn's tool and request budget is exhausted, so this tool call was "
-    "aborted and no further tool calls are possible. Answer now using what you "
-    "already have, and say plainly what you could not verify."
-)
 
 
 def _evict_anyio_run_vars(loop: asyncio.AbstractEventLoop) -> None:
