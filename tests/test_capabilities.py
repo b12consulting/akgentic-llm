@@ -36,6 +36,8 @@ from pydantic_ai.usage import RequestUsage, RunUsage, UsageLimits
 from akgentic.llm import (
     AgentUsageLimitError,
     AgentUsageLimits,
+    CompactionCapability,
+    CompactionResult,
     ContextManager,
     EventSourcingCapability,
     HealingCapability,
@@ -43,6 +45,7 @@ from akgentic.llm import (
 )
 from akgentic.llm.capabilities import RUN_LIMIT_HEALING_MESSAGE
 from akgentic.llm.event import (
+    LlmContextCompactedEvent,
     LlmMessageEvent,
     LlmSystemPromptEvent,
     LlmUsageEvent,
@@ -1066,3 +1069,312 @@ def test_it_does_not_override_for_run() -> None:
     because the behavioural failure is quiet.
     """
     assert LifetimeBudgetCapability.for_run is AbstractCapability.for_run
+
+
+# ---------------------------------------------------------------------------
+# Story 24.2 — the fold anchor: a write to ``wrap_run``'s ``ctx.messages``
+# ---------------------------------------------------------------------------
+
+
+def _history_recording_model(seen: list[list[ModelMessage]]) -> FunctionModel:
+    """A model that records the history list it is handed, then answers with one TextPart."""
+
+    def model_fn(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        seen.append(list(messages))
+        return ModelResponse(parts=[TextPart(content="ok")])
+
+    return FunctionModel(model_fn)
+
+
+@dataclass
+class _RewriteHistoryInWrapRun(AbstractCapability[Any]):
+    """Replace the run's history in ``wrap_run``, before ``handler()`` — the fold's shape."""
+
+    replacement: list[ModelMessage] = field(default_factory=list)
+
+    async def wrap_run(
+        self, ctx: RunContext[Any], *, handler: WrapRunHandler
+    ) -> AgentRunResult[Any]:
+        """Mirror ``replacement`` onto the run's live list, in place, then run."""
+        ctx.messages[:] = self.replacement
+        return await handler()
+
+
+async def test_a_wrap_run_write_to_ctx_messages_reaches_the_model() -> None:
+    """A pre-``handler()`` write to ``ctx.messages`` IS the run's history (Story 24.2 Task 1).
+
+    The premise ``CompactionCapability``'s fold rests on, proven rather than inherited.
+    Epic 23 established that ``wrap_run``'s ``ctx.messages`` is *frozen* — but frozen means
+    it stops tracking the run's later growth, not that it is a detached copy. In
+    pydantic-ai 2.27.1 ``build_run_context`` passes ``messages=ctx.state.message_history``
+    (``_agent_graph.py:2285``) — the same list object, no copy — and ``wrap_run`` is invoked
+    with that context (``agent/__init__.py:1767``). ``UserPromptNode.run`` then *reads* that
+    object at ``_agent_graph.py:530`` (``messages[:] = _clean_message_history(
+    ctx.state.message_history)``) before rebinding ``state`` to the normalised copy at
+    ``:532``. So a write performed BEFORE ``handler()`` lands in the list line 530
+    normalises; only a write performed after it is lost.
+
+    Asserted on what the MODEL received, not on what ``ctx.messages`` held afterwards:
+    line 530 also normalises, so the two are not the same claim.
+    """
+    seen: list[list[ModelMessage]] = []
+    replacement: list[ModelMessage] = [
+        ModelRequest(parts=[UserPromptPart(content="[Conversation summary] folded")]),
+    ]
+    agent: Agent[None, str] = Agent(
+        model=_history_recording_model(seen),
+        capabilities=[_RewriteHistoryInWrapRun(replacement=list(replacement))],
+    )
+    history: list[ModelMessage] = [
+        ModelRequest(parts=[UserPromptPart(content="a long earlier question")]),
+        ModelResponse(parts=[TextPart(content="a long earlier answer")]),
+    ]
+
+    await agent.run("next question", message_history=history)
+
+    assert seen, "the model was never called"
+    contents = [
+        p.content
+        for m in seen[0]
+        if isinstance(m, ModelRequest)
+        for p in m.parts
+        if isinstance(p, UserPromptPart)
+    ]
+    assert "[Conversation summary] folded" in contents, "the wrap_run write never reached the run"
+    assert "a long earlier question" not in contents, "the replaced history came back"
+
+
+async def test_a_wrap_run_rebind_of_ctx_messages_does_NOT_reach_the_model() -> None:
+    """Rebinding the name instead of mutating the list is the mutation that loses the fold.
+
+    ``ctx.messages = folded`` looks identical at the call site and is silently inert: the
+    graph holds the original list object, so the run proceeds on the unfolded history. This
+    is why ``CompactionCapability`` mirrors with ``ctx.messages[:] = …`` and why that slice
+    assignment is load-bearing rather than stylistic.
+    """
+    seen: list[list[ModelMessage]] = []
+
+    @dataclass
+    class _RebindHistory(AbstractCapability[Any]):
+        async def wrap_run(
+            self, ctx: RunContext[Any], *, handler: WrapRunHandler
+        ) -> AgentRunResult[Any]:
+            ctx.messages = [ModelRequest(parts=[UserPromptPart(content="never seen")])]
+            return await handler()
+
+    agent: Agent[None, str] = Agent(
+        model=_history_recording_model(seen), capabilities=[_RebindHistory()]
+    )
+    history: list[ModelMessage] = [
+        ModelRequest(parts=[UserPromptPart(content="a long earlier question")]),
+        ModelResponse(parts=[TextPart(content="a long earlier answer")]),
+    ]
+
+    await agent.run("next question", message_history=history)
+
+    contents = [
+        p.content
+        for m in seen[0]
+        if isinstance(m, ModelRequest)
+        for p in m.parts
+        if isinstance(p, UserPromptPart)
+    ]
+    assert "never seen" not in contents
+    assert "a long earlier question" in contents
+
+
+# ---------------------------------------------------------------------------
+# Story 24.2 — CompactionCapability, mounted on a bare Agent
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _RecordingStrategy:
+    """A ``CompactionStrategy`` recording its calls and returning a fixed result."""
+
+    result: CompactionResult
+    calls: int = 0
+    seen: list[list[ModelMessage]] = field(default_factory=list)
+
+    async def compact(self, messages: list[ModelMessage]) -> CompactionResult:
+        """Record the history handed over, then return the configured result."""
+        self.calls += 1
+        self.seen.append(list(messages))
+        return self.result
+
+
+def _compaction_event(result: CompactionResult) -> LlmContextCompactedEvent:
+    """The ``event_factory`` a bare mount supplies; ``ReactAgent`` passes its own."""
+    return LlmContextCompactedEvent(
+        run_id=None,
+        strategy_id="summarize",
+        summary=result.summary,
+        replaced_message_count=result.replaced_message_count,
+        summarizer_prompt_version="v1",
+        tokens_before=None,
+        tokens_after=result.tokens_after,
+    )
+
+
+def _compactor(
+    strategy: _RecordingStrategy, context: ContextManager, threshold: int | None
+) -> CompactionCapability:
+    """A ``CompactionCapability`` armed at ``threshold`` (``None`` ⇒ compaction off)."""
+    return CompactionCapability(
+        strategy=strategy,
+        context=context,
+        threshold_fn=lambda: threshold,
+        event_factory=_compaction_event,
+    )
+
+
+def _seeded_context(used: int | None) -> tuple[ContextManager, EventCapture]:
+    """A context carrying two messages and a provider-reported ``last_input_tokens``."""
+    context, capture = _manager_with_capture()
+    context.add_message(ModelRequest(parts=[UserPromptPart(content="earlier question")]))
+    context.add_message(ModelResponse(parts=[TextPart(content="earlier answer")]))
+    context._last_input_tokens = used
+    return context, capture
+
+
+async def test_it_mounts_on_a_bare_agent_and_folds_above_the_threshold() -> None:
+    """It needs nothing from ReactAgent: one instance, one bare Agent, one fold (AC #1, #2)."""
+    context, _ = _seeded_context(used=900)
+    strategy = _RecordingStrategy(CompactionResult("S", 2))
+    agent: Agent[None, str] = Agent(
+        model=TestModel(), capabilities=[_compactor(strategy, context, threshold=850)]
+    )
+
+    await agent.run("next", message_history=context.messages)
+
+    assert strategy.calls == 1
+
+
+async def test_compaction_off_never_fires_however_large_the_history() -> None:
+    """``threshold_fn()`` returning None means compaction is off — a no-op (AC #2)."""
+    context, _ = _seeded_context(used=10_000_000)
+    strategy = _RecordingStrategy(CompactionResult("S", 2))
+    agent: Agent[None, str] = Agent(
+        model=TestModel(), capabilities=[_compactor(strategy, context, threshold=None)]
+    )
+
+    await agent.run("next", message_history=context.messages)
+
+    assert strategy.calls == 0
+
+
+async def test_no_usage_reported_never_mis_fires() -> None:
+    """``last_input_tokens is None`` is missing data, not a small number (AC #2).
+
+    Treating it as zero would be safe; treating it as "unknown, so fold" would run a
+    summarizer on every first turn of every agent whose provider reports no usage.
+    """
+    context, _ = _seeded_context(used=None)
+    strategy = _RecordingStrategy(CompactionResult("S", 2))
+    agent: Agent[None, str] = Agent(
+        model=TestModel(), capabilities=[_compactor(strategy, context, threshold=850)]
+    )
+
+    await agent.run("next", message_history=context.messages)
+
+    assert strategy.calls == 0
+
+
+async def test_usage_exactly_at_the_threshold_does_not_fire() -> None:
+    """Strictly above fires; at the threshold does not (AC #2)."""
+    context, _ = _seeded_context(used=850)
+    strategy = _RecordingStrategy(CompactionResult("S", 2))
+    agent: Agent[None, str] = Agent(
+        model=TestModel(), capabilities=[_compactor(strategy, context, threshold=850)]
+    )
+
+    await agent.run("next", message_history=context.messages)
+
+    assert strategy.calls == 0
+
+
+async def test_a_zero_replacement_result_writes_nothing_at_all() -> None:
+    """Nothing to compact ⇒ no event, no fold, no synthetic summary (AC #3)."""
+    context, capture = _seeded_context(used=900)
+    strategy = _RecordingStrategy(CompactionResult("", 0))
+    capability = _compactor(strategy, context, threshold=850)
+    before = context.messages
+
+    status = await capability.compact_now()
+
+    assert status == "Nothing to compact."
+    assert strategy.calls == 1
+    assert context.messages == before
+    assert [e for e in capture.events if isinstance(e, LlmContextCompactedEvent)] == []
+
+
+async def test_the_fold_writes_both_histories_and_they_agree() -> None:
+    """The durable write and the live write are one operation (AC #3, #4).
+
+    Both are needed and neither implies the other: ``Agent.run()`` seeds the run's state
+    from a copy of the history it is handed, so mutating the run's list never reaches
+    ``ContextManager`` and folding ``ContextManager`` never reaches the run. Dropping
+    either write turns this red — the live list stops matching the durable one, or the
+    durable one is never folded at all.
+    """
+    context, capture = _seeded_context(used=900)
+    strategy = _RecordingStrategy(CompactionResult("the summary", 2))
+    capability = _compactor(strategy, context, threshold=850)
+    live: list[ModelMessage] = context.messages
+
+    status = await capability.compact_now(live)
+
+    assert status == "Compacted: replaced 2 earlier message(s) with a summary."
+    assert live == context.messages
+    assert len([e for e in capture.events if isinstance(e, LlmContextCompactedEvent)]) == 1
+    contents = [
+        p.content
+        for m in live
+        if isinstance(m, ModelRequest)
+        for p in m.parts
+        if isinstance(p, UserPromptPart)
+    ]
+    assert contents == ["[Conversation summary] the summary"]
+
+
+async def test_the_model_receives_exactly_the_post_fold_durable_history() -> None:
+    """The run's next model request and the durable history are byte-identical (AC #4).
+
+    The whole reason both writes exist, asserted against what the MODEL was handed rather
+    than against ``ctx.messages``: ``UserPromptNode`` normalises the folded list before the
+    request is built, so the two are not the same claim. Drop the live write and the model
+    sees the unfolded history; drop the durable write and ``context.messages`` still holds
+    it.
+    """
+    seen: list[list[ModelMessage]] = []
+    context, _ = _seeded_context(used=900)
+    strategy = _RecordingStrategy(CompactionResult("the summary", 2))
+    agent: Agent[None, str] = Agent(
+        model=_history_recording_model(seen),
+        capabilities=[_compactor(strategy, context, threshold=850)],
+    )
+
+    await agent.run("next question", message_history=context.messages)
+
+    assert seen, "the model was never called"
+    # What the model was handed, minus the run's own prompt appended after the fold.
+    assert seen[0][:-1] == context.messages[: len(seen[0]) - 1]
+    folded = [
+        p.content
+        for m in seen[0]
+        if isinstance(m, ModelRequest)
+        for p in m.parts
+        if isinstance(p, UserPromptPart)
+    ]
+    assert folded[0] == "[Conversation summary] the summary"
+    assert "earlier question" not in folded
+
+
+def test_it_does_not_override_for_run_either() -> None:
+    """No per-run state, so the default ``for_run`` (return ``self``) is correct (AC #1).
+
+    ``wrap_run`` fires once per run by construction and the gate re-reads
+    ``context.last_input_tokens`` every time, so there is nothing a per-run copy would
+    protect — and nothing a shared instance can leak between runs.
+    """
+    assert CompactionCapability.for_run is AbstractCapability.for_run

@@ -21,6 +21,7 @@ from .capabilities import (
     AgentUsageLimitError as AgentUsageLimitError,
 )
 from .capabilities import (
+    CompactionCapability,
     EventSourcingCapability,
     HealingCapability,
     LifetimeBudgetCapability,
@@ -121,19 +122,19 @@ class ReactAgent:
             result_type: Type for agent result validation (default: str)
             observer: Context observer to register automatically (optional)
             capabilities: Optional sequence of pydantic-ai AgentCapability instances.
-                They are NOT forwarded unchanged: three internal capabilities —
-                LifetimeBudgetCapability, then EventSourcingCapability, then
-                HealingCapability — are mounted ahead of them, because those three own
-                the agent-lifetime budget, persistence, system-prompt recording and
-                dangling-tool-call healing for every run this agent drives. The budget
-                is outermost so a run it refuses reaches none of the others.
-                Ordering is fixed: a capability's before_model_request hook runs AFTER
-                compaction — ContextManager rewrites messages first, the result is
-                passed as message_history, and only then does the capability chain
-                run. Two consequences, neither guessable from the signature: a
-                capability sees only the POST-compaction history, never what
-                compaction folded away; and because pydantic-ai unwinds the chain in
-                reverse, a caller capability's `after_*` hooks run BEFORE the
+                They are NOT forwarded unchanged: four internal capabilities —
+                LifetimeBudgetCapability, then CompactionCapability, then
+                EventSourcingCapability, then HealingCapability — are mounted ahead of
+                them, because those four own the agent-lifetime budget, auto-compaction,
+                persistence, system-prompt recording and dangling-tool-call healing for
+                every run this agent drives. The budget is outermost so a run it refuses
+                reaches none of the others — including the summarizer LLM call.
+                Ordering is fixed, and a caller's capabilities sit INSIDE all four. Two
+                consequences, neither guessable from the signature: a capability sees
+                only the POST-compaction history, never what compaction folded away —
+                the fold happens in CompactionCapability's wrap_run head, which encloses
+                every hook a caller capability has; and because pydantic-ai unwinds the
+                chain in reverse, a caller capability's `after_*` hooks run BEFORE the
                 persistence sweep, so its durable edits are the ones persisted.
                 Under pydantic-ai 2.x (verified against 2.31.0), a capability that
                 orphans a tool call/return pair (e.g. by splitting one while injecting
@@ -195,8 +196,20 @@ class ReactAgent:
         # agent's shared httpx client (no second pool); the summarizer model uses
         # summary_model_cfg when set, else the primary model_cfg.
         summary_cfg = config.compaction_cfg.summary_model_cfg or config.model_cfg
-        self._compaction: CompactionStrategy = create_compaction(
+        strategy: CompactionStrategy = create_compaction(
             config.compaction_cfg, summary_cfg, self._http_client
+        )
+
+        # The whole of auto-compaction — the token gate, the durable fold and the
+        # in-place fold of the run's own history — lives here. Held on the instance
+        # because the manual /compact bridge delegates to it and the read-through
+        # `_compaction` property below reports its strategy; it is also the second
+        # entry of the capability stack assembled further down.
+        self._compactor = CompactionCapability(
+            strategy=strategy,
+            context=self._context,
+            threshold_fn=self._compaction_threshold,
+            event_factory=self._build_compaction_event,
         )
 
         # Create model from config
@@ -205,13 +218,18 @@ class ReactAgent:
         # Wrap result_type with provider-aware output strategy for structured output
         wrapped_result_type: Any = get_output_type(config.model_cfg, result_type)
 
-        # The whole capability stack, assembled once, here. The internal ones come first
-        # so the caller's sit inside them: pydantic-ai unwinds the chain in reverse, so a
-        # caller capability's after_* hooks run before the persistence sweep and its
-        # durable edits are what gets persisted. The budget is first of all, so a run it
-        # refuses reaches none of the others.
+        # The whole capability stack, assembled once, here — the only place its order is
+        # decided. The budget is first of all, so a run it refuses reaches none of the
+        # others and in particular never pays for compaction's summarizer; nothing but
+        # this list holds that. Compaction is second so persistence opens its cursor on
+        # the POST-fold history, though that one is belt-and-braces — _anchor re-opens the
+        # cursor at the first node hook either way. The internal ones come first so the
+        # caller's sit inside them: pydantic-ai unwinds the chain in reverse, so a caller
+        # capability's after_* hooks run before the persistence sweep and its durable edits
+        # are what gets persisted.
         capability_stack: list[AgentCapability[Any]] = [
             self._budget,
+            self._compactor,
             EventSourcingCapability(context=self._context),
             HealingCapability(context=self._context),
             *(capabilities or []),
@@ -346,27 +364,19 @@ class ReactAgent:
         output_type: type[Any] | None,
         limits: RunUsageLimits | None,
     ) -> Any:
-        """Shared run core: pre-flight, compaction, one ``run()`` call.
+        """Shared run core: fold the prompt, convert the run tier, one ``run()`` call.
 
         Everything ``run()`` does, with the run-tier budget as a parameter so the
         tool-free conclusion can substitute its own without ``run()`` growing a
         public knob for it. Reusing this core is what gives the conclusion the same
-        pre-flight, the same persistence, the same system-prompt recording and the
-        same usage fold — so a conclusion emits an ``LlmUsageEvent`` like any other
-        run.
+        pre-flight, the same auto-compaction, the same persistence, the same
+        system-prompt recording and the same usage fold — so a conclusion emits an
+        ``LlmUsageEvent`` like any other run.
 
-        Persistence, system-prompt recording, healing and the agent-lifetime budget
-        are not performed here at all: they belong to ``EventSourcingCapability``,
-        ``HealingCapability`` and ``LifetimeBudgetCapability``, mounted ahead of the
-        caller's capabilities in ``__init__``. What is left is a compaction gate and
-        one awaited call.
-
-        The one budget call still made here is ``check_budget()``, which consumes
-        nothing: ``LifetimeBudgetCapability`` enforces the same two refusals inside
-        ``wrap_run``, but ``wrap_run`` runs *inside* ``Agent.run()`` — by which point
-        auto-compaction has already paid for a summarizer LLM call. This keeps "a
-        refused run costs nothing" true while compaction still sits out here; the call
-        goes away when compaction itself moves into the stack.
+        None of those five is performed here: they belong to the capability stack
+        assembled in ``__init__``, and each fires inside the one awaited ``run()``
+        below. What is left is the operator-action prompt fold, the run-tier limits
+        conversion, that call, and the run-tier exception mapping.
 
         Args:
             user_prompt: The prompt for this turn.
@@ -386,13 +396,6 @@ class ReactAgent:
                 method's, to alter, because that is what
                 ``Akgent._handle_failure`` formats onto ``ErrorMessage.traceback``.
         """
-        # Non-consuming pre-flight, ahead of compaction: the capability refuses the
-        # same two ways inside wrap_run, but that is downstream of the summarizer.
-        self._budget.check_budget()
-        # Auto-compact (at most once per turn) BEFORE the run reads the history.
-        # message_history is read once at entry and the graph only appends, so
-        # compacting here takes effect for the whole turn.
-        await self._maybe_compact()
         user_prompt = self._fold_pending_operator_actions(user_prompt)
         pydantic_limits = self._to_pydantic_limits(limits)
 
@@ -459,34 +462,31 @@ class ReactAgent:
             return f"{preamble}\n\n{user_prompt}"
         return [preamble, *user_prompt]
 
+    @property
+    def _compaction(self) -> CompactionStrategy:
+        """The resolved compaction strategy, read through to the mounted capability.
+
+        One source of truth: ``CompactionCapability`` holds the strategy and is what
+        actually calls it. Deliberately read-only — a test that swapped a strategy onto
+        ``ReactAgent`` instead of onto the capability would be testing nothing, silently,
+        so the assignment raises instead. Swap ``agent._compactor.strategy``.
+        """
+        return self._compactor.strategy
+
     def _compaction_threshold(self) -> int | None:
         """Token budget that arms the auto-trigger, or None when compaction is off.
 
-        ``int(context_length * trigger_ratio)`` when ``model_cfg.context_length``
-        is set; ``None`` (auto-compaction disabled) otherwise.
-        """
-        context_length = self._config.model_cfg.context_length
-        if context_length is None:
-            return None
-        return int(context_length * self._config.compaction_cfg.trigger_ratio)
-
-    async def _maybe_compact(self) -> None:
-        """Auto-compact once when the last run's input_tokens exceed the threshold.
-
-        Reads the provider-reported ``last_input_tokens`` (no ``tiktoken``). No-ops
-        when auto-trigger is off, the budget is unset (``context_length is None``),
-        no usage has been reported yet (``last_input_tokens is None`` — never
-        mis-fires on missing data), or usage is at/below the threshold. Fires at
-        most once per ``run()`` call.
+        ``int(context_length * trigger_ratio)`` when auto-compaction is on and
+        ``model_cfg.context_length`` is set; ``None`` (auto-compaction disabled)
+        otherwise. Both ways of being off — the switch and the missing budget — answer
+        ``None`` here so "compaction is off" is one concept the capability reads once.
+        The arithmetic is unchanged.
         """
         cfg = self._config.compaction_cfg
-        if not cfg.auto_trigger:
-            return
-        threshold = self._compaction_threshold()
-        used = self._context.last_input_tokens
-        if threshold is None or used is None or used <= threshold:
-            return
-        await self._compact_now()
+        context_length = self._config.model_cfg.context_length
+        if not cfg.auto_trigger or context_length is None:
+            return None
+        return int(context_length * cfg.trigger_ratio)
 
     def _build_compaction_event(self, result: CompactionResult) -> LlmContextCompactedEvent:
         """Build the append-only event from a strategy result (auto + manual share this)."""
@@ -502,23 +502,18 @@ class ReactAgent:
         )
 
     async def _compact_now(self) -> str:
-        """Run the strategy and fold its result in — the shared async core (R1 + R2).
+        """Force a compaction now — the manual half of the one fold site (FR5).
 
-        Awaits the strategy inside the running loop (ADR-009). A zero-replacement
-        result is a clean no-op: no event, no synthetic summary. Both the auto path
-        (``_maybe_compact``) and the sync ``compact()`` bridge converge here.
+        Delegates to ``CompactionCapability.compact_now`` with no live message list:
+        there is no run in flight on this path, so the durable write is the only one and
+        the next run picks the folded history up from ``ContextManager``. The auto path
+        reaches the same method from the capability's own ``wrap_run``, which is what
+        keeps the two from diverging.
 
         Returns:
             A human-readable status string.
         """
-        result = await self._compaction.compact(self._context.messages)
-        if result.replaced_message_count == 0:
-            return "Nothing to compact."
-        self._context.compact(self._build_compaction_event(result))
-        return (
-            f"Compacted: replaced {result.replaced_message_count} "
-            f"earlier message(s) with a summary."
-        )
+        return await self._compactor.compact_now()
 
     def compact(self) -> str:
         """Force a compaction now, bypassing the budget gate (manual /compact, FR15).

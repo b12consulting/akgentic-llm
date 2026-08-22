@@ -3,9 +3,12 @@
 Three hook anchors carry everything here:
 
 - ``wrap_run``'s **head** — the pre-flight anchor. It runs before the wrapped run does
-  anything at all, which is where the agent-lifetime budget refuses a spent agent: the
+  anything at all, which is where the agent-lifetime budget refuses a spent agent (the
   outermost ``wrap_run`` is the only place a refusal costs nothing, since every inner
-  capability (and every model request) is downstream of it.
+  capability (and every model request) is downstream of it) and where auto-compaction folds
+  the history the run is about to read. ``RunContext.messages`` is the graph's own
+  ``message_history`` list, which ``UserPromptNode`` *reads* before rebinding ``state`` to a
+  normalised copy of it — so a head write reaches the run and a tail write does not.
 
 - ``after_node_run`` — the steady-state anchor. It fires after every graph node that
   completes, and is where persistence keeps its incremental shape: messages reach
@@ -28,16 +31,21 @@ last recorded message on every pass, with the cursor kept only as the fallback.
 **Composition: the first capability in the list is the outermost.** ``before_*`` hooks fire in
 list order, ``after_*`` in reverse, and ``wrap_run``s nest with the first one wrapping all the
 rest (pydantic-ai 2.27.1 — ``capabilities/combined.py`` builds each chain over
-``reversed(self.capabilities)``). ``ReactAgent`` mounts
-``[LifetimeBudgetCapability, EventSourcingCapability, HealingCapability, *yours]``. That list
-order is not final, though: if **any** capability in the chain declares ``get_ordering()`` (a
-fixed ``position``, or a ``wraps=`` / ``wrapped_by=`` constraint) pydantic-ai topologically
-re-sorts the whole chain to satisfy it, so a caller capability can legitimately end up outside
-these three. None of the classes here declares one, and the budget deliberately does not declare
-one to pin itself outermost — that would be a behavioural change owed its own decision. What a
-co-mounted capability needs from the order does **not** depend on where it sits: the closing
-sweep is in ``wrap_run``'s ``finally``, outside every capability's node hooks whatever the order,
-so durable ``after_*`` edits are always the ones persisted.
+``reversed(self.capabilities)``). ``ReactAgent`` mounts ``[LifetimeBudgetCapability,
+CompactionCapability, EventSourcingCapability, HealingCapability, *yours]``. One coupling rides
+on exactly that order and nothing else: the budget refuses a spent agent **before** compaction
+pays for a summarizer. Compaction sitting ahead of persistence also puts the cursor on the
+post-fold history, which is where it belongs — but that one is belt-and-braces, not the
+mechanism: ``_anchor`` re-opens the cursor against the normalised list at the first node hook,
+which absorbs a fold performed anywhere before it (verified by swapping the two).
+That list order is not final, though: if **any** capability in the chain
+declares ``get_ordering()`` (a fixed ``position``, or a ``wraps=`` / ``wrapped_by=`` constraint)
+pydantic-ai topologically re-sorts the whole chain to satisfy it, so a caller capability can
+legitimately end up outside these four. None of the classes here declares one, and the budget
+deliberately does not declare one to pin itself outermost — that would be a behavioural change
+owed its own decision. What a co-mounted capability needs from the order does **not** depend on
+where it sits: the closing sweep is in ``wrap_run``'s ``finally``, outside every capability's
+node hooks whatever the order, so durable ``after_*`` edits are always the ones persisted.
 
 **The ``wrap_run`` context is a snapshot, not the live list** (pydantic-ai 2.27.1, verified by
 running it). ``run_ctx`` is built once, before the graph starts; ``UserPromptNode.run`` then
@@ -59,6 +67,7 @@ in silence. Two back-to-back ``record_operator_action`` calls are enough to trig
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from typing import Any
 
@@ -76,8 +85,10 @@ from pydantic_ai.run import AgentRunResult
 from pydantic_ai.tools import RunContext
 from pydantic_ai.usage import RunUsage
 
+from .compaction import CompactionResult, CompactionStrategy
 from .config import AgentUsageLimits
 from .context import ContextManager
+from .event import LlmContextCompactedEvent
 
 logger = logging.getLogger(__name__)
 
@@ -145,7 +156,14 @@ class LifetimeBudgetCapability(AbstractCapability[Any]):
     this ``wrap_run``, so a refusal here is the only one that costs nothing at all. That is a
     property of the position, not of the class: nothing pins it there (see the module
     docstring's note on ``get_ordering()`` re-sorting), so a caller that needs the guarantee
-    must not mount work outside it.
+    must not mount work outside it. ``CompactionCapability`` is the concrete case — its
+    summarizer issues an LLM call, and it is only mounted *inside* this one that a spent agent
+    never pays for it.
+
+    **One enforcement site.** The two refusals live in ``wrap_run``'s head and nowhere else.
+    A second, non-consuming pre-flight helper existed while compaction still ran outside the
+    run; compaction moved inside, so the reason went with it. Two sites that must agree are
+    one site too many.
 
     **Check-then-consume, tokens first.** The token check runs first so that a token refusal
     consumes no run budget; the run counter then advances *before* the call executes, so a run
@@ -206,20 +224,6 @@ class LifetimeBudgetCapability(AbstractCapability[Any]):
         """
         self._run_count = run_count
         self._usage = usage
-
-    def check_budget(self) -> None:
-        """Both refusals, neither consumed — a caller's pre-flight ahead of ``wrap_run``.
-
-        Same two checks in the same order as ``wrap_run``'s head, minus the increment, so
-        calling it is idempotent and safe to place ahead of the run. ``ReactAgent`` uses it to
-        keep work that still sits *outside* the run — auto-compaction, whose summarizer issues
-        its own LLM call — from being paid for by a run that is about to be refused.
-
-        Raises:
-            AgentUsageLimitError: If either lifetime budget is already spent.
-        """
-        self._check_agent_token_budget()
-        self._check_agent_run_budget()
 
     async def wrap_run(
         self,
@@ -307,6 +311,127 @@ class LifetimeBudgetCapability(AbstractCapability[Any]):
         """
         self._check_agent_run_budget()
         self._run_count += 1
+
+
+@dataclass
+class CompactionCapability(AbstractCapability[Any]):
+    """Fold the conversation before the run reads it, when the token gate is armed.
+
+    Mountable on any pydantic-ai ``Agent``; it needs nothing from ``ReactAgent``. The gate
+    reads provider-reported tokens only — never ``tiktoken``, never an estimate — and the fold
+    itself is the strategy's, so this class owns only *when* to fold and *where the result
+    goes*.
+
+    **Mount it inside the lifetime budget and outside persistence.** Both neighbours matter
+    and neither is pinned by anything but list order:
+
+    - Inside ``LifetimeBudgetCapability``, because the summarizer issues its own LLM call. A
+      spent agent must be refused before it pays for one, and the budget's refusal in the
+      enclosing ``wrap_run`` head is what delivers that.
+    - Outside ``EventSourcingCapability``, so its cursor opens on the POST-fold list and the
+      synthetic summary request sits behind it, never re-persisted as an ``LlmMessageEvent``
+      (ADR-010 §9's replay rule — the ``LlmContextCompactedEvent`` already carries the
+      summary, so persisting both double-applies it on restore). This half is belt-and-braces
+      rather than load-bearing: ``EventSourcingCapability._anchor`` re-opens the cursor
+      against the normalised list at the first node hook, which absorbs a fold performed
+      anywhere ahead of it. Verified by swapping the two — the outcome is unchanged. The
+      budget coupling above is the one that genuinely depends on position.
+
+    **No ``for_run`` override, deliberately.** It holds no per-run state — the gate re-reads
+    ``context.last_input_tokens`` every time — and pydantic-ai's default hands back ``self``,
+    so ``wrap_run`` fires once per run by construction. That once-per-run property is what
+    ``before_model_request`` could not give: that hook fires per model *request*, so a fold
+    placed there would need an explicit guard to stay once per turn.
+    """
+
+    strategy: CompactionStrategy
+    """How to summarize and where the fold boundary is; the framework owns the fold itself."""
+
+    context: ContextManager
+    """The durable history the fold is applied to, and the observer channel it is emitted on."""
+
+    threshold_fn: Callable[[], int | None]
+    """The armed token budget, re-read per run. ``None`` ⇒ auto-compaction is off.
+
+    A callable rather than a value so a config change between runs takes effect, and so
+    "compaction is off" stays one concept computed in one place by the owner of the config.
+    """
+
+    event_factory: Callable[[CompactionResult], LlmContextCompactedEvent]
+    """Builds the append-only event from a strategy result.
+
+    Injected because the event carries configuration this capability deliberately does not
+    hold — the strategy id and the summarizer prompt version — which keeps it mountable à la
+    carte without a ``ReactAgentConfig``.
+    """
+
+    async def wrap_run(
+        self,
+        ctx: RunContext[Any],
+        *,
+        handler: WrapRunHandler,
+    ) -> AgentRunResult[Any]:
+        """Fold before the run reads its history, then run.
+
+        The fold is performed **before** ``handler()``, which is what makes it take effect:
+        ``RunContext.messages`` is ``GraphAgentState.message_history`` itself, the same list
+        object the graph holds (pydantic-ai 2.27.1 — ``_agent_graph.build_run_context``), and
+        ``UserPromptNode.run`` *reads* that object before rebinding ``state`` to a normalised
+        copy of it. A write placed after ``handler()`` would land on a list nothing reads
+        again, silently.
+
+        Nothing needs to run on the way out, so there is no ``try``/``finally`` here.
+        """
+        if self._armed():
+            await self.compact_now(ctx.messages)
+        return await handler()
+
+    def _armed(self) -> bool:
+        """Whether this run's history is over the auto-compaction threshold.
+
+        Three no-ops, in the order they are cheapest to decide: auto-compaction off
+        (``threshold_fn()`` is ``None``), no usage reported yet (``last_input_tokens`` is
+        ``None`` — never mis-fire on missing data), and usage at or below the threshold
+        (strictly above fires).
+        """
+        threshold = self.threshold_fn()
+        used = self.context.last_input_tokens
+        return threshold is not None and used is not None and used > threshold
+
+    async def compact_now(self, live_messages: list[ModelMessage] | None = None) -> str:
+        """Run the strategy and apply its result to both histories — the only fold site.
+
+        The durable write (``ContextManager.compact``) and the live write
+        (``live_messages[:] = …``) are **one logical operation** and are kept in one method
+        for that reason: ``Agent.run()`` seeds the run's state from a copy of the history it
+        is handed, so mutating the run's list never reaches ``ContextManager`` and folding
+        ``ContextManager`` never reaches the run. Split across two methods they drift the
+        first time someone adds an early return.
+
+        The live write **mirrors** the durable result rather than folding a second time.
+        Applying the fold again to an already-folded list double-folds, and mirroring also
+        preserves message *identity*, which ``EventSourcingCapability``'s tail anchor locates
+        by.
+
+        Args:
+            live_messages: The run's own history list, mutated in place. ``None`` on the
+                manual ``/compact`` path, where there is no run in flight — the durable write
+                is then the only one, and the next run picks the folded history up from
+                ``ContextManager``.
+
+        Returns:
+            A human-readable status string.
+        """
+        result = await self.strategy.compact(self.context.messages)
+        if result.replaced_message_count == 0:
+            return "Nothing to compact."
+        self.context.compact(self.event_factory(result))
+        if live_messages is not None:
+            live_messages[:] = self.context.messages
+        return (
+            f"Compacted: replaced {result.replaced_message_count} "
+            f"earlier message(s) with a summary."
+        )
 
 
 @dataclass
