@@ -415,16 +415,17 @@ class TestRunInvokesHealing:
 
         The whole of FR3 rests on this: operators still receive the stack, because
         ``Akgent._handle_failure`` formats it off the exception that leaves
-        ``run()``. What this pins is that the generic branch neither wraps, replaces
-        nor swallows that exception — a handler that raised a new error, or returned
-        instead of re-raising, would break debugging to fix a prompt. Asserted by
-        identity, which no message-level check can substitute for.
+        ``run()``. What this pins is that a non-usage failure is neither wrapped,
+        replaced nor swallowed on its way out — anything that raised a new error, or
+        returned instead of propagating, would break debugging to fix a prompt.
+        Asserted by identity, which no message-level check can substitute for.
 
-        What it does NOT catch, deliberately, is ``raise e`` instead of the bare
-        ``raise``: ``raise e`` re-raises the *same* object and appends the current
-        frame to ``__traceback__`` rather than rebinding or truncating it, so it is
-        indistinguishable here. The bare form is required for the frame it does not
-        add, not for a guarantee this assertion could express.
+        Story 23-2 made that guarantee structural rather than behavioural: the
+        ``except Exception`` clause that used to re-raise is deleted, not emptied, so
+        there is no handler on this path to get wrong. The assertion is kept anyway,
+        because it now also covers ``HealingCapability.on_run_error``, which sits on
+        the same path and *could* suppress the error by returning a result — it
+        deliberately re-raises the original object instead.
         """
         agent = _make_agent()
         agent._context.add_message(_response_with_tool_calls(("tool_c", "call_c")))

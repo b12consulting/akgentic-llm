@@ -2170,6 +2170,34 @@ class TestReactAgentRunRecordsSystemPrompt:
 
         assert _system_events(observer) == []
 
+    @pytest.mark.asyncio
+    async def test_a_run_that_added_nothing_records_nothing(self, minimal_config):
+        """AC 1 edge: a run that appended no message of its own records no event.
+
+        The other half of the guard the companion above drives, and reachable the same
+        way: ``run()`` always produces messages, so "this run added nothing" exists only
+        at the capability's own ``wrap_run`` hook. Everything the recording needs is
+        deliberately in place — the history ends in a system request carrying a run_id,
+        and the ``ContextManager`` holds that same request to hash — so the one thing
+        suppressing the event is the run having added nothing. That makes it a real
+        guard: drop the length check and this goes red rather than staying vacuously
+        green.
+        """
+        observer = MockObserver()
+        agent = ReactAgent(config=minimal_config, observer=observer)
+        seeded = _system_request_with_run_id(("backstory", "B."), run_id="r1")
+        agent.context.add_message(seeded)
+        capability = EventSourcingCapability(context=agent.context)
+        ctx = _bare_run_context()
+        ctx.messages.append(seeded)
+
+        async def handler():
+            return MagicMock()
+
+        await capability.wrap_run(ctx, handler=handler)
+
+        assert _system_events(observer) == []
+
 
 class TestReactAgentRestoreSeedsSystemPromptHash:
     """restore_context() seeds the dedup hash from persisted events (AC 4, 5, 6, 7)."""
