@@ -312,6 +312,10 @@ def test_agent_request_limit_is_enforced_not_merely_declared() -> None:
     ``__init__.py``'s module docstring called this budget "declared, not yet
     enforced" long after it started refusing runs. A budget of zero runs is
     refused before the model is ever contacted.
+
+    Driven through ``agent._budget``, the ``LifetimeBudgetCapability`` the agent
+    mounts: the counter and both refusals moved there, and this asserts the budget
+    the agent is actually configured with, not a capability built by the test.
     """
     config = ReactAgentConfig(
         model_cfg=ModelConfig(provider="openai", model="gpt-4o"),
@@ -319,12 +323,12 @@ def test_agent_request_limit_is_enforced_not_merely_declared() -> None:
     )
     agent = ReactAgent(config=config)
     try:
-        agent._check_and_consume_agent_budget()  # consumes the only unit
+        agent._budget._check_and_consume_agent_budget()  # consumes the only unit
         # The tier is asserted by CLASS. `pytest.raises(Exception, match=...)`
         # identified it by message text, which is the one thing the README tells
         # readers never to branch on.
         with pytest.raises(AgentUsageLimitError):
-            agent._check_and_consume_agent_budget()
+            agent._budget._check_and_consume_agent_budget()
     finally:
         agent.close()
 

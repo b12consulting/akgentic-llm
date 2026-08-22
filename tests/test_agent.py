@@ -2,7 +2,7 @@
 
 import asyncio
 import inspect
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, TypeVar, get_type_hints
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -19,10 +19,12 @@ from pydantic_ai.messages import (
     ToolReturnPart,
     UserPromptPart,
 )
+from pydantic_ai.capabilities import AbstractCapability, WrapRunHandler
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.test import TestModel
+from pydantic_ai.run import AgentRunResult
 from pydantic_ai.tools import RunContext
-from pydantic_ai.usage import RunUsage
+from pydantic_ai.usage import RequestUsage, RunUsage
 
 from akgentic.llm import (
     AgentUsageLimitError,
@@ -85,13 +87,55 @@ class MockObserver:
 def _text_model(text: str = "test result") -> FunctionModel:
     """A model answering every request with one TextPart, for driving a REAL run.
 
-    Persistence, system-prompt recording and healing are capability hooks now, and a
-    stubbed ``iter()`` fires none of them — so every test whose subject is one of those
-    three has to reach the model rather than a double.
+    Persistence, system-prompt recording, healing and the agent-lifetime budget are
+    capability hooks now, and a stubbed ``iter()`` fires none of them — so every test whose
+    subject is one of those four has to reach the model rather than a double.
     """
 
     def stub(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
         return ModelResponse(parts=[TextPart(content=text)])
+
+    return FunctionModel(stub)
+
+
+def _spending_model(input_tokens: int, output_tokens: int = 0, text: str = "ok") -> FunctionModel:
+    """A ``_text_model`` that also reports a caller-chosen token spend, for a REAL run.
+
+    The replacement for the stubbed-``iter()`` spending double this file used to carry: the
+    lifetime token accumulator is folded in ``LifetimeBudgetCapability.wrap_run``, which a
+    stubbed ``iter()`` never reaches.
+
+    The spend is exact, not estimated: ``FunctionModel`` only guesses usage when the
+    response it is handed carries none (``models/function.py`` — ``if not
+    response.usage.has_values()``), so setting it here pins the run's cost to the number
+    the test asked for. One request per run, so a run costs exactly ``input + output``.
+    """
+
+    def stub(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        return ModelResponse(
+            parts=[TextPart(content=text)],
+            usage=RequestUsage(input_tokens=input_tokens, output_tokens=output_tokens),
+        )
+
+    return FunctionModel(stub)
+
+
+def _calling_model(
+    tool_name: str, args: dict[str, Any] | None = None, **usage: int
+) -> FunctionModel:
+    """A model that answers every request with the same single tool call.
+
+    Two REAL failure shapes are built on it: a tool that raises (the run dies partway) and
+    a run-tier ``RunUsageLimits(run_request_limit=1)`` (the second request is refused). Both
+    used to be injected by making a stubbed ``iter()`` raise, which no longer reaches the
+    capability under test.
+    """
+
+    def stub(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        return ModelResponse(
+            parts=[ToolCallPart(tool_name=tool_name, args=args or {})],
+            usage=RequestUsage(**usage),
+        )
 
     return FunctionModel(stub)
 
@@ -823,15 +867,17 @@ def _agent_token_config(**token_limits):
     )
 
 
-def _stub_run_spending(input_tokens, output_tokens=0):
-    """iter() side_effect returning a run that reports a fixed token spend."""
-    spend = RunUsage(input_tokens=input_tokens, output_tokens=output_tokens)
+def _both_tier_config(*, run_request_limit, agent_request_limit):
+    """Config carrying a run-tier request budget AND an agent-tier run budget.
 
-    def factory(*args, **kwargs):
-        _spend_through_the_run_anchor(kwargs, spend)
-        return _StubRun(spent=spend)
-
-    return factory
+    The two are deliberately given different values wherever it is used, so a test
+    distinguishes "reads the run tier" from "reads whichever tier is set".
+    """
+    return ReactAgentConfig(
+        model_cfg=ModelConfig(provider="openai", model="gpt-4o"),
+        run_usage_limits=RunUsageLimits(run_request_limit=run_request_limit),
+        agent_usage_limits=AgentUsageLimits(agent_request_limit=agent_request_limit),
+    )
 
 
 class TestReactAgentRunCountEnforcement:
@@ -845,7 +891,7 @@ class TestReactAgentRunCountEnforcement:
     def test_runs_up_to_the_limit_succeed(self):
         """Test calls 1..N execute and consume exactly N."""
         agent = ReactAgent(config=_agent_limit_config(2))
-        with patch.object(agent._pydantic_agent, "iter", side_effect=_StubRun):
+        with agent.pydantic_agent.override(model=_text_model()):
             agent.run_sync("first")
             agent.run_sync("second")
         assert agent._agent_run_count == 2
@@ -853,7 +899,7 @@ class TestReactAgentRunCountEnforcement:
     def test_run_past_the_limit_raises_and_does_not_consume(self):
         """Test call N+1 is rejected and leaves the counter pinned at the limit."""
         agent = ReactAgent(config=_agent_limit_config(2))
-        with patch.object(agent._pydantic_agent, "iter", side_effect=_StubRun):
+        with agent.pydantic_agent.override(model=_text_model()):
             agent.run_sync("first")
             agent.run_sync("second")
             with pytest.raises(UsageLimitError) as exc_info:
@@ -872,11 +918,11 @@ class TestReactAgentRunCountEnforcement:
         now — and the claim is unchanged: a pre-flight rejection never reaches it.
         """
         agent = ReactAgent(config=_agent_limit_config(1))
-        with patch.object(agent._pydantic_agent, "iter", side_effect=_StubRun):
+        with agent.pydantic_agent.override(model=_text_model()):
             agent.run_sync("first")
-        with patch.object(HealingCapability, "_heal") as heal:
-            with pytest.raises(UsageLimitError):
-                agent.run_sync("second")
+            with patch.object(HealingCapability, "_heal") as heal:
+                with pytest.raises(UsageLimitError):
+                    agent.run_sync("second")
         heal.assert_not_called()
 
     def test_run_hands_the_run_tier_to_pydantic_ai(self):
@@ -902,26 +948,44 @@ class TestReactAgentRunCountEnforcement:
     def test_rejection_happens_before_compaction(self):
         """Test the budget check precedes compaction: a rejected run costs nothing."""
         agent = ReactAgent(config=_agent_limit_config(1))
-        with patch.object(agent._pydantic_agent, "iter", side_effect=_StubRun):
+        with agent.pydantic_agent.override(model=_text_model()):
             agent.run_sync("first")
-        with patch.object(agent, "_maybe_compact", new=AsyncMock()) as compact:
-            with pytest.raises(UsageLimitError):
-                agent.run_sync("second")
+            with patch.object(agent, "_maybe_compact", new=AsyncMock()) as compact:
+                with pytest.raises(UsageLimitError):
+                    agent.run_sync("second")
         compact.assert_not_called()
 
     def test_counter_advances_when_the_wrapped_call_raises(self):
-        """Test a run that fails partway has already been counted."""
+        """Test a run that fails partway has already been counted.
+
+        The failure is real: the model calls a tool that raises, so the run dies after
+        the counter advanced. Injecting it by making ``iter()`` raise no longer works —
+        the counter lives in a ``wrap_run`` hook that a stubbed ``iter()`` never reaches.
+        """
         agent = ReactAgent(config=_agent_limit_config(3))
-        with patch.object(agent._pydantic_agent, "iter", side_effect=RuntimeError("boom")):
+
+        @agent.pydantic_agent.tool_plain
+        def boom_tool() -> str:
+            raise RuntimeError("boom")
+
+        with agent.pydantic_agent.override(model=_calling_model("boom_tool")):
             with pytest.raises(RuntimeError):
                 agent.run_sync("first")
         assert agent._agent_run_count == 1
 
     def test_counter_advances_when_the_run_tier_limit_fires(self):
-        """Test a run-tier breach still consumes the agent-tier budget."""
-        agent = ReactAgent(config=_agent_limit_config(3))
-        breach = UsageLimitExceeded("The next request would exceed the request_limit of 1")
-        with patch.object(agent._pydantic_agent, "iter", side_effect=breach):
+        """Test a run-tier breach still consumes the agent-tier budget.
+
+        The breach is real: one request is all the run tier allows, and the model asks
+        for a tool, so the follow-up request pydantic-ai needs is the one refused.
+        """
+        agent = ReactAgent(config=_both_tier_config(run_request_limit=1, agent_request_limit=3))
+
+        @agent.pydantic_agent.tool_plain
+        def noop() -> str:
+            return "ok"
+
+        with agent.pydantic_agent.override(model=_calling_model("noop")):
             with pytest.raises(RunUsageLimitError) as exc_info:
                 agent.run_sync("first")
         assert agent._agent_run_count == 1
@@ -933,9 +997,13 @@ class TestReactAgentRunCountEnforcement:
         Which tier fired is asserted by CLASS; the message assertions that follow
         pin the wording, they do not identify the tier.
         """
-        agent = ReactAgent(config=_agent_limit_config(2))
-        breach = UsageLimitExceeded("The next request would exceed the request_limit of 1")
-        with patch.object(agent._pydantic_agent, "iter", side_effect=breach):
+        agent = ReactAgent(config=_both_tier_config(run_request_limit=1, agent_request_limit=2))
+
+        @agent.pydantic_agent.tool_plain
+        def noop() -> str:
+            return "ok"
+
+        with agent.pydantic_agent.override(model=_calling_model("noop")):
             for _ in range(2):
                 with pytest.raises(RunUsageLimitError) as run_tier:
                     agent.run_sync("burn a turn")
@@ -948,7 +1016,7 @@ class TestReactAgentRunCountEnforcement:
         """Test agent_request_limit=None (the default) blocks nothing but still counts."""
         assert minimal_config.agent_usage_limits.agent_request_limit is None
         agent = ReactAgent(config=minimal_config)
-        with patch.object(agent._pydantic_agent, "iter", side_effect=_StubRun):
+        with agent.pydantic_agent.override(model=_text_model()):
             for _ in range(5):
                 agent.run_sync("unbounded")
         assert agent._agent_run_count == 5
@@ -956,7 +1024,7 @@ class TestReactAgentRunCountEnforcement:
     async def test_async_run_enforces_the_same_budget(self):
         """Test the async entry point holds the budget (run_sync only delegates to it)."""
         agent = ReactAgent(config=_agent_limit_config(1))
-        with patch.object(agent._pydantic_agent, "iter", side_effect=_StubRun):
+        with agent.pydantic_agent.override(model=_text_model()):
             await agent.run("first")
             with pytest.raises(UsageLimitError):
                 await agent.run("second")
@@ -1069,7 +1137,7 @@ class TestReactAgentRunCountRestore:
         """
         agent = ReactAgent(config=_agent_limit_config(2))
         agent.restore_context([FakeEventMessage(event=_usage_event("r1"))])
-        with patch.object(agent._pydantic_agent, "iter", side_effect=_StubRun):
+        with agent.pydantic_agent.override(model=_text_model()):
             agent.run_sync("the one run left")
             with pytest.raises(UsageLimitError):
                 agent.run_sync("one turn too many")
@@ -1104,6 +1172,27 @@ class TestReactAgentRunCountRestore:
         assert agent._agent_run_count == 2
 
 
+@dataclass
+class _RunUsageProbe(AbstractCapability[Any]):
+    """Records the run's own usage accumulator, as handed to a co-mounted capability.
+
+    Mounted as a caller capability it nests **inside** ``LifetimeBudgetCapability``, so its
+    ``wrap_run`` runs after the budget's pre-flight and before the run spends anything —
+    the moment at which "this run starts at zero" is a claim worth making.
+    """
+
+    seen: list[tuple[RunUsage, int]] = field(default_factory=list)
+
+    async def wrap_run(
+        self, ctx: RunContext[Any], *, handler: WrapRunHandler
+    ) -> AgentRunResult[Any]:
+        """Snapshot the accumulator's identity and its total at hand-over, then run."""
+        # The total is snapshotted here, not read back at the end: the run spends THROUGH
+        # this very object, so it is non-zero by the time the assertions run.
+        self.seen.append((ctx.usage, ctx.usage.total_tokens))
+        return await handler()
+
+
 class TestReactAgentTokenBudgetEnforcement:
     """Test the agent-lifetime TOKEN budget: accumulate across runs, check pre-flight."""
 
@@ -1118,7 +1207,7 @@ class TestReactAgentTokenBudgetEnforcement:
         assert (limits.input_tokens_limit, limits.output_tokens_limit) == (None, None)
         assert limits.total_tokens_limit is None
         agent = ReactAgent(config=minimal_config)
-        with patch.object(agent._pydantic_agent, "iter", side_effect=_stub_run_spending(1000, 500)):
+        with agent.pydantic_agent.override(model=_spending_model(1000, 500)):
             for _ in range(5):
                 agent.run_sync("unbounded")
         assert agent._agent_usage.total_tokens == 7500
@@ -1131,7 +1220,7 @@ class TestReactAgentTokenBudgetEnforcement:
         accumulator each run — never raises and passes a single-run test green.
         """
         agent = ReactAgent(config=_agent_token_config(total_tokens_limit=100))
-        with patch.object(agent._pydantic_agent, "iter", side_effect=_stub_run_spending(40, 20)):
+        with agent.pydantic_agent.override(model=_spending_model(40, 20)):
             agent.run_sync("first")
             agent.run_sync("second")
             with pytest.raises(UsageLimitError) as exc_info:
@@ -1146,7 +1235,7 @@ class TestReactAgentTokenBudgetEnforcement:
     def test_input_tokens_limit_blocks_independently(self):
         """Test input_tokens_limit is live on its own, not only via the total."""
         agent = ReactAgent(config=_agent_token_config(input_tokens_limit=100))
-        with patch.object(agent._pydantic_agent, "iter", side_effect=_stub_run_spending(60)):
+        with agent.pydantic_agent.override(model=_spending_model(60)):
             agent.run_sync("first")
             agent.run_sync("second")
             with pytest.raises(UsageLimitError) as exc_info:
@@ -1160,7 +1249,7 @@ class TestReactAgentTokenBudgetEnforcement:
     def test_output_tokens_limit_blocks_independently(self):
         """Test output_tokens_limit is live on its own — output tokens only here."""
         agent = ReactAgent(config=_agent_token_config(output_tokens_limit=100))
-        with patch.object(agent._pydantic_agent, "iter", side_effect=_stub_run_spending(0, 60)):
+        with agent.pydantic_agent.override(model=_spending_model(0, 60)):
             agent.run_sync("first")
             agent.run_sync("second")
             with pytest.raises(UsageLimitError) as exc_info:
@@ -1179,7 +1268,7 @@ class TestReactAgentTokenBudgetEnforcement:
         Pinned as behaviour so a reader meeting the overshoot does not file it as a bug.
         """
         agent = ReactAgent(config=_agent_token_config(total_tokens_limit=100))
-        with patch.object(agent._pydantic_agent, "iter", side_effect=_stub_run_spending(900, 100)):
+        with agent.pydantic_agent.override(model=_spending_model(900, 100)):
             assert agent.run_sync("one very expensive run") == "ok"
             assert agent._agent_usage.total_tokens == 1000
             with pytest.raises(UsageLimitError):
@@ -1188,18 +1277,20 @@ class TestReactAgentTokenBudgetEnforcement:
     def test_usage_folds_even_when_the_run_fails_partway(self):
         """Test tokens a failed run burned are still counted — the provider billed them.
 
-        The failure is injected from the stub factory (spend, then raise) rather than
-        by patching a private method that no longer exists. See
-        ``test_a_real_failing_run_still_folds_its_usage`` for the same claim proved
-        against a real model, where the anchor is pydantic-ai's own accumulator.
+        The model spends an exact 40/20 asking for a tool, and the tool raises: the run
+        dies **after** the request that cost the tokens, which is the shape the fold in
+        ``wrap_run``'s ``finally`` exists for. See
+        ``test_a_real_failing_run_still_folds_its_usage`` for the same claim asserted
+        loosely against pydantic-ai's own estimate.
         """
         agent = ReactAgent(config=_agent_token_config(total_tokens_limit=1000))
 
-        def spend_then_fail(*args, **kwargs):
-            _spend_through_the_run_anchor(kwargs, RunUsage(input_tokens=40, output_tokens=20))
+        @agent.pydantic_agent.tool_plain
+        def boom_tool() -> str:
             raise RuntimeError("boom")
 
-        with patch.object(agent._pydantic_agent, "iter", side_effect=spend_then_fail):
+        model = _calling_model("boom_tool", input_tokens=40, output_tokens=20)
+        with agent.pydantic_agent.override(model=model):
             with pytest.raises(RuntimeError):
                 agent.run_sync("fails after spending")
         assert agent._agent_usage.total_tokens == 60
@@ -1241,7 +1332,7 @@ class TestReactAgentTokenBudgetEnforcement:
             agent_usage_limits=AgentUsageLimits(agent_request_limit=5, total_tokens_limit=100),
         )
         agent = ReactAgent(config=config)
-        with patch.object(agent._pydantic_agent, "iter", side_effect=_stub_run_spending(150)):
+        with agent.pydantic_agent.override(model=_spending_model(150)):
             agent.run_sync("first")
             with pytest.raises(UsageLimitError):
                 agent.run_sync("refused on tokens")
@@ -1252,47 +1343,44 @@ class TestReactAgentTokenBudgetEnforcement:
     def test_token_rejection_happens_before_compaction(self):
         """Test the token check precedes compaction: a refused run pays no summarizer."""
         agent = ReactAgent(config=_agent_token_config(total_tokens_limit=100))
-        with patch.object(agent._pydantic_agent, "iter", side_effect=_stub_run_spending(150)):
+        with agent.pydantic_agent.override(model=_spending_model(150)):
             agent.run_sync("first")
-        with patch.object(agent, "_maybe_compact", new=AsyncMock()) as compact:
-            with pytest.raises(UsageLimitError):
-                agent.run_sync("refused")
+            with patch.object(agent, "_maybe_compact", new=AsyncMock()) as compact:
+                with pytest.raises(UsageLimitError):
+                    agent.run_sync("refused")
         compact.assert_not_called()
 
     def test_run_tier_never_receives_the_lifetime_accumulator(self):
-        """Test iter() starts every run at zero usage — it never sees the accumulator.
+        """Test every run starts at zero usage — the run tier never sees the accumulator.
 
-        The mutation this exists to kill (``usage=self._agent_usage`` on the ``iter()``
-        call) raises nothing and logs nothing: it checks the RUN tier's limits against
-        lifetime totals, silently turning a per-run cap into a lifetime one. No other
-        test in this file goes red for it.
+        The same claim as before the budget moved, re-expressed against the new shape:
+        the object the run spends through is now the one pydantic-ai's graph creates and
+        hands to every hook as ``ctx.usage``, and ``LifetimeBudgetCapability`` folds it in
+        rather than being it. The mutation this exists to kill — making the capability's
+        accumulator the run's own budget object — raises nothing and logs nothing: it
+        checks the RUN tier's limits against lifetime totals, silently turning a per-run
+        cap into a lifetime one. No other test in this file goes red for it.
         """
-        agent = ReactAgent(config=_agent_token_config())
-        captured = []
+        probe = _RunUsageProbe()
+        # Mounted as a CALLER capability, so it sits inside the budget's wrap_run and
+        # sees exactly the object the run itself will spend through.
+        agent = ReactAgent(config=_agent_token_config(), capabilities=[probe])
 
-        def capture(*args, **kwargs):
-            usage = kwargs.get("usage")
-            # The total is snapshotted at hand-over, not read back at the end: the run
-            # spends THROUGH this very object (that is the fold's anchor), so the object
-            # is non-zero by the time the assertions below run.
-            captured.append((usage, None if usage is None else usage.total_tokens))
-            _spend_through_the_run_anchor(kwargs, RunUsage(input_tokens=100, output_tokens=50))
-            return _StubRun()
-
-        with patch.object(agent._pydantic_agent, "iter", side_effect=capture):
+        with agent.pydantic_agent.override(model=_spending_model(100, 50)):
             agent.run_sync("first")
             agent.run_sync("second")
 
-        # Non-zero by the second call, so "fresh" is a real claim there, not a tautology.
+        # Non-zero by the second run, so "fresh" is a real claim there, not a tautology.
         assert agent._agent_usage.total_tokens == 300
-        assert len(captured) == 2
-        for usage, total_at_handover in captured:
-            assert usage is None or (usage is not agent._agent_usage and total_at_handover == 0)
+        assert len(probe.seen) == 2
+        for usage, total_at_handover in probe.seen:
+            assert usage is not agent._agent_usage
+            assert total_at_handover == 0
 
     async def test_async_run_enforces_the_same_token_budget(self):
         """Test the async entry point holds the budget (run_sync only delegates to it)."""
         agent = ReactAgent(config=_agent_token_config(total_tokens_limit=100))
-        with patch.object(agent._pydantic_agent, "iter", side_effect=_stub_run_spending(150)):
+        with agent.pydantic_agent.override(model=_spending_model(150)):
             await agent.run("first")
             with pytest.raises(UsageLimitError):
                 await agent.run("second")
@@ -1339,7 +1427,7 @@ class TestReactAgentTokenBudgetRestore:
         agent.restore_context(
             [FakeEventMessage(event=_usage_event(rid)) for rid in ("r1", "r2", "r3")]
         )
-        with patch.object(agent._pydantic_agent, "iter", side_effect=_stub_run_spending(1)):
+        with agent.pydantic_agent.override(model=_spending_model(1)):
             with pytest.raises(UsageLimitError) as exc_info:
                 agent.run_sync("one run too many")
         # pydantic-ai v2 appends a docs-hint suffix to UsageLimitExceeded; ADR-013 only
@@ -1354,7 +1442,7 @@ class TestReactAgentTokenBudgetRestore:
         agent.restore_context(
             [FakeEventMessage(event=_usage_event(rid)) for rid in ("r1", "r2", "r3")]
         )
-        with patch.object(agent._pydantic_agent, "iter", side_effect=_stub_run_spending(60)):
+        with agent.pydantic_agent.override(model=_spending_model(60)):
             agent.run_sync("the one run left")  # 45 + 60 = 105, over only afterwards
             with pytest.raises(UsageLimitError):
                 agent.run_sync("one run too many")
@@ -1401,7 +1489,7 @@ class TestReactAgentTokenBudgetRestore:
         """Test a restored agent folds new runs on top of the seed, not over it."""
         agent = ReactAgent(config=_agent_token_config(total_tokens_limit=1000))
         agent.restore_context([FakeEventMessage(event=_usage_event("r1"))])
-        with patch.object(agent._pydantic_agent, "iter", side_effect=_stub_run_spending(100, 50)):
+        with agent.pydantic_agent.override(model=_spending_model(100, 50)):
             agent.run_sync("one more")
         assert agent._agent_usage.input_tokens == 110
         assert agent._agent_usage.output_tokens == 55
@@ -1426,7 +1514,7 @@ class TestUsageLimitErrorTierSplit:
     def test_agent_tier_token_breach_raises_the_agent_subclass(self):
         """Test a pre-flight token breach surfaces as AgentUsageLimitError."""
         agent = ReactAgent(config=_agent_token_config(total_tokens_limit=100))
-        with patch.object(agent._pydantic_agent, "iter", side_effect=_stub_run_spending(80, 40)):
+        with agent.pydantic_agent.override(model=_spending_model(80, 40)):
             agent.run_sync("first")
             with pytest.raises(AgentUsageLimitError):
                 agent.run_sync("second")
@@ -1434,7 +1522,7 @@ class TestUsageLimitErrorTierSplit:
     def test_agent_tier_run_breach_raises_the_agent_subclass(self):
         """Test the N+1 run surfaces as AgentUsageLimitError."""
         agent = ReactAgent(config=_agent_limit_config(2))
-        with patch.object(agent._pydantic_agent, "iter", side_effect=_StubRun):
+        with agent.pydantic_agent.override(model=_text_model()):
             agent.run_sync("first")
             agent.run_sync("second")
             with pytest.raises(AgentUsageLimitError):
@@ -1461,7 +1549,7 @@ class TestUsageLimitErrorTierSplit:
                 pytest.fail("run tier did not raise")
 
         agent_tier_agent = ReactAgent(config=_agent_limit_config(1))
-        with patch.object(agent_tier_agent._pydantic_agent, "iter", side_effect=_StubRun):
+        with agent_tier_agent.pydantic_agent.override(model=_text_model()):
             agent_tier_agent.run_sync("first")
             try:
                 agent_tier_agent.run_sync("second")
@@ -1491,7 +1579,7 @@ class TestUsageLimitErrorTierSplit:
     def test_message_text_is_unchanged_by_the_split(self, minimal_config):
         """Test the split moved the class, never the wording, at both tiers."""
         agent = ReactAgent(config=_agent_limit_config(2))
-        with patch.object(agent._pydantic_agent, "iter", side_effect=_StubRun):
+        with agent.pydantic_agent.override(model=_text_model()):
             agent.run_sync("first")
             agent.run_sync("second")
             with pytest.raises(AgentUsageLimitError) as agent_tier:
@@ -1613,7 +1701,7 @@ class TestReactAgentConcludeWithoutTools:
         pre-flight, not a model round-trip that then fails.
         """
         agent = ReactAgent(config=_agent_limit_config(1))
-        with patch.object(agent._pydantic_agent, "iter", side_effect=_StubRun):
+        with agent.pydantic_agent.override(model=_text_model()):
             agent.run_sync("the only run this agent gets")
 
         with patch.object(agent._pydantic_agent, "iter", side_effect=_StubRun) as iter_call:
@@ -1625,7 +1713,7 @@ class TestReactAgentConcludeWithoutTools:
     def test_spent_token_budget_refuses_the_conclusion(self):
         """The token half of the agent tier refuses the conclusion too (AC #12)."""
         agent = ReactAgent(config=_agent_token_config(total_tokens_limit=100))
-        with patch.object(agent._pydantic_agent, "iter", side_effect=_stub_run_spending(80, 40)):
+        with agent.pydantic_agent.override(model=_spending_model(80, 40)):
             agent.run_sync("burn the lifetime token budget")
 
         with patch.object(agent._pydantic_agent, "iter", side_effect=_StubRun) as iter_call:

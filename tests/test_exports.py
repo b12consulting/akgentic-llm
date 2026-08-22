@@ -65,6 +65,7 @@ def test_key_exports_present():
     assert hasattr(akgentic.llm, "ToolReturnEvent")
 
     # Run-loop capabilities
+    assert hasattr(akgentic.llm, "LifetimeBudgetCapability")
     assert hasattr(akgentic.llm, "EventSourcingCapability")
     assert hasattr(akgentic.llm, "HealingCapability")
 
