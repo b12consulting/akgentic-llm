@@ -1,4 +1,4 @@
-"""Tests for ReactAgent._heal_unprocessed_tool_calls().
+"""Tests for dangling-tool-call healing, now ``HealingCapability``'s.
 
 Covers Story 5.1 / ADR-003: When the REACT loop fails mid-execution, any
 ``ModelResponse`` whose ``ToolCallPart`` entries never received results is
@@ -6,9 +6,15 @@ healed by appending a ``ModelRequest`` with matching ``ToolReturnPart``
 entries. This prevents the 'unprocessed tool calls' error on the next
 ``run()``.
 
-Tests invoke ``_heal_unprocessed_tool_calls()`` directly on a constructed
-``ReactAgent`` so the healing logic can be exercised without a real LLM
-round-trip.
+The unit tests invoke the healer directly, against a manually populated context, so
+the healing logic can be exercised without a real LLM round-trip. Its subject moved
+in story 23-2 — ``ReactAgent._heal_unprocessed_tool_calls`` is gone and the healer is
+``HealingCapability._heal`` — but the context, the assertions and the event checks are
+unchanged; ``_heal_through_the_capability`` is the one-line adapter.
+
+The run-level tests underneath are driven by a **real** model: healing is
+``HealingCapability.on_run_error`` now, and no capability hook fires when ``iter()``
+is stubbed out.
 """
 
 from __future__ import annotations
@@ -19,8 +25,8 @@ from datetime import datetime
 from unittest.mock import patch
 
 import pytest
-from pydantic_ai.exceptions import UsageLimitExceeded
 from pydantic_ai.messages import (
+    ModelMessage,
     ModelRequest,
     ModelResponse,
     TextPart,
@@ -28,12 +34,15 @@ from pydantic_ai.messages import (
     ToolReturnPart,
     UserPromptPart,
 )
+from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 from akgentic.llm import (
+    HealingCapability,
     LlmMessageEvent,
     ModelConfig,
     ReactAgent,
     ReactAgentConfig,
+    RunUsageLimits,
     ToolReturnEvent,
     UsageLimitError,
 )
@@ -55,12 +64,29 @@ class _EventCapture:
 def _make_agent() -> ReactAgent:
     """Construct a ReactAgent with a minimal offline config.
 
-    The underlying pydantic-ai Agent is never invoked by these tests — we
-    call ``_heal_unprocessed_tool_calls()`` directly on a manually populated
-    context.
+    The underlying pydantic-ai Agent is never invoked by the unit tests — they run the
+    healer directly on a manually populated context.
     """
     config = ReactAgentConfig(model_cfg=ModelConfig(provider="openai", model="gpt-4o"))
     return ReactAgent(config=config)
+
+
+def _heal_through_the_capability(agent: ReactAgent, model_message: str) -> None:
+    """Heal the agent's context — the one line that changed when the subject moved.
+
+    ``HealingCapability`` needs nothing from the agent but its ``ContextManager``, which
+    is exactly why healing could move out of ``ReactAgent`` at all.
+    """
+    HealingCapability(context=agent._context)._heal(model_message)
+
+
+def _tool_calling_model(tool_name: str) -> FunctionModel:
+    """A real model that answers every request with the same single tool call."""
+
+    def model_fn(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        return ModelResponse(parts=[ToolCallPart(tool_name=tool_name, args={})])
+
+    return FunctionModel(model_fn)
 
 
 def _response_with_tool_calls(*call_specs: tuple[str, str]) -> ModelResponse:
@@ -89,7 +115,7 @@ class TestHealingAppendsToolReturns:
         agent._context.add_message(_response_with_tool_calls(("my_tool", "call_xyz")))
 
         before = len(agent._context.messages)
-        agent._heal_unprocessed_tool_calls("test error")
+        _heal_through_the_capability(agent, "test error")
 
         messages = agent._context.messages
         assert len(messages) == before + 1
@@ -103,7 +129,7 @@ class TestHealingAppendsToolReturns:
         agent = _make_agent()
         agent._context.add_message(_response_with_tool_calls(("search", "call_001")))
 
-        agent._heal_unprocessed_tool_calls("boom")
+        _heal_through_the_capability(agent, "boom")
 
         healed = agent._context.messages[-1]
         assert isinstance(healed, ModelRequest)
@@ -123,7 +149,7 @@ class TestHealingAppendsToolReturns:
         agent = _make_agent()
         agent._context.add_message(_response_with_tool_calls(("search", "call_001")))
 
-        agent._heal_unprocessed_tool_calls("RuntimeError: connection reset")
+        _heal_through_the_capability(agent, "RuntimeError: connection reset")
 
         healed = agent._context.messages[-1]
         assert isinstance(healed, ModelRequest)
@@ -145,7 +171,7 @@ class TestNoOpConditions:
         agent = _make_agent()
         assert agent._context.messages == []
 
-        agent._heal_unprocessed_tool_calls("error")
+        _heal_through_the_capability(agent, "error")
 
         assert agent._context.messages == []
 
@@ -155,7 +181,7 @@ class TestNoOpConditions:
         agent._context.add_message(ModelRequest(parts=[UserPromptPart(content="hi")]))
 
         before = len(agent._context.messages)
-        agent._heal_unprocessed_tool_calls("error")
+        _heal_through_the_capability(agent, "error")
 
         assert len(agent._context.messages) == before
 
@@ -171,7 +197,7 @@ class TestNoOpConditions:
         )
 
         before = len(agent._context.messages)
-        agent._heal_unprocessed_tool_calls("error")
+        _heal_through_the_capability(agent, "error")
 
         assert len(agent._context.messages) == before
 
@@ -191,8 +217,8 @@ class TestWarningLog:
             _response_with_tool_calls(("t1", "c1"), ("t2", "c2"), ("t3", "c3"))
         )
 
-        with caplog.at_level(logging.WARNING, logger="akgentic.llm.agent"):
-            agent._heal_unprocessed_tool_calls("error")
+        with caplog.at_level(logging.WARNING, logger="akgentic.llm.capabilities"):
+            _heal_through_the_capability(agent, "error")
 
         warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
         assert any(
@@ -204,8 +230,8 @@ class TestWarningLog:
         """No warning emitted when there is nothing to heal."""
         agent = _make_agent()
 
-        with caplog.at_level(logging.WARNING, logger="akgentic.llm.agent"):
-            agent._heal_unprocessed_tool_calls("error")
+        with caplog.at_level(logging.WARNING, logger="akgentic.llm.capabilities"):
+            _heal_through_the_capability(agent, "error")
 
         assert not any(
             "Healing" in r.getMessage()
@@ -233,7 +259,7 @@ class TestParallelToolCalls:
             )
         )
 
-        agent._heal_unprocessed_tool_calls("error")
+        _heal_through_the_capability(agent, "error")
 
         healed = agent._context.messages[-1]
         assert isinstance(healed, ModelRequest)
@@ -271,7 +297,7 @@ class TestObserverEventsOnHeal:
         # Drain events from adding the ModelResponse so we only inspect heal-time events.
         capture.events.clear()
 
-        agent._heal_unprocessed_tool_calls("error")
+        _heal_through_the_capability(agent, "error")
 
         llm_events = [e for e in capture.events if isinstance(e, LlmMessageEvent)]
         assert len(llm_events) == 1
@@ -285,7 +311,7 @@ class TestObserverEventsOnHeal:
 
 
 # ---------------------------------------------------------------------------
-# AC-1 / AC-2: healing is invoked by run() exception handlers
+# AC-1 / AC-2: a failing run heals the context on its way out
 # ---------------------------------------------------------------------------
 
 
@@ -303,28 +329,39 @@ class _RaisingRun:
 
 
 class TestRunInvokesHealing:
-    """Run-level integration: exception handlers call the healing method."""
+    """Run-level integration: a failing run heals the context through the capability.
+
+    Real runs, not doubles: ``HealingCapability.on_run_error`` is a capability hook, and
+    a stubbed ``iter()`` fires no hook at all. Each test asserts on the two trailing
+    messages — the dangling ``ModelResponse`` the failure left, and the single healing
+    ``ModelRequest`` that closes it out — which is the structural claim the old
+    ``before + 1`` length check made against a hand-seeded context.
+    """
 
     @pytest.mark.asyncio
     async def test_usage_limit_exceeded_heals_pending_tool_calls(self) -> None:
-        """AC-1: UsageLimitExceeded handler heals context and still raises.
+        """AC-1: a run-tier breach heals the context and still raises.
 
         Also AC #3: what lands in the model's context is the instruction sentence,
         not a stack. The two no-traceback assertions are the regression guard —
-        restoring ``traceback.format_exc()`` at the call site turns them red while
-        the structural assertions above stay green.
+        restoring ``traceback.format_exc()`` as the healing wording turns them red
+        while the structural assertions above stay green.
         """
-        agent = _make_agent()
-        agent._context.add_message(_response_with_tool_calls(("tool_a", "call_a")))
-        before = len(agent._context.messages)
+        config = ReactAgentConfig(
+            model_cfg=ModelConfig(provider="openai", model="gpt-4o"),
+            run_usage_limits=RunUsageLimits(tool_calls_limit=1),
+        )
+        agent = ReactAgent(config=config)
 
-        raising = _RaisingRun(UsageLimitExceeded("Request limit exceeded"))
-        with patch.object(agent._pydantic_agent, "iter", return_value=raising):
+        @agent.pydantic_agent.tool_plain
+        def tool_a() -> str:
+            return "ok"
+
+        with agent.pydantic_agent.override(model=_tool_calling_model("tool_a")):
             with pytest.raises(UsageLimitError):
                 await agent.run("test")
 
         messages = agent._context.messages
-        assert len(messages) == before + 1
         healed = messages[-1]
         assert isinstance(healed, ModelRequest)
         tool_returns = [p for p in healed.parts if isinstance(p, ToolReturnPart)]
@@ -334,36 +371,43 @@ class TestRunInvokesHealing:
         assert "Traceback (most recent call last)" not in content
         assert "pydantic_ai" not in content
 
+        dangling = messages[-2]
+        assert isinstance(dangling, ModelResponse)
+        assert tool_returns[0].tool_call_id == dangling.tool_calls[0].tool_call_id
+
     @pytest.mark.asyncio
     async def test_generic_exception_heals_and_reraises(self) -> None:
-        """AC-2: generic Exception handler heals context and re-raises unchanged.
+        """AC-2: a non-usage failure heals context and re-raises unchanged.
 
         AC #4: the healed content names the exception's type and message — what a
         model can act on — and carries no stack.
         """
         agent = _make_agent()
-        agent._context.add_message(_response_with_tool_calls(("tool_b", "call_b")))
-        before = len(agent._context.messages)
 
-        class MyBoom(Exception):
+        class MyBoomError(Exception):
             pass
 
-        raising = _RaisingRun(MyBoom("kaboom"))
-        with patch.object(agent._pydantic_agent, "iter", return_value=raising):
-            with pytest.raises(MyBoom, match="kaboom"):
+        @agent.pydantic_agent.tool_plain
+        def tool_b() -> str:
+            raise MyBoomError("kaboom")
+
+        with agent.pydantic_agent.override(model=_tool_calling_model("tool_b")):
+            with pytest.raises(MyBoomError, match="kaboom"):
                 await agent.run("test")
 
         messages = agent._context.messages
-        assert len(messages) == before + 1
         healed = messages[-1]
         assert isinstance(healed, ModelRequest)
         tool_returns = [p for p in healed.parts if isinstance(p, ToolReturnPart)]
         assert len(tool_returns) == 1
         assert tool_returns[0].tool_name == "tool_b"
-        assert tool_returns[0].tool_call_id == "call_b"
         content = str(tool_returns[0].content)
-        assert "MyBoom: kaboom" in content
+        assert "MyBoomError: kaboom" in content
         assert "Traceback (most recent call last)" not in content
+
+        dangling = messages[-2]
+        assert isinstance(dangling, ModelResponse)
+        assert tool_returns[0].tool_call_id == dangling.tool_calls[0].tool_call_id
 
     @pytest.mark.asyncio
     async def test_generic_branch_preserves_the_exception_object_and_traceback(self) -> None:

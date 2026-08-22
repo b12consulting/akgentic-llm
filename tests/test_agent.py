@@ -20,6 +20,8 @@ from pydantic_ai.messages import (
     UserPromptPart,
 )
 from pydantic_ai.models.function import AgentInfo, FunctionModel
+from pydantic_ai.models.test import TestModel
+from pydantic_ai.tools import RunContext
 from pydantic_ai.usage import RunUsage
 
 from akgentic.llm import (
@@ -27,6 +29,8 @@ from akgentic.llm import (
     AgentUsageLimits,
     CompactionConfig,
     CompactionResult,
+    EventSourcingCapability,
+    HealingCapability,
     ModelConfig,
     ReactAgent,
     ReactAgentConfig,
@@ -76,6 +80,25 @@ class MockObserver:
 
     def notify_event(self, event: object) -> None:
         self.events.append(event)
+
+
+def _text_model(text: str = "test result") -> FunctionModel:
+    """A model answering every request with one TextPart, for driving a REAL run.
+
+    Persistence, system-prompt recording and healing are capability hooks now, and a
+    stubbed ``iter()`` fires none of them — so every test whose subject is one of those
+    three has to reach the model rather than a double.
+    """
+
+    def stub(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        return ModelResponse(parts=[TextPart(content=text)])
+
+    return FunctionModel(stub)
+
+
+def _bare_run_context() -> RunContext[None]:
+    """A synthetic RunContext for driving a capability hook outside a real run."""
+    return RunContext[None](deps=None, model=TestModel(), usage=RunUsage())
 
 
 @pytest.fixture
@@ -161,10 +184,32 @@ class TestReactAgentInit:
         """Omitting `capabilities` is behaviourally identical to passing `capabilities=[]`."""
         agent_omitted = ReactAgent(config=minimal_config)
         agent_explicit_empty = ReactAgent(config=minimal_config, capabilities=[])
-        assert (
-            agent_omitted.pydantic_agent.root_capability.capabilities
-            == agent_explicit_empty.pydantic_agent.root_capability.capabilities
-        )
+        # Compared by type rather than by value: both stacks now carry the two internal
+        # capabilities, each bound to ITS OWN agent's ContextManager, and dataclass
+        # equality makes two capabilities on different contexts unequal. The claim being
+        # made is about the shape of the stack, which the sequence of types expresses.
+        assert [type(c) for c in agent_omitted.pydantic_agent.root_capability.capabilities] == [
+            type(c) for c in agent_explicit_empty.pydantic_agent.root_capability.capabilities
+        ]
+
+    def test_internal_capabilities_precede_the_callers(self, minimal_config):
+        """The stack is [EventSourcing, Healing, *caller] — the internal two first.
+
+        Asserted as RELATIVE order by index, never as absolute positions:
+        pydantic-ai composes a base capability of its own into that surface and
+        where that one sits is not this package's contract. Matched by type rather
+        than by instance ref for a second reason — ``for_run`` hands every run a
+        fresh copy, so an instance ref would not match one either.
+        """
+        from pydantic_ai.capabilities import Capability
+
+        caller_cap = Capability(id="custom-cap")
+        agent = ReactAgent(config=minimal_config, capabilities=[caller_cap])
+
+        mounted = list(agent.pydantic_agent.root_capability.capabilities)
+        types = [type(c) for c in mounted]
+        assert types.index(EventSourcingCapability) < types.index(HealingCapability)
+        assert types.index(HealingCapability) < mounted.index(caller_cap)
 
 
 class TestReactAgentCapabilityHook:
@@ -422,21 +467,21 @@ class TestReactAgentRun:
 
     @pytest.mark.asyncio
     async def test_run_updates_context(self, minimal_config):
-        """Test context messages updated after run()."""
-        agent = ReactAgent(config=minimal_config)
+        """Test context messages updated after run().
 
-        run = _StubRun(
-            output="test result",
-            yields=True,
-            new_messages=[ModelRequest(parts=[UserPromptPart(content="test")])],
-        )
+        Driven by a real model: the messages reach the context through
+        ``EventSourcingCapability``, and no capability hook fires under a stubbed
+        ``iter()``.
+        """
+        agent = ReactAgent(config=minimal_config)
         assert len(agent.context.messages) == 0
 
-        with patch.object(agent._pydantic_agent, "iter", return_value=run):
-            await agent.run("test query")
+        with agent.pydantic_agent.override(model=_text_model()):
+            result = await agent.run("test query")
 
-            # Context should have messages after run
-            assert len(agent.context.messages) == 1
+        # Context should have messages after run: this run's request and its response.
+        assert result == "test result"
+        assert len(agent.context.messages) == 2
 
     @pytest.mark.asyncio
     async def test_usage_limit_error_raised(self, minimal_config):
@@ -475,22 +520,22 @@ class TestReactAgentContextMethods:
 
     @pytest.mark.asyncio
     async def test_subscribe_context(self, minimal_config):
-        """Test subscribe_context() observer notified on message add."""
+        """Test subscribe_context() observer notified on message add.
+
+        A real model, because the messages reach the context through
+        ``EventSourcingCapability`` and no hook fires under a stubbed ``iter()``.
+        """
         observer = MockObserver()
         agent = ReactAgent(config=minimal_config)
-
-        run = _StubRun(
-            output="test result",
-            yields=True,
-            new_messages=[ModelRequest(parts=[UserPromptPart(content="test")])],
-        )
         agent.subscribe_context(observer)
 
-        with patch.object(agent._pydantic_agent, "iter", return_value=run):
+        with agent.pydantic_agent.override(model=_text_model()):
             await agent.run("test query")
 
-            # Observer should have been notified
-            assert len(observer.events) == 1
+        # Observer should have been notified, for every message the run persisted
+        notified = [e.message for e in observer.events if isinstance(e, LlmMessageEvent)]
+        assert notified == agent.context.messages
+        assert len(notified) == 2
 
     def test_checkpoint_and_rewind_wrappers_removed(self, minimal_config):
         """ReactAgent no longer exposes checkpoint/rewind wrappers (AC 4)."""
@@ -669,13 +714,19 @@ class _StubRun:
     change untouched; pass ``captured=`` (or use ``_capturing_stub_run`` below)
     to record those kwargs instead of discarding them.
 
-    Defaults reproduce the zero-yield, zero-usage, empty-``new_messages()``
-    shape most call sites need. Pass ``yields=True`` for call sites whose test
-    reads ``agent.context.messages``: ``ReactAgent.run()`` only invokes
-    ``new_messages()`` from inside its ``async for`` loop body, so a fake that
-    never yields never adds anything to context regardless of what
-    ``new_messages()`` would return (the iteration-count trap — see story
-    16-3's Dev Notes).
+    ``ReactAgent`` drives ``Agent.run()``, which is implemented on top of
+    ``iter()`` — so patching ``iter`` still intercepts it — but then drives what
+    ``iter()`` returned through a wider protocol: it reads ``next_node`` before
+    its loop and ends on ``assert agent_run.result is not None``. ``next_node``
+    is therefore any non-``End`` sentinel; because ``result`` is always a
+    non-``None`` ``MagicMock``, ``run()`` breaks out on the first iteration and
+    never calls ``next()``.
+
+    A stubbed ``iter()`` means **no capability hook fires**, so a run driven by
+    this double persists nothing and records no system prompt — both now belong
+    to ``EventSourcingCapability``. ``yields`` and ``new_messages`` drive the
+    ``async for`` protocol only; a test asserting on persistence, on
+    system-prompt events or on healing must use a real model instead.
     """
 
     def __init__(
@@ -692,6 +743,8 @@ class _StubRun:
         if captured is not None:
             captured.update(kwargs)
         self.result = MagicMock(output=output)
+        # Non-End sentinel: run() reads this before its loop, then breaks on `result`.
+        self.next_node = MagicMock()
         self._usage = spent if spent is not None else RunUsage()
         self._new_messages = new_messages if new_messages is not None else []
         self._yields = yields
@@ -722,17 +775,33 @@ class _StubRun:
         return self._new_messages
 
 
+def _spend_through_the_run_anchor(kwargs: dict, spend: RunUsage) -> None:
+    """Report a run's cost the way pydantic-ai does: in place, on the handed-in RunUsage.
+
+    ``ReactAgent`` folds the ``RunUsage`` it passes as ``run(usage=...)``, because that
+    object is the only anchor that survives a run which raised. A double that only set
+    ``_StubRun.usage`` would therefore report a cost of zero.
+    """
+    handed_in = kwargs.get("usage")
+    if handed_in is not None:
+        handed_in.incr(spend)
+
+
 def _capturing_stub_run(captured: dict, **stub_kwargs):
     """iter() ``side_effect`` that records the call's real kwargs into `captured`.
 
     Complements passing ``captured=`` directly into ``_StubRun(...)`` (which only
     works with ``return_value=``, a single fixed instance): a ``side_effect=``
     factory must be invoked fresh, with ``iter()``'s actual args/kwargs, on every
-    call — this returns such a factory.
+    call — this returns such a factory. A ``spent=`` is reported through the
+    handed-in accumulator as well, since that is what the fold reads.
     """
 
     def factory(*args, **kwargs):
         captured.update(kwargs)
+        spent = stub_kwargs.get("spent")
+        if spent is not None:
+            _spend_through_the_run_anchor(kwargs, spent)
         return _StubRun(**stub_kwargs)
 
     return factory
@@ -756,9 +825,11 @@ def _agent_token_config(**token_limits):
 
 def _stub_run_spending(input_tokens, output_tokens=0):
     """iter() side_effect returning a run that reports a fixed token spend."""
+    spend = RunUsage(input_tokens=input_tokens, output_tokens=output_tokens)
 
     def factory(*args, **kwargs):
-        return _StubRun(spent=RunUsage(input_tokens=input_tokens, output_tokens=output_tokens))
+        _spend_through_the_run_anchor(kwargs, spend)
+        return _StubRun(spent=spend)
 
     return factory
 
@@ -793,15 +864,17 @@ class TestReactAgentRunCountEnforcement:
         assert str(exc_info.value) == "Exceeded the agent_request_limit of 2 (run_count=2)"
 
     def test_rejection_does_not_reach_the_tool_call_healing_path(self):
-        """Test a rejected run never routes through _heal_unprocessed_tool_calls.
+        """Test a rejected run never routes through the healing capability.
 
         Asserted on the call, not on resulting context: healing is a no-op on an
         empty context, so an emptiness check would pass even from inside the try.
+        The patch moved with its subject — healing is ``HealingCapability._heal``
+        now — and the claim is unchanged: a pre-flight rejection never reaches it.
         """
         agent = ReactAgent(config=_agent_limit_config(1))
         with patch.object(agent._pydantic_agent, "iter", side_effect=_StubRun):
             agent.run_sync("first")
-        with patch.object(agent, "_heal_unprocessed_tool_calls") as heal:
+        with patch.object(HealingCapability, "_heal") as heal:
             with pytest.raises(UsageLimitError):
                 agent.run_sync("second")
         heal.assert_not_called()
@@ -1113,13 +1186,48 @@ class TestReactAgentTokenBudgetEnforcement:
                 agent.run_sync("refused")
 
     def test_usage_folds_even_when_the_run_fails_partway(self):
-        """Test tokens a failed run burned are still counted — the provider billed them."""
+        """Test tokens a failed run burned are still counted — the provider billed them.
+
+        The failure is injected from the stub factory (spend, then raise) rather than
+        by patching a private method that no longer exists. See
+        ``test_a_real_failing_run_still_folds_its_usage`` for the same claim proved
+        against a real model, where the anchor is pydantic-ai's own accumulator.
+        """
         agent = ReactAgent(config=_agent_token_config(total_tokens_limit=1000))
-        with patch.object(agent._pydantic_agent, "iter", side_effect=_stub_run_spending(40, 20)):
-            with patch.object(agent, "_record_run_system_prompt", side_effect=RuntimeError("boom")):
-                with pytest.raises(RuntimeError):
-                    agent.run_sync("fails after spending")
+
+        def spend_then_fail(*args, **kwargs):
+            _spend_through_the_run_anchor(kwargs, RunUsage(input_tokens=40, output_tokens=20))
+            raise RuntimeError("boom")
+
+        with patch.object(agent._pydantic_agent, "iter", side_effect=spend_then_fail):
+            with pytest.raises(RuntimeError):
+                agent.run_sync("fails after spending")
         assert agent._agent_usage.total_tokens == 60
+
+    async def test_a_real_failing_run_still_folds_its_usage(self):
+        """A REAL run that raises after spending still contributes what it burned.
+
+        The design rests on ``usage=`` being the same object pydantic-ai's graph mutates
+        in place for the whole run; a stubbed run proves only that the stub cooperates.
+        Here the model is real, the token count is pydantic-ai's own, and the run dies
+        inside a tool — after the model request that spent them. Move the fold out of
+        ``_run_with_limits``' ``finally`` onto the success path and this goes red.
+        """
+        agent = ReactAgent(config=_agent_token_config(total_tokens_limit=1_000_000))
+
+        def tool_calling_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            return ModelResponse(parts=[ToolCallPart(tool_name="boom_tool", args={})])
+
+        @agent.pydantic_agent.tool_plain
+        def boom_tool() -> str:
+            raise RuntimeError("boom")
+
+        assert agent._agent_usage.total_tokens == 0
+        with agent.pydantic_agent.override(model=FunctionModel(tool_calling_model)):
+            with pytest.raises(RuntimeError, match="boom"):
+                await agent.run("spend, then fail")
+
+        assert agent._agent_usage.total_tokens > 0
 
     def test_token_rejection_consumes_no_run_budget(self):
         """Test the two agent-tier gates are independent: a token refusal costs no run.
@@ -1163,8 +1271,13 @@ class TestReactAgentTokenBudgetEnforcement:
         captured = []
 
         def capture(*args, **kwargs):
-            captured.append(kwargs.get("usage"))
-            return _StubRun(spent=RunUsage(input_tokens=100, output_tokens=50))
+            usage = kwargs.get("usage")
+            # The total is snapshotted at hand-over, not read back at the end: the run
+            # spends THROUGH this very object (that is the fold's anchor), so the object
+            # is non-zero by the time the assertions below run.
+            captured.append((usage, None if usage is None else usage.total_tokens))
+            _spend_through_the_run_anchor(kwargs, RunUsage(input_tokens=100, output_tokens=50))
+            return _StubRun()
 
         with patch.object(agent._pydantic_agent, "iter", side_effect=capture):
             agent.run_sync("first")
@@ -1173,8 +1286,8 @@ class TestReactAgentTokenBudgetEnforcement:
         # Non-zero by the second call, so "fresh" is a real claim there, not a tautology.
         assert agent._agent_usage.total_tokens == 300
         assert len(captured) == 2
-        for usage in captured:
-            assert usage is None or (usage is not agent._agent_usage and usage.total_tokens == 0)
+        for usage, total_at_handover in captured:
+            assert usage is None or (usage is not agent._agent_usage and total_at_handover == 0)
 
     async def test_async_run_enforces_the_same_token_budget(self):
         """Test the async entry point holds the budget (run_sync only delegates to it)."""
@@ -1527,37 +1640,47 @@ class TestReactAgentConcludeWithoutTools:
 
         iter_call.assert_not_called()
 
-    async def test_conclusion_runs_on_top_of_the_healed_context(self, minimal_config):
+    async def test_conclusion_runs_on_top_of_the_healed_context(self):
         """The healing ToolReturnPart is in the history the conclusion is given (AC #13).
 
         This is the whole point of healing before concluding: the tool result the
         model reads as the reason it must answer now is already in the context the
         follow-up run is handed.
-        """
-        agent = ReactAgent(config=minimal_config)
-        agent._context.add_message(
-            ModelResponse(parts=[ToolCallPart(tool_name="lookup", tool_call_id="c1", args="{}")])
-        )
 
-        breach = _StubRun(enter_raises=UsageLimitExceeded("Request limit exceeded"))
-        with patch.object(agent._pydantic_agent, "iter", return_value=breach):
+        The breaching run must be real — healing is ``HealingCapability.on_run_error``
+        and no hook fires under a stubbed ``iter()``. Only the conclusion stays stubbed,
+        to capture the history it was handed. The run-tier breach also puts the trailing
+        dangling ``ModelResponse`` there for real, which the second half asserts.
+        """
+        config = ReactAgentConfig(
+            model_cfg=ModelConfig(provider="openai", model="gpt-4o"),
+            run_usage_limits=RunUsageLimits(tool_calls_limit=1),
+        )
+        agent = ReactAgent(config=config, tools=[weather_lookup])
+
+        def tool_calling_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            return ModelResponse(
+                parts=[ToolCallPart(tool_name="weather_lookup", args={"city": "Paris"})]
+            )
+
+        with agent.pydantic_agent.override(model=FunctionModel(tool_calling_model)):
             with pytest.raises(RunUsageLimitError):
                 await agent.run("do the thing")
 
         captured: dict = {}
-        with patch.object(
-            agent._pydantic_agent, "iter", side_effect=_capturing_stub_run(captured)
-        ):
+        with patch.object(agent._pydantic_agent, "iter", side_effect=_capturing_stub_run(captured)):
             await agent.conclude_without_tools("wrap it up")
 
-        healed = [
-            p
-            for m in captured["message_history"]
-            if isinstance(m, ModelRequest)
-            for p in m.parts
-            if isinstance(p, ToolReturnPart)
+        history = captured["message_history"]
+        healing = history[-1]
+        assert isinstance(healing, ModelRequest)
+        assert [str(p.content) for p in healing.parts if isinstance(p, ToolReturnPart)] == [
+            RUN_LIMIT_HEALING_MESSAGE
         ]
-        assert [str(p.content) for p in healed] == [RUN_LIMIT_HEALING_MESSAGE]
+        # The healing request closes out the response the breach left dangling.
+        dangling = history[-2]
+        assert isinstance(dangling, ModelResponse)
+        assert dangling.tool_calls
 
     def test_sync_bridge_returns_the_same_output(self, minimal_config):
         """conclude_without_tools_sync() returns what the async form returns (AC #14)."""
@@ -1664,9 +1787,9 @@ class TestReactAgentMultimodalPrompt:
 
     def test_user_prompt_importable(self):
         """Test UserPrompt type alias importable from akgentic.llm."""
-        from akgentic.llm import UserPrompt as UP
+        from akgentic.llm import UserPrompt as ImportedUserPrompt
 
-        assert UP is not None
+        assert ImportedUserPrompt is not None
 
     def test_user_prompt_alias_in_module_scope(self):
         """Test UserPrompt imported at top of test file is not None."""
@@ -1943,64 +2066,66 @@ def _system_events(observer: MockObserver) -> list[LlmSystemPromptEvent]:
     return [e for e in observer.events if isinstance(e, LlmSystemPromptEvent)]
 
 
+def _register_backstory(agent: ReactAgent, rendering: str) -> None:
+    """Register one dynamic system prompt, so two agents render an identical block.
+
+    The function's name is what pydantic-ai stamps as ``dynamic_ref``, and the ref is
+    part of what the rendering hash is taken over — hence one shared registration
+    helper rather than a locally-named closure per test.
+    """
+
+    @agent.system_prompt
+    def backstory() -> str:
+        return rendering
+
+
 class TestReactAgentRunRecordsSystemPrompt:
-    """Per-run system prompt recording wired into ReactAgent.run() (AC 1, 2, 3)."""
+    """Per-run system prompt recording, now EventSourcingCapability's (AC 1, 2, 3).
+
+    Driven by real models throughout: the recording rides the capability's closing
+    sweep, and a stubbed ``iter()`` fires no hook at all.
+    """
 
     @pytest.mark.asyncio
     async def test_run_records_one_event_with_run_id(self, minimal_config):
         """AC 1/2: one LlmSystemPromptEvent emitted, run_id matches the run's messages."""
         observer = MockObserver()
         agent = ReactAgent(config=minimal_config, observer=observer)
+        _register_backstory(agent, "B.")
 
-        run = _make_mock_run([_system_request_with_run_id(("backstory", "B."), run_id="abc")])
-        with patch.object(agent._pydantic_agent, "iter", return_value=run):
+        with agent.pydantic_agent.override(model=_text_model()):
             await agent.run("query")
 
         events = _system_events(observer)
         assert len(events) == 1
-        assert events[0].run_id == "abc"
+        assert events[0].run_id == str(agent.context.messages[-1].run_id)
 
     @pytest.mark.asyncio
     async def test_dedup_across_two_unchanged_runs(self, minimal_config):
         """AC 3: two runs with identical rendering emit exactly one event total."""
         observer = MockObserver()
         agent = ReactAgent(config=minimal_config, observer=observer)
+        _register_backstory(agent, "B.")
 
-        run1 = _make_mock_run(
-            [_system_request_with_run_id(("backstory", "B."), run_id="r1")]
-        )
-        with patch.object(agent._pydantic_agent, "iter", return_value=run1):
+        with agent.pydantic_agent.override(model=_text_model()):
             await agent.run("query 1")
-
-        run2 = _make_mock_run(
-            [_system_request_with_run_id(("backstory", "B."), run_id="r2")]
-        )
-        with patch.object(agent._pydantic_agent, "iter", return_value=run2):
             await agent.run("query 2")
 
         assert len(_system_events(observer)) == 1
 
     @pytest.mark.asyncio
     async def test_changed_rendering_emits_second_event(self, minimal_config):
-        """AC 2: a changed current_date block emits a second, distinct event."""
+        """AC 2: a changed dynamic block emits a second, distinct event."""
         observer = MockObserver()
         agent = ReactAgent(config=minimal_config, observer=observer)
+        renderings = iter(["Day 1.", "Day 2."])
 
-        run1 = _make_mock_run(
-            [_system_request_with_run_id(("current_date", "Day 1."), run_id="r1")]
-        )
-        with patch.object(agent._pydantic_agent, "iter", return_value=run1):
+        @agent.system_prompt
+        def current_date() -> str:
+            return next(renderings)
+
+        with agent.pydantic_agent.override(model=_text_model()):
             await agent.run("query 1")
-
-        # Simulate pydantic-ai's in-place re-evaluation by mutating the first
-        # request's system part content before the next run.
-        first_request = agent.context.messages[0]
-        first_request.parts[0].content = "Day 2."  # type: ignore[union-attr]
-
-        run2 = _make_mock_run(
-            [ModelRequest(parts=[UserPromptPart(content="more")], run_id="r2")]
-        )
-        with patch.object(agent._pydantic_agent, "iter", return_value=run2):
             await agent.run("query 2")
 
         events = _system_events(observer)
@@ -2008,28 +2133,40 @@ class TestReactAgentRunRecordsSystemPrompt:
         assert events[0].content_hash != events[1].content_hash
 
     @pytest.mark.asyncio
-    async def test_no_new_messages_records_nothing(self, minimal_config):
-        """AC 1 edge: a run with no new messages records no event (no run_id)."""
+    async def test_no_system_prompt_records_nothing(self, minimal_config):
+        """AC 1 edge: a run with nothing to record records no event.
+
+        Retargeted from ``test_no_new_messages_records_nothing``: ``run()`` always
+        produces messages, so "no new messages" is not reachable through ReactAgent —
+        the reachable form of "nothing to record" is a run with no system prompt at
+        all. The companion below drives the run_id half of the guard directly.
+        """
         observer = MockObserver()
         agent = ReactAgent(config=minimal_config, observer=observer)
 
-        run = _make_mock_run([])
-        with patch.object(agent._pydantic_agent, "iter", return_value=run):
+        with agent.pydantic_agent.override(model=_text_model()):
             await agent.run("query")
 
         assert _system_events(observer) == []
 
     @pytest.mark.asyncio
     async def test_messages_without_run_id_record_nothing(self, minimal_config):
-        """AC 1 edge: new messages lacking a run_id skip the recording call."""
+        """AC 1 edge: a run whose last message lacks a run_id skips the recording.
+
+        Retargeted at the subject, which moved into ``EventSourcingCapability``: a real
+        run always stamps a run_id, so the guard is only reachable by driving the
+        capability's own ``wrap_run`` hook. The assertion is the original one.
+        """
         observer = MockObserver()
         agent = ReactAgent(config=minimal_config, observer=observer)
+        capability = EventSourcingCapability(context=agent.context)
+        ctx = _bare_run_context()
 
-        run = _make_mock_run(
-            [_system_request_with_run_id(("backstory", "B."), run_id=None)]  # type: ignore[arg-type]
-        )
-        with patch.object(agent._pydantic_agent, "iter", return_value=run):
-            await agent.run("query")
+        async def handler():
+            ctx.messages.append(_system_request_with_run_id(("backstory", "B."), run_id=None))  # type: ignore[arg-type]
+            return MagicMock()
+
+        await capability.wrap_run(ctx, handler=handler)
 
         assert _system_events(observer) == []
 
@@ -2051,15 +2188,22 @@ class TestReactAgentRestoreSeedsSystemPromptHash:
         assert agent.context._last_system_prompt_hash == "abc123"
 
     def test_seed_suppresses_unchanged_reemission(self, minimal_config):
-        """AC 4: a run matching the seeded rendering emits nothing."""
+        """AC 4: a run matching the seeded rendering emits nothing.
+
+        The seed hash is learned from a probe agent's own real run of the same
+        rendering, rather than computed off a hand-built request: the run is real now,
+        so the rendering pydantic-ai stamps is the one that must match the seed.
+        """
+        probe_observer = MockObserver()
+        probe = ReactAgent(config=minimal_config, observer=probe_observer)
+        _register_backstory(probe, "B.")
+        with probe.pydantic_agent.override(model=_text_model()):
+            probe.run_sync("probe")
+        known_hash = _system_events(probe_observer)[0].content_hash
+
         observer = MockObserver()
         agent = ReactAgent(config=minimal_config, observer=observer)
-
-        # Compute the real hash for ("backstory", "B.") via a throwaway manager run.
-        probe = ReactAgent(config=minimal_config)
-        probe.context.add_message(_system_request_with_run_id(("backstory", "B."), run_id="r0"))
-        probe.context.record_system_prompt("r0")
-        known_hash = probe.context._last_system_prompt_hash
+        _register_backstory(agent, "B.")
 
         event = LlmSystemPromptEvent(
             run_id="r1",
@@ -2068,10 +2212,7 @@ class TestReactAgentRestoreSeedsSystemPromptHash:
         )
         agent.restore_context([FakeEventMessage(event=event)])
 
-        run = _make_mock_run(
-            [_system_request_with_run_id(("backstory", "B."), run_id="r2")]
-        )
-        with patch.object(agent._pydantic_agent, "iter", return_value=run):
+        with agent.pydantic_agent.override(model=_text_model()):
             agent.run_sync("query")
 
         assert _system_events(observer) == []
@@ -2080,6 +2221,7 @@ class TestReactAgentRestoreSeedsSystemPromptHash:
         """AC 5: a run whose rendering differs from the seed emits one event."""
         observer = MockObserver()
         agent = ReactAgent(config=minimal_config, observer=observer)
+        _register_backstory(agent, "New.")
 
         event = LlmSystemPromptEvent(
             run_id="r1",
@@ -2088,10 +2230,7 @@ class TestReactAgentRestoreSeedsSystemPromptHash:
         )
         agent.restore_context([FakeEventMessage(event=event)])
 
-        run = _make_mock_run(
-            [_system_request_with_run_id(("backstory", "New."), run_id="r2")]
-        )
-        with patch.object(agent._pydantic_agent, "iter", return_value=run):
+        with agent.pydantic_agent.override(model=_text_model()):
             agent.run_sync("query")
 
         assert len(_system_events(observer)) == 1
@@ -2133,10 +2272,7 @@ class TestReactAgentRestoreSeedsSystemPromptHash:
         agent.restore_context([FakeEventMessage(event=LlmMessageEvent(message=msg))])
         assert agent.context._last_system_prompt_hash is None
 
-        run = _make_mock_run(
-            [ModelRequest(parts=[UserPromptPart(content="more")], run_id="r2")]
-        )
-        with patch.object(agent._pydantic_agent, "iter", return_value=run):
+        with agent.pydantic_agent.override(model=_text_model()):
             agent.run_sync("query")
 
         assert len(_system_events(observer)) == 1
