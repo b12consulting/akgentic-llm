@@ -32,9 +32,10 @@ from typing import Any
 
 import pytest
 from pydantic import BaseModel
-from pydantic_ai import BinaryContent, NativeOutput
+from pydantic_ai import Agent, BinaryContent, NativeOutput
 from pydantic_ai.capabilities import ProcessHistory
 from pydantic_ai.messages import ModelRequest, SystemPromptPart, UserPromptPart
+from pydantic_ai.models.test import TestModel
 
 from akgentic.llm import (
     COMPACTION_STRATEGIES,
@@ -44,6 +45,7 @@ from akgentic.llm import (
     CompactionConfig,
     CompactionResult,
     ContextManager,
+    EventSourcingCapability,
     HttpClientConfig,
     LlmContextClearedEvent,
     LlmContextCompactedEvent,
@@ -585,6 +587,40 @@ def test_capabilities_process_history_sample(agents: Any) -> None:
         capabilities=[ProcessHistory(processor=inject_source_reference)],
     )
     assert agent.pydantic_agent is not None
+
+
+async def test_run_loop_capabilities_sample() -> None:
+    """§Capabilities → Run-loop capabilities — the bare-``Agent`` mount, run as written.
+
+    The claim under test is the modularity one: ``EventSourcingCapability`` needs
+    nothing from ``ReactAgent``, so the sample builds a plain pydantic-ai ``Agent``
+    on a ``TestModel`` — no ``ReactAgent``, no loop to close, no egress.
+
+    Both assertions in the README are kept: the context holds what the run
+    produced, and a subscribed observer saw the same list. The second is what makes
+    the sample worth running — persistence that never reached an observer would
+    still satisfy the first.
+    """
+
+    class Recorder:
+        def __init__(self) -> None:
+            self.messages: list[Any] = []
+
+        def notify_event(self, event: object) -> None:
+            if isinstance(event, LlmMessageEvent):
+                self.messages.append(event.message)
+
+    context = ContextManager()
+    recorder = Recorder()
+    context.subscribe(recorder)
+
+    agent: Agent[None, str] = Agent(
+        model=TestModel(), capabilities=[EventSourcingCapability(context)]
+    )
+    result = await agent.run("hello")
+
+    assert context.messages == list(result.all_messages())
+    assert recorder.messages == context.messages
 
 
 # ---------------------------------------------------------------------------

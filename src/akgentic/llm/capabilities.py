@@ -16,6 +16,15 @@ Two hook anchors carry everything here:
 capabilities' in-flight edits, and pydantic-ai writes the processed list back into durable
 history after the ``before_model_request`` chain anyway.
 
+**Composition: the first capability in the list is the outermost.** ``before_*`` hooks fire in
+list order, ``after_*`` in reverse, and ``wrap_run``s nest with the first one wrapping all the
+rest (pydantic-ai 2.27.1 — ``capabilities/combined.py`` builds each chain over
+``reversed(self.capabilities)``). ``ReactAgent`` mounts
+``[EventSourcingCapability, HealingCapability, *yours]``. What a co-mounted capability needs
+from that does **not** depend on where it sits: the closing sweep is in ``wrap_run``'s
+``finally``, outside every capability's node hooks whatever the order, so durable ``after_*``
+edits are always the ones persisted.
+
 **The ``wrap_run`` context is a snapshot, not the live list** (pydantic-ai 2.27.1, verified by
 running it). ``run_ctx`` is built once, before the graph starts; ``UserPromptNode.run`` then
 *rebinds* ``state.message_history`` to a different list object, so ``wrap_run``'s own
@@ -24,6 +33,13 @@ get a freshly built ``RunContext`` per node and therefore do see the live list, 
 both node hooks re-anchor the reference the closing sweep later reads — ``before_node_run``
 included, so a run that dies inside its very first model request (where ``after_node_run`` has
 not once fired against the rebound list) still has its messages swept.
+
+**The rule that follows: open the cursor against the list the sweep will index** — the
+normalised list a node hook hands over — never against the incoming history's length. The
+normalised copy is routinely *shorter* than what was handed in, so a cursor carried over from
+the incoming length sits past where the run's own messages begin and skips everything behind it
+in silence. Two back-to-back ``record_operator_action`` calls are enough to trigger it; see
+``_anchor``.
 """
 
 from __future__ import annotations

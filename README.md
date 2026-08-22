@@ -21,6 +21,7 @@ call any LLM without coupling to a specific vendor or framework primitive.
 - [Providers](#providers)
 - [ReactAgent API](#reactagent-api)
 - [Capabilities](#capabilities)
+  - [Run-loop capabilities](#run-loop-capabilities)
 - [Multimodal Prompts](#multimodal-prompts)
 - [Context Management](#context-management)
   - [ContextManager](#contextmanager)
@@ -40,10 +41,11 @@ call any LLM without coupling to a specific vendor or framework primitive.
 
 `akgentic-llm` is the LLM execution layer between agent logic and LLM providers. It provides:
 
-- **ReactAgent** — a thin wrapper around pydantic-ai's `Agent.iter()` that persists message
-  history across calls, deduplicates messages across tool-call iterations, and translates
-  pydantic-ai's `UsageLimitExceeded` into a framework-local `RunUsageLimitError` — one of the two
-  tiers under the exported base `UsageLimitError` (see [Usage limits](#usage-limits))
+- **ReactAgent** — a thin wrapper around one awaited `pydantic_ai.Agent.run()` call that persists
+  message history across calls — through a mounted `EventSourcingCapability`, cursor-based so
+  nothing depends on message object identity — and translates pydantic-ai's `UsageLimitExceeded`
+  into a framework-local `RunUsageLimitError` — one of the two tiers under the exported base
+  `UsageLimitError` (see [Usage limits](#usage-limits))
 - **Provider abstraction** — `create_model()` dispatches to one of six provider factories
   (OpenAI, Azure, Anthropic, Google, Mistral, NVIDIA), wrapping the result in pydantic-ai's
   `FallbackModel` when `ModelConfig.fallback_models` is non-empty; `get_output_type()` wraps
@@ -64,16 +66,17 @@ ReactAgent
   │
   ├── run(user_prompt: UserPrompt)           # str | list[str | BinaryContent]
   │     │
-  │     ├── pydantic_agent.iter(            # pydantic-ai REACT loop
+  │     ├── await pydantic_agent.run(        # pydantic-ai REACT loop, one awaited call
   │     │       user_prompt,
   │     │       message_history=context.messages,
   │     │       output_type=get_output_type(model_cfg, output_type),
+  │     │       usage=run_usage,             # this run's own accumulator
   │     │   )
   │     │     │
-  │     │     └── for each step:
+  │     │     └── EventSourcingCapability, after each graph node:
   │     │           context.add_message()   # persists + notifies observers
   │     │
-  │     └── return run.result.output
+  │     └── return result.output
   │
   ├── context: ContextManager               # persistent message history
   ├── compact() / clear_context()           # fold history into a summary, or drop it
@@ -565,7 +568,7 @@ What the mechanism does when a caller invokes it:
   raises `AgentUsageLimitError` from the conclusion. That is the caller's signal to stop trying,
   not a defect to swallow — the lifetime counter is what bounds a retry loop by construction.
 - **It emits an `LlmUsageEvent`** like any other run: it shares `run()`'s execution core, so the
-  usage fold, the system-prompt recording and the context drain are identical.
+  usage fold, the system-prompt recording and the persistence sweep are identical.
 
 `reason` reaches the model as the run's user prompt, layered on the healed context — so the
 healing instruction described under [Usage limits](#usage-limits) is already there as the tool
@@ -582,9 +585,12 @@ callers can stop passing it without a flag day.
 ## Capabilities
 
 `capabilities` is an optional constructor argument on `ReactAgent` (accepted-and-ignored on
-`MockReactAgent`) — a sequence of pydantic-ai `AgentCapability` instances, forwarded unchanged
-to the wrapped `Agent(...)` as `capabilities or []`. Omitting it is behaviourally identical to
-today: `[]` is already `Agent`'s own default.
+`MockReactAgent`) — a sequence of pydantic-ai `AgentCapability` instances. They are **not**
+forwarded unchanged: `ReactAgent` mounts two internal capabilities of its own first and appends
+yours after them, so the wrapped `Agent(...)` always receives
+`[EventSourcingCapability, HealingCapability, *(capabilities or [])]`. The stack is never `[]`,
+even when the argument is omitted — those two are how every run persists its messages and closes
+out its dangling tool calls. See [Run-loop capabilities](#run-loop-capabilities) below.
 
 **Why it exists.** [Context Compaction](#context-compaction) and
 [System Prompt Rendering Events](#system-prompt-rendering-events) now cover history
@@ -629,6 +635,77 @@ agent = ReactAgent(
   This is pydantic-ai's internal pipeline behaviour, **not a documented public guarantee**, and
   it could change in a future release — a capability should still avoid orphaning tool calls on
   purpose.
+- Your capabilities sit **inside** the two internal ones, so `before_*` hooks fire after theirs
+  and `after_*` hooks before theirs. Your durable `after_*` edits are what gets persisted:
+  `EventSourcingCapability`'s closing sweep lives in `wrap_run`'s `finally`, outside every
+  capability's node hooks.
+
+### Run-loop capabilities
+
+`ReactAgent` does not implement persistence or error recovery in its run method. Both are
+standalone pydantic-ai capabilities, exported from `akgentic.llm`, and each is mountable on a
+bare `Agent` of your own:
+
+| Class | Owns | Hook anchors |
+|---|---|---|
+| `EventSourcingCapability(context=…)` | Hands every message a run produces to `ContextManager.add_message()`, exactly once, in run order; records the run's system-prompt rendering | `after_node_run` (steady state, keeps emission incremental), `before_node_run` (re-anchors the live history), `wrap_run`'s `finally` (closing sweep + system-prompt recording) |
+| `HealingCapability(context=…)` | Appends one `ToolReturnPart` per tool call left dangling by a failed run, so the *next* run is not rejected for unprocessed tool calls | `on_run_error` — it always re-raises the original exception, never returns to recover |
+
+**Ordering.** The stack is `[EventSourcingCapability, HealingCapability, *yours]`, and the
+**first capability is the outermost**: `before_*` hooks fire in list order, `after_*` in reverse,
+and `wrap_run`s nest with the first wrapping all the rest. Assembling your own stack, keep the
+same shape — the persistence you rely on is the outer layer, not a peer of your own hooks. Note
+that the guarantee in the caveat above holds regardless of list position, because the closing
+sweep sits in `wrap_run`'s `finally` rather than in a node hook.
+
+**Durable state only.** Persist from `RunContext.messages` **inside a node hook**. Never from
+`ModelRequestContext.messages` mid-chain: that request copy legitimately carries other
+capabilities' in-flight edits, and pydantic-ai folds the processed list back into durable history
+after the `before_model_request` chain anyway. `wrap_run`'s own `ctx.messages` is a snapshot
+frozen at the incoming history — `UserPromptNode` rebinds the run's history to a *normalised
+copy* (consecutive requests merged, orphaned tool results dropped, dangling calls repaired) that
+is routinely shorter. A cursor opened against the pre-normalisation length therefore sits past
+where the run's own messages begin and skips everything behind it, in silence. Open it against
+the list the sweep will index.
+
+```python
+from pydantic_ai import Agent
+from pydantic_ai.models.test import TestModel
+from akgentic.llm import ContextManager, EventSourcingCapability, LlmMessageEvent
+
+class Recorder:
+    def __init__(self) -> None:
+        self.messages = []
+
+    def notify_event(self, event: object) -> None:
+        if isinstance(event, LlmMessageEvent):
+            self.messages.append(event.message)
+
+context = ContextManager()
+recorder = Recorder()
+context.subscribe(recorder)
+
+# A bare pydantic-ai Agent — no ReactAgent anywhere.
+agent = Agent(model=TestModel(), capabilities=[EventSourcingCapability(context)])
+result = await agent.run("hello")
+
+# Everything the run produced, persisted once, in run order — and every observer saw it.
+assert context.messages == list(result.all_messages())
+assert recorder.messages == context.messages
+```
+
+**The event API is unchanged.** This decomposition moved *where* persistence lives, not what it
+emits: the same seven event types (`LlmMessageEvent`, `ToolCallEvent`, `ToolReturnEvent`,
+`LlmUsageEvent`, `LlmSystemPromptEvent`, `LlmContextCompactedEvent`, `LlmContextClearedEvent`),
+the same payload shapes, the same per-message ordering (`LlmMessageEvent` → tool events →
+`LlmUsageEvent`). A consumer of this package's event stream has nothing to change.
+
+**One behavioural difference, and it is the fix working.** The hand-rolled loop this replaces had
+a blind tail: messages a run appended after its last drain — a cancellation tail, or an
+end-of-run drain that never happened — were dropped **in silence**. The closing sweep in
+`wrap_run`'s `finally` persists them. A downstream event consumer will therefore see
+`LlmMessageEvent`s on those paths that it never saw before. That is the loss being repaired, not
+a regression.
 
 ## Multimodal Prompts
 
@@ -662,7 +739,7 @@ annotate their own signatures without importing `pydantic_ai` directly.
 ## Context Management
 
 `ReactAgent` maintains a persistent `ContextManager` across calls. Message history is passed
-as `message_history` on every `Agent.iter()` invocation, giving the LLM full conversation
+as `message_history` on every `Agent.run()` invocation, giving the LLM full conversation
 continuity without manual history threading.
 
 ```python

@@ -195,7 +195,7 @@ class ReactAgent:
         # Agent-lifetime token accumulator backing agent_usage_limits' token fields.
         # Same lifecycle as _run_count (in memory, reseeded from the same replayed
         # events). pydantic-ai's own RunUsage, so folding and comparison are both its
-        # code. NEVER handed to iter() — see _check_agent_token_budget.
+        # code. NEVER handed to run(usage=…) — see _check_agent_token_budget.
         self._agent_usage: RunUsage = RunUsage()
 
         # Create context manager (no max_messages by default)
@@ -261,8 +261,9 @@ class ReactAgent:
     ) -> Any:
         """Execute agent with REACT pattern.
 
-        Runs pydantic-ai agent iteratively, updating context after each
-        iteration step.
+        One awaited ``pydantic_ai.Agent.run()`` call. Context is still updated
+        incrementally as the run produces messages, but that is
+        ``EventSourcingCapability``'s ``after_node_run`` sweep, not this method.
 
         Args:
             user_prompt: User message to process
@@ -448,10 +449,11 @@ class ReactAgent:
         spent", never "never exceed it": the last run admitted can carry the total
         arbitrarily past the limit, and only the next one is refused.
 
-        The accumulator is compared here rather than handed to ``iter()`` because
-        ``iter()`` takes exactly one usage — passing the lifetime total would check
-        the *run* tier's limits against it and silently turn a per-run cap into a
-        lifetime one (ADR-013 §Out of scope, reopened for the token tier).
+        The accumulator is compared here rather than handed to ``run(usage=…)``
+        because a run takes exactly one usage object — passing the lifetime total
+        would check the *run* tier's limits against it and silently turn a per-run
+        cap into a lifetime one (ADR-013 §Out of scope, reopened for the token
+        tier).
 
         Raises:
             AgentUsageLimitError: If lifetime usage has already exceeded a token

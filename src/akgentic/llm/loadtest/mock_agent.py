@@ -65,6 +65,13 @@ class MockReactAgent:
             capabilities: Accepted and ignored, mirroring the ``event_loop``
                 accept-and-ignore pattern below — the mock never builds a
                 ``pydantic_ai.Agent``, so there is nothing to forward this to.
+                Ignoring it stays honest parity even though ``ReactAgent`` now
+                mounts two internal capabilities of its own: what
+                ``EventSourcingCapability`` does for a real run — hand every
+                message to ``ContextManager.add_message()`` — this class already
+                does directly from ``_emit_request`` / ``_emit_tool_call`` /
+                ``_emit_tool_return`` / ``_emit_final_response``, so it is its own
+                event source rather than a client of one.
             event_loop: Deprecated — accepted and ignored. The mock creates and
                 owns its own loop (``self._loop``) for drop-in parity with
                 ``ReactAgent``; the passed loop is neither adopted nor used by
