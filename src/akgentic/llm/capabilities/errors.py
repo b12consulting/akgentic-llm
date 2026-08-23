@@ -6,14 +6,40 @@ capabilities compose.
 
 from __future__ import annotations
 
-# What the MODEL reads as the tool result of the call the run-tier breach aborted.
-# Not a diagnostic: the operator's traceback travels the other channel
+# What the MODEL reads as the tool result of the call a run-tier breach aborted.
+# Not diagnostics: the operator's traceback travels the other channel
 # (``ErrorMessage.traceback``, formatted by ``Akgent._handle_failure``). Defined once
-# here so the call site and its test never drift into two wordings (ADR-016 §D2).
+# here so each call site and its test cannot drift into two wordings (ADR-016 §D2).
+#
+# There is one wording per KIND of limit, because the advice genuinely differs and a single
+# sentence has to lie about the others. ``RunUsageLimits`` can breach five ways — requests,
+# tool calls, and three token limits — and pydantic-ai raises the same ``UsageLimitExceeded``
+# for all of them, so the kind is recovered from usage-vs-limits, never from the message text.
+
+RUN_LIMIT_HEALING_MESSAGE_REQUESTS = (
+    "This turn's request budget is exhausted, so this tool call was aborted and this is the "
+    "last thing you can do in this turn. Answer now using what you already have, and say "
+    "plainly what you could not verify."
+)
+
+RUN_LIMIT_HEALING_MESSAGE_TOOL_CALLS = (
+    "This turn's tool-call budget is exhausted, so this tool call was aborted and no further "
+    "tool calls are possible. You can still reason about what you already have. Answer now, "
+    "and say plainly what you could not verify."
+)
+
+RUN_LIMIT_HEALING_MESSAGE_TOKENS = (
+    "This turn's token budget is exhausted, so this tool call was aborted and no further work "
+    "is possible. Answer now and keep it brief, using what you already have, and say plainly "
+    "what you could not verify."
+)
+
+# The kind-agnostic wording, used when the binding limit cannot be identified. Also the
+# historical name: it stays exported so callers written against it keep resolving.
 RUN_LIMIT_HEALING_MESSAGE = (
-    "This turn's tool and request budget is exhausted, so this tool call was "
-    "aborted and no further tool calls are possible. Answer now using what you "
-    "already have, and say plainly what you could not verify."
+    "This turn's budget is exhausted, so this tool call was aborted and no further tool calls "
+    "are possible. Answer now using what you already have, and say plainly what you could not "
+    "verify."
 )
 
 

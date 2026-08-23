@@ -455,3 +455,122 @@ class TestRunInvokesHealing:
 
         assert exc_info.value is sentinel
         assert exc_info.value.__traceback__ is not None
+
+
+# ---------------------------------------------------------------------------
+# The healing sentence names the limit that actually bound
+#
+# `RunUsageLimits` can breach five ways and pydantic-ai raises one
+# `UsageLimitExceeded` for all of them, so the kind is recovered from
+# usage-vs-limits. These pin that recovery, and that each kind gets its own
+# wording — a single sentence would be false for four of the five.
+# ---------------------------------------------------------------------------
+
+
+class _FakeUsage:
+    """Only the counters ``_breached_limit_kind`` reads."""
+
+    def __init__(
+        self,
+        requests: int = 0,
+        tool_calls: int = 0,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        total_tokens: int = 0,
+    ) -> None:
+        self.requests = requests
+        self.tool_calls = tool_calls
+        self.input_tokens = input_tokens
+        self.output_tokens = output_tokens
+        self.total_tokens = total_tokens
+
+
+class _FakeCtx:
+    """Stands in for ``RunContext``: the healer reads only these two attributes."""
+
+    def __init__(self, limits: Any, usage: _FakeUsage) -> None:
+        self.usage_limits = limits
+        self.usage = usage
+
+
+def _to_pydantic(limits: Any) -> Any:
+    """Convert our RunUsageLimits to the pydantic-ai UsageLimits the run actually carries."""
+    from pydantic_ai import UsageLimits as PydanticUsageLimits
+
+    return PydanticUsageLimits(
+        request_limit=limits.run_request_limit,
+        tool_calls_limit=limits.tool_calls_limit,
+        input_tokens_limit=limits.input_tokens_limit,
+        output_tokens_limit=limits.output_tokens_limit,
+        total_tokens_limit=limits.total_tokens_limit,
+    )
+
+
+def _message_for(limits: Any, usage: _FakeUsage) -> str:
+    from akgentic.llm.capabilities import HealingCapability
+
+    return HealingCapability._healing_message(
+        UsageLimitExceeded("breached"), _FakeCtx(limits, usage)
+    )
+
+
+def test_a_request_breach_says_the_turn_is_over_not_that_tools_are_gone() -> None:
+    """A spent request budget ends the turn — tool calls are not what ran out."""
+    from akgentic.llm import RunUsageLimits
+    from akgentic.llm.capabilities import RUN_LIMIT_HEALING_MESSAGE_REQUESTS
+
+    limits = RunUsageLimits(run_request_limit=3)
+    message = _message_for(_to_pydantic(limits), _FakeUsage(requests=3))
+
+    assert message == RUN_LIMIT_HEALING_MESSAGE_REQUESTS
+    assert "request budget" in message
+
+
+def test_a_tool_call_breach_says_reasoning_is_still_possible() -> None:
+    """Only tools are gone: the model can still think, which the wording must say."""
+    from akgentic.llm import RunUsageLimits
+    from akgentic.llm.capabilities import RUN_LIMIT_HEALING_MESSAGE_TOOL_CALLS
+
+    limits = RunUsageLimits(run_request_limit=50, tool_calls_limit=2)
+    message = _message_for(_to_pydantic(limits), _FakeUsage(requests=1, tool_calls=3))
+
+    assert message == RUN_LIMIT_HEALING_MESSAGE_TOOL_CALLS
+    assert "still reason" in message
+
+
+@pytest.mark.parametrize(
+    ("field", "usage_kwargs"),
+    [
+        ("input_tokens_limit", {"input_tokens": 101}),
+        ("output_tokens_limit", {"output_tokens": 101}),
+        ("total_tokens_limit", {"total_tokens": 101}),
+    ],
+)
+def test_any_token_breach_asks_for_a_brief_answer(field: str, usage_kwargs: Any) -> None:
+    """All three token limits mean the same thing to the model: no headroom, be brief."""
+    from akgentic.llm import RunUsageLimits
+    from akgentic.llm.capabilities import RUN_LIMIT_HEALING_MESSAGE_TOKENS
+
+    limits = RunUsageLimits(run_request_limit=50, **{field: 100})
+    message = _message_for(_to_pydantic(limits), _FakeUsage(requests=1, **usage_kwargs))
+
+    assert message == RUN_LIMIT_HEALING_MESSAGE_TOKENS
+    assert "brief" in message
+
+
+def test_an_unidentifiable_breach_falls_back_rather_than_guessing() -> None:
+    """No limits attached: say the kind-agnostic thing instead of naming a wrong budget."""
+    from akgentic.llm.capabilities import RUN_LIMIT_HEALING_MESSAGE
+
+    assert _message_for(None, _FakeUsage()) == RUN_LIMIT_HEALING_MESSAGE
+
+
+def test_a_non_limit_failure_still_gets_type_and_message() -> None:
+    """The other branch is untouched: a model can act on 'ReadTimeout: pool timeout'."""
+    from akgentic.llm.capabilities import HealingCapability
+
+    message = HealingCapability._healing_message(
+        TimeoutError("pool timeout"), _FakeCtx(None, _FakeUsage())
+    )
+
+    assert message == "Tool call aborted: TimeoutError: pool timeout"
