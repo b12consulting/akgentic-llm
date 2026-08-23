@@ -78,9 +78,6 @@ from .budget import LifetimeBudgetCapability
 from .compaction import CompactionCapability
 from .errors import (
     RUN_LIMIT_HEALING_MESSAGE,
-    RUN_LIMIT_HEALING_MESSAGE_REQUESTS,
-    RUN_LIMIT_HEALING_MESSAGE_TOKENS,
-    RUN_LIMIT_HEALING_MESSAGE_TOOL_CALLS,
     AgentUsageLimitError,
     RunUsageLimitError,
     UsageLimitError,
@@ -96,9 +93,6 @@ from .limit_recovery import (
 __all__ = [
     "DEFAULT_CONCLUSION_REASON",
     "RUN_LIMIT_HEALING_MESSAGE",
-    "RUN_LIMIT_HEALING_MESSAGE_REQUESTS",
-    "RUN_LIMIT_HEALING_MESSAGE_TOKENS",
-    "RUN_LIMIT_HEALING_MESSAGE_TOOL_CALLS",
     "AgentUsageLimitError",
     "CompactionCapability",
     "ConclusionDecision",
