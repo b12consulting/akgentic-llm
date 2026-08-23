@@ -129,14 +129,20 @@ def test_systempromptregistry_not_exported():
 def test_the_usage_limit_hierarchy_is_importable_from_both_modules():
     """The three exception classes stay importable from ``akgentic.llm.agent``.
 
-    They are defined in ``capabilities.py`` — ``LifetimeBudgetCapability`` raises the agent
-    tier and ``agent.py`` imports that module, not the reverse — and ``agent.py`` re-exports
-    them with the ``X as X`` pattern for callers written against their old home. That
-    re-export is the whole guarantee the move rests on, and nothing else fails if the three
-    lines are dropped: ruff treats ``X as X`` as an explicit re-export, so removing it is
-    silent. Asserted on IDENTITY, not on ``hasattr``: two separately-defined classes with the
-    same name would satisfy a presence check while breaking every ``except`` written against
-    the other module.
+    They are defined in ``capabilities/errors.py`` — ``LifetimeBudgetCapability`` raises the
+    agent tier and ``agent.py`` imports that package, not the reverse — and ``agent.py``
+    re-exports them with the ``X as X`` pattern for callers written against their old home.
+
+    Ruff treats ``X as X`` as an explicit re-export, so dropping one of those lines is silent
+    to the toolchain. It is no longer silent to this suite: ``akgentic/llm/__init__.py``
+    imports the same three names from ``.agent``, so the package stops importing entirely and
+    collection fails. Do not lean on that second-order effect — it is a property of what
+    ``__init__.py`` happens to re-export today, and it catches a *deleted* name, never a
+    *shadowed* one.
+
+    Asserted on IDENTITY, not on ``hasattr``: two separately-defined classes with the same
+    name would satisfy a presence check while breaking every ``except`` written against the
+    other module.
     """
     import akgentic.llm.agent as agent_module
     import akgentic.llm.capabilities as capabilities_module
