@@ -13,7 +13,7 @@ from pydantic_ai.usage import RunUsage
 # Re-exported, not used here: healing moved into HealingCapability and the usage-limit
 # hierarchy moved next to the capability that raises the agent tier, but
 # `akgentic.llm.agent.<name>` stays importable for callers written against the old home.
-# capabilities.py holds the one definition of each.
+# The capabilities package holds the one definition of each.
 from .capabilities import (
     RUN_LIMIT_HEALING_MESSAGE as RUN_LIMIT_HEALING_MESSAGE,
 )

@@ -147,6 +147,61 @@ def test_the_usage_limit_hierarchy_is_importable_from_both_modules():
         assert getattr(akgentic.llm, name) is one_class, f"{name} is not the same class"
 
 
+def test_every_public_capability_name_still_resolves_from_the_package():
+    """The eight public names stay importable from ``akgentic.llm.capabilities``.
+
+    ``capabilities`` is a package of one module per capability, so each name now reaches
+    callers through a re-export in ``capabilities/__init__.py``. Dropping one of those lines
+    breaks every ``from akgentic.llm.capabilities import X`` written outside this repo and
+    nothing in the toolchain notices: ruff counts ``__all__`` membership as a use, mypy is
+    happy, and the package still imports.
+
+    The names are a **hardcoded literal tuple**, never ``capabilities.__all__``: a test that
+    iterates ``__all__`` passes green when a name is dropped from the import and from
+    ``__all__`` in the same edit — which is exactly the edit that breaks callers.
+
+    Asserted on IDENTITY, not on ``hasattr``: two separately-defined classes of the same name
+    satisfy a presence check while breaking every ``except`` and every ``isinstance`` written
+    against the other module.
+    """
+    import akgentic.llm.agent as agent_module
+    import akgentic.llm.capabilities as capabilities_package
+    from akgentic.llm.capabilities import budget, compaction, errors, event_sourcing, healing
+
+    one_definition_of = (
+        ("RUN_LIMIT_HEALING_MESSAGE", errors),
+        ("UsageLimitError", errors),
+        ("RunUsageLimitError", errors),
+        ("AgentUsageLimitError", errors),
+        ("LifetimeBudgetCapability", budget),
+        ("CompactionCapability", compaction),
+        ("EventSourcingCapability", event_sourcing),
+        ("HealingCapability", healing),
+    )
+
+    for name, sibling in one_definition_of:
+        assert hasattr(capabilities_package, name), (
+            f"{name} is no longer re-exported from akgentic.llm.capabilities"
+        )
+        assert getattr(capabilities_package, name) is getattr(sibling, name), (
+            f"akgentic.llm.capabilities.{name} is not the object {sibling.__name__} defines"
+        )
+
+    # The four capability classes reach callers through akgentic.llm as well.
+    for name, sibling in one_definition_of[4:]:
+        assert getattr(akgentic.llm, name) is getattr(sibling, name), (
+            f"akgentic.llm.{name} is not the object {sibling.__name__} defines"
+        )
+
+    # The constant and the three exception classes reach callers through akgentic.llm.agent,
+    # for code written against their pre-capability home. RUN_LIMIT_HEALING_MESSAGE is
+    # deliberately NOT on akgentic.llm — it never was, and __init__.py is untouched here.
+    for name, sibling in one_definition_of[:4]:
+        assert getattr(agent_module, name) is getattr(sibling, name), (
+            f"akgentic.llm.agent.{name} is not the object {sibling.__name__} defines"
+        )
+
+
 def test_catching_the_base_still_catches_both_tiers():
     """``except UsageLimitError`` written against the old home catches both subclasses.
 
