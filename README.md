@@ -798,15 +798,27 @@ the lifetime budget and compaction into capabilities. Those changed *where* the 
 not what a run emits: the same seven event types (`LlmMessageEvent`, `ToolCallEvent`,
 `ToolReturnEvent`, `LlmUsageEvent`, `LlmSystemPromptEvent`, `LlmContextCompactedEvent`,
 `LlmContextClearedEvent`), the same payload shapes, the same per-message ordering
-(`LlmMessageEvent` → tool events → `LlmUsageEvent`), the same run-id correlation. A consumer of
-this package's event stream has nothing to change.
+(`LlmMessageEvent` → tool events → `LlmUsageEvent`), the same run-id correlation. **No consumer
+needs a schema change.** Two paths do emit *more* than they used to, both described below.
 
-**One behavioural difference, and it is the fix working.** The hand-rolled loop this replaces had
-a blind tail: messages a run appended after its last drain — a cancellation tail, or an
-end-of-run drain that never happened — were dropped **in silence**. The closing sweep in
-`wrap_run`'s `finally` persists them. A downstream event consumer will therefore see
-`LlmMessageEvent`s on those paths that it never saw before. That is the loss being repaired, not
-a regression.
+**Two behavioural differences, and both are the fix working.**
+
+*The blind tail closes.* The hand-rolled loop this replaces dropped messages a run appended after
+its last drain — a cancellation tail, or an end-of-run drain that never happened — **in silence**.
+The closing sweep in `wrap_run`'s `finally` persists them, so a downstream consumer will see
+`LlmMessageEvent`s on those paths that it never saw before. That is the loss being repaired.
+
+*A failed or cancelled run can now emit `LlmSystemPromptEvent`.* The per-run system-prompt
+recording moved into that same `finally`. Its previous call site sat inside the success path and
+was unreachable once a run raised, so a run that failed recorded nothing even when it had rendered
+a new prompt. Two consequences, before you assume this stream is byte-identical to the old one:
+
+- an event can appear on a failure or cancellation path where none appeared before — subject to
+  the unchanged hash dedup, so an unchanged rendering still emits nothing; and
+- on a healed failure it lands **ahead of** the healing `LlmMessageEvent`, a relative position that
+  did not previously exist.
+
+Group a trace by `run_id`, which every event carries, rather than by arrival order.
 
 ## Multimodal Prompts
 

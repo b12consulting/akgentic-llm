@@ -129,13 +129,22 @@ class ReactAgent:
                 persistence, system-prompt recording and dangling-tool-call healing for
                 every run this agent drives. The budget is outermost so a run it refuses
                 reaches none of the others — including the summarizer LLM call.
-                Ordering is fixed, and a caller's capabilities sit INSIDE all four. Two
-                consequences, neither guessable from the signature: a capability sees
-                only the POST-compaction history, never what compaction folded away —
-                the fold happens in CompactionCapability's wrap_run head, which encloses
-                every hook a caller capability has; and because pydantic-ai unwinds the
-                chain in reverse, a caller capability's `after_*` hooks run BEFORE the
-                persistence sweep, so its durable edits are the ones persisted.
+                That is the MOUNT order, and it is a default rather than a guarantee:
+                pydantic-ai's CombinedCapability topologically re-sorts the whole chain
+                as soon as ANY capability declares get_ordering(), so a caller declaring
+                position='outermost' — or wraps=[...] naming one of the four — lands
+                ahead of them. None of the four declares an ordering, so a caller that
+                declares nothing does sit inside all four, and the two consequences below
+                hold for that caller. A caller that re-sorts itself gets neither.
+                First: a capability sees only the POST-compaction history, never what
+                compaction folded away — the fold happens in CompactionCapability's
+                wrap_run head, which encloses every hook a caller capability has.
+                Second: because pydantic-ai unwinds the chain in reverse, a caller
+                capability's `after_*` hooks run BEFORE the persistence sweep, so its
+                durable edits are the ones persisted. Persistence survives any ordering
+                regardless — the closing sweep sits in a `finally` outside every node
+                hook — but `on_run_error` precedence does not, and is deliberately left
+                uncontracted (see backlog.md).
                 Under pydantic-ai 2.x (verified against 2.31.0), a capability that
                 orphans a tool call/return pair (e.g. by splitting one while injecting
                 content) is NOT left broken: pydantic-ai's own dangling-tool-call
