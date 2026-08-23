@@ -693,8 +693,11 @@ class ReactAgent:
             RuntimeError: If the agent has been closed
             UsageLimitError: If usage limits are exceeded. run_sync() surfaces
                 whatever run() raised, so either subclass can arrive here:
-                RunUsageLimitError for a run-tier breach, AgentUsageLimitError for
-                an agent-tier one.
+                AgentUsageLimitError for an agent-tier breach, which is terminal,
+                and RunUsageLimitError for a run-tier one — but only when the
+                recovery seam declined, or the conclusion it asked for failed or
+                produced nothing usable. A recovered run-tier breach RETURNS the
+                conclusion's answer from here, exactly as it does from run().
         """
         # Always run on the agent's own loop so the httpx connection pool stays
         # bound to ONE stable loop across calls. There is no asyncio.run()

@@ -39,9 +39,14 @@ class RunUsageLimitError(UsageLimitError):
     """One run() call exhausted its RunUsageLimits budget.
 
     Requests, tool calls or tokens spent within the turn — pydantic-ai stopped the
-    run mid-graph. The agent may still have lifetime budget, so this is
-    **recoverable**: the turn may not call another tool, but the agent can be asked
-    to conclude with what it already gathered.
+    run mid-graph. The agent may still have lifetime budget, so the breach is
+    **recovered by default rather than raised**: ``LimitRecoveryCapability``'s seam
+    decides the turn concludes, and ``ReactAgent.run()`` returns that tool-free
+    conclusion's answer. This class reaches the caller only when the seam declines
+    (returns ``None``), when the conclusion it asked for failed or produced nothing
+    usable, or from a direct ``conclude_without_tools()`` call, which is never itself
+    recovered. An ``except RunUsageLimitError`` written before recovery existed may
+    therefore stop firing.
     """
 
     pass
