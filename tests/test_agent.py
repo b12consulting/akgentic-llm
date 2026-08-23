@@ -2049,7 +2049,9 @@ def _always_calling_model() -> FunctionModel:
     """
 
     def stub(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
-        return ModelResponse(parts=[ToolCallPart(tool_name="weather_lookup", args={"city": "Paris"})])
+        return ModelResponse(
+            parts=[ToolCallPart(tool_name="weather_lookup", args={"city": "Paris"})]
+        )
 
     return FunctionModel(stub)
 
@@ -2164,8 +2166,16 @@ class TestReactAgentLimitRecovery:
         The whole reason ``LimitRecoveryCapability`` is mounted *before*
         ``HealingCapability``: pydantic-ai walks ``on_run_error`` over
         ``reversed(self.capabilities)``, so the later entry runs first. Swap the two back and
-        the seam sees a context whose last message is still the dangling ``ModelResponse`` —
-        which is the context the conclusion would then be handed.
+        the seam sees a context whose last message is still the dangling ``ModelResponse``,
+        so a policy that reads the context to decide decides on the wrong one.
+
+        What the order does NOT protect is the conclusion's own starting context. The walk
+        runs every hook and re-raises only afterwards, so healing has always written its
+        ``ToolReturnPart`` by the time ``_run_with_limits`` drives the conclusion — swapping
+        the two leaves ``test_a_run_tier_breach_returns_the_concluded_answer`` and
+        ``test_a_rescued_turn_emits_two_runs_worth_of_events`` green, and this test is what
+        sees it. Keeping a dangling tool call out of the conclusion is the job of using
+        ``on_run_error`` instead of ``wrap_run``, not of this ordering.
         """
         offered: list[list[str]] = []
         seam = _RecordingSeam()
@@ -2335,12 +2345,18 @@ class TestReactAgentLimitRecovery:
         assert any(record.exc_info for record in caplog.records), "the secondary was logged"
 
     @pytest.mark.parametrize("output", [None, "   "], ids=["none", "whitespace"])
-    async def test_an_unusable_conclusion_output_surfaces_the_original_breach(self, output):
+    async def test_an_unusable_conclusion_output_surfaces_the_original_breach(
+        self, output, caplog
+    ):
         """Nothing usable is the same as nothing at all (AC #11).
 
         Narrow by design: ``None``, or a ``str`` that is empty or whitespace-only. Richer
         emptiness — a structured output carrying no requests — is the caller's judgement and
         stays out of this package.
+
+        The log line is asserted, not incidental: nothing raised on this path, so the warning
+        is the ONLY trace that a turn was rescued and the rescue came back empty. Its sibling
+        above has an exception to carry that signal; this one has nothing else.
         """
         offered: list[list[str]] = []
         agent = ReactAgent(config=_recovery_config(tool_calls_limit=1), tools=[weather_lookup])
@@ -2348,13 +2364,17 @@ class TestReactAgentLimitRecovery:
         async def useless(*_: Any, **__: Any) -> Any:
             return output
 
-        with agent.pydantic_agent.override(model=_breaching_then_concluding_model(offered)):
-            with patch.object(agent, "conclude_without_tools", new=useless):
-                with pytest.raises(RunUsageLimitError) as exc_info:
-                    await agent.run("do the thing")
+        with caplog.at_level(logging.WARNING, logger="akgentic.llm.agent"):
+            with agent.pydantic_agent.override(model=_breaching_then_concluding_model(offered)):
+                with patch.object(agent, "conclude_without_tools", new=useless):
+                    with pytest.raises(RunUsageLimitError) as exc_info:
+                        await agent.run("do the thing")
 
         assert "tool_calls_limit" in str(exc_info.value)
         assert isinstance(exc_info.value.__cause__, UsageLimitExceeded)
+        assert any("no usable output" in r.message for r in caplog.records), (
+            "an empty rescue must leave a trace; nothing raised to carry one"
+        )
 
     async def test_an_agent_tier_breach_never_consults_the_seam(self):
         """The terminal tier stays terminal: no seam, no conclusion (AC #12).
@@ -2376,6 +2396,24 @@ class TestReactAgentLimitRecovery:
         assert seam.consulted == []
         assert seam.consume_decision() is None
         conclude.assert_not_called()
+
+    async def test_a_rescued_turn_consumes_two_units_of_the_lifetime_budget(self):
+        """A rescued turn costs TWO runs of the agent-lifetime budget, not one.
+
+        Inherent to the sibling-run design rather than a regression — the conclusion is a
+        second run through the same stack and pays the same agent-tier pre-flight. But it is
+        exactly what ``test_counter_advances_when_the_run_tier_limit_fires`` and its loop
+        twin stopped covering when they took the opt-out seam to keep their own subject a
+        single run, so without this the arithmetic a caller sizing ``agent_request_limit``
+        depends on would be stated only in prose.
+        """
+        offered: list[list[str]] = []
+        agent = ReactAgent(config=_recovery_config(tool_calls_limit=1), tools=[weather_lookup])
+
+        with agent.pydantic_agent.override(model=_breaching_then_concluding_model(offered)):
+            assert await agent.run("do the thing") == "concluded"
+
+        assert agent._agent_run_count == 2
 
     async def test_a_rescued_turn_emits_two_runs_worth_of_events(self):
         """The event stream is unchanged in shape by recovery (AC #15).

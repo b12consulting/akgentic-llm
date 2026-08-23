@@ -258,8 +258,11 @@ class ReactAgent:
         # are what gets persisted. Limit recovery sits immediately BEFORE healing, and that
         # position is load-bearing: pydantic-ai walks the on_run_error chain in REVERSE, so
         # the later entry fires first — healing must write its ToolReturnPart before the
-        # recovery seam is consulted, or the conclusion would start from a context carrying
-        # a dangling tool call.
+        # recovery seam is consulted, so that a policy reading the context to decide sees the
+        # healed one. It is NOT what keeps a dangling tool call out of the conclusion: the
+        # walk runs every hook and only then re-raises, so healing has always written its
+        # part by the time `_run_with_limits` drives the conclusion, whatever the order.
+        # Using `on_run_error` rather than `wrap_run` is what protects the conclusion.
         capability_stack: list[AgentCapability[Any]] = [
             self._budget,
             self._compactor,
@@ -298,6 +301,11 @@ class ReactAgent:
         with the default policy the turn degrades into one tool-free conclusion and
         that conclusion's output is what this returns, instead of raising. A seam
         returning ``None`` restores the raising contract exactly.
+
+        **A rescued turn costs TWO units of the agent-lifetime run budget**, not one:
+        the conclusion is a sibling run through the same stack and pays the same
+        agent-tier pre-flight as any other. Size ``agent_request_limit`` accordingly —
+        a turn that breaches buys half as many turns as one that does not.
 
         Args:
             user_prompt: User message to process
