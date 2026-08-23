@@ -20,8 +20,7 @@ from pydantic_ai.tools import RunContext
 # unprefixed name is a role to hire). A deployment that wants the requester named returns its
 # own ``ConclusionDecision(reason=...)`` from the seam — that is what the seam is for.
 DEFAULT_CONCLUSION_REASON = (
-    "This turn has run out of its tool-call budget, so you cannot call any further tool "
-    "and this is your last chance to answer.\n"
+    "This turn has run out of its budget, this is your last chance to answer.\n"
     "Answer now with what you have already gathered. State your conclusion plainly, say "
     "explicitly which parts you could not check or finish, and do not promise follow-up "
     "work — the turn ends with this answer."
