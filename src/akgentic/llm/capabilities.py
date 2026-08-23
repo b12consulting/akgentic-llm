@@ -70,7 +70,7 @@ not once fired against the rebound list) still has its messages swept.
 normalised list a node hook hands over — never against the incoming history's length. The
 normalised copy is routinely *shorter* than what was handed in, so a cursor carried over from
 the incoming length sits past where the run's own messages begin and skips everything behind it
-in silence. Two back-to-back ``record_operator_action`` calls are enough to trigger it; see
+in silence. Two back-to-back ``append_user_prompt`` calls are enough to trigger it; see
 ``_anchor``.
 """
 
@@ -573,7 +573,7 @@ class EventSourcingCapability(AbstractCapability[Any]):
         is not the snapshot's. The cursor ``wrap_run`` opened is an index into the snapshot;
         carried onto the copy unchanged it lands at the wrong offset, and a copy that came out
         shorter means the run's own opening messages sit *behind* the cursor and are silently
-        never persisted. Two back-to-back ``record_operator_action`` calls are enough to
+        never persisted. Two back-to-back ``append_user_prompt`` calls are enough to
         trigger it — they merge into one request, and the user's next prompt disappears.
 
         So the cursor is re-opened against the list the sweep will actually index, the first

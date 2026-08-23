@@ -885,9 +885,9 @@ ctx.last_input_tokens         # → int | None — provider-reported size of the
 ctx.subscribe(observer)
 ctx.unsubscribe(observer)
 
-# Operator actions recorded outside a run
-ctx.record_operator_action("…")     # buffered before the first run, appended after it
-ctx.drain_pending_operator_actions()  # → list[str]; ReactAgent.run folds these into the prompt
+# User-role turns added outside a run (operator actions, context-update blocks)
+ctx.append_user_prompt("…")     # buffered before the first run, appended after it
+ctx.drain_pending_user_prompts()  # → list[str]; ReactAgent.run folds these into the prompt
 
 # System-prompt rendering (see System Prompt Rendering Events)
 ctx.record_system_prompt(run_id)

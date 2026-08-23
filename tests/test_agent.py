@@ -2046,7 +2046,7 @@ class TestReactAgentFoldsPendingOperatorActions:
     async def test_str_prompt_gets_preamble_prepended(self, minimal_config):
         """FR4: a buffered entry is prepended to a str prompt with a blank-line join."""
         agent = ReactAgent(config=minimal_config)
-        agent.context.record_operator_action("[Operator action] ran /reset")
+        agent.context.append_user_prompt("[Operator action] ran /reset")
         captured: dict = {}
 
         with patch.object(
@@ -2060,8 +2060,8 @@ class TestReactAgentFoldsPendingOperatorActions:
     async def test_multiple_entries_joined_in_order(self, minimal_config):
         """FR4: multiple buffered entries join with blank lines, then the prompt."""
         agent = ReactAgent(config=minimal_config)
-        agent.context.record_operator_action("first")
-        agent.context.record_operator_action("second")
+        agent.context.append_user_prompt("first")
+        agent.context.append_user_prompt("second")
         captured: dict = {}
 
         with patch.object(
@@ -2075,8 +2075,8 @@ class TestReactAgentFoldsPendingOperatorActions:
     async def test_list_prompt_gets_preamble_as_leading_element(self, minimal_config):
         """FR4: a multimodal list prompt gets the preamble inserted as its first element."""
         agent = ReactAgent(config=minimal_config)
-        agent.context.record_operator_action("op-A")
-        agent.context.record_operator_action("op-B")
+        agent.context.append_user_prompt("op-A")
+        agent.context.append_user_prompt("op-B")
         bc = BinaryContent(data=b"img", media_type="image/png")
         multimodal: list = ["describe", bc]
         captured: dict = {}
@@ -2092,7 +2092,7 @@ class TestReactAgentFoldsPendingOperatorActions:
     async def test_run_clears_buffer(self, minimal_config):
         """FR4: after a run the operator-action buffer is empty."""
         agent = ReactAgent(config=minimal_config)
-        agent.context.record_operator_action("once")
+        agent.context.append_user_prompt("once")
         captured: dict = {}
 
         with patch.object(
@@ -2100,7 +2100,7 @@ class TestReactAgentFoldsPendingOperatorActions:
         ):
             await agent.run("q")
 
-        assert agent.context.drain_pending_operator_actions() == []
+        assert agent.context.drain_pending_user_prompts() == []
 
     @pytest.mark.asyncio
     async def test_empty_buffer_leaves_str_prompt_unchanged(self, minimal_config):
@@ -2133,7 +2133,7 @@ class TestReactAgentFoldsPendingOperatorActions:
     async def test_message_history_stays_empty_so_system_prompt_injects(self, minimal_config):
         """FR5: folding leaves message_history empty so pydantic-ai injects the system prompt."""
         agent = ReactAgent(config=minimal_config)
-        agent.context.record_operator_action("[Operator action] ran /help")
+        agent.context.append_user_prompt("[Operator action] ran /help")
         captured: dict = {}
 
         with patch.object(

@@ -384,7 +384,7 @@ class ReactAgent:
 
         None of those five is performed here: they belong to the capability stack
         assembled in ``__init__``, and each fires inside the one awaited ``run()``
-        below. What is left is the operator-action prompt fold, the run-tier limits
+        below. What is left is the buffered-user-prompt fold, the run-tier limits
         conversion, that call, and the run-tier exception mapping.
 
         Args:
@@ -405,7 +405,7 @@ class ReactAgent:
                 method's, to alter, because that is what
                 ``Akgent._handle_failure`` formats onto ``ErrorMessage.traceback``.
         """
-        user_prompt = self._fold_pending_operator_actions(user_prompt)
+        user_prompt = self._fold_pending_user_prompts(user_prompt)
         pydantic_limits = self._to_pydantic_limits(limits)
 
         # No `usage=`: the run's own accumulator is the one pydantic-ai's graph creates,
@@ -438,10 +438,10 @@ class ReactAgent:
         """This agent's lifetime token accumulator, read through to the capability."""
         return self._budget.usage
 
-    def _fold_pending_operator_actions(self, user_prompt: UserPrompt) -> UserPrompt:
-        """Prepend any buffered pre-first-run operator actions to the run prompt.
+    def _fold_pending_user_prompts(self, user_prompt: UserPrompt) -> UserPrompt:
+        """Prepend any user prompts buffered before the first run to the run prompt.
 
-        Drains ``ContextManager._pending_operator_actions`` and folds the entries
+        Drains ``ContextManager._pending_user_prompts`` and folds the entries
         into ``user_prompt`` so they reach the model **as prompt content** rather
         than as a system-less ``ModelRequest`` in ``message_history`` — which
         would make pydantic-ai's history non-empty and suppress system-prompt
@@ -460,10 +460,10 @@ class ReactAgent:
             user_prompt: The caller's prompt for this run (str or multimodal list).
 
         Returns:
-            The prompt with buffered operator actions prepended, or the original
+            The prompt with the buffered entries prepended, or the original
             prompt when the buffer is empty.
         """
-        pending = self._context.drain_pending_operator_actions()
+        pending = self._context.drain_pending_user_prompts()
         if not pending:
             return user_prompt
         preamble = "\n\n".join(pending)

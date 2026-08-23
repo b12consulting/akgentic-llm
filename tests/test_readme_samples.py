@@ -721,8 +721,8 @@ def test_context_manager_sample_methods_all_exist_and_run() -> None:
 
     # Operator actions: appended directly once history is non-empty, so nothing
     # is left buffered for ReactAgent.run to fold into the prompt.
-    ctx.record_operator_action("operator did a thing")
-    assert ctx.drain_pending_operator_actions() == []
+    ctx.append_user_prompt("operator did a thing")
+    assert ctx.drain_pending_user_prompts() == []
     assert len(ctx.messages) == 2
 
     ctx.record_system_prompt("run-1")  # no system parts yet — a documented no-op

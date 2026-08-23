@@ -217,7 +217,7 @@ async def test_a_history_pydantic_ai_normalises_does_not_shift_the_cursor() -> N
 
     ``UserPromptNode`` rebinds the run's history to a *normalised copy* of what it was handed:
     consecutive ``ModelRequest``s are merged into one, orphaned tool results dropped. Two
-    back-to-back ``record_operator_action`` calls — the shape ``ReactAgent`` drives whenever
+    back-to-back ``append_user_prompt`` calls — the shape ``ReactAgent`` drives whenever
     the mailbox delivers twice between turns — merge, so the copy is one message shorter than
     the snapshot ``wrap_run`` measured its cursor against. A cursor carried across that rebind
     sits one past where the run's own messages begin, and the user's prompt is silently never
@@ -229,8 +229,8 @@ async def test_a_history_pydantic_ai_normalises_does_not_shift_the_cursor() -> N
     )
 
     await agent.run("one")
-    context.record_operator_action("[operator] first note")
-    context.record_operator_action("[operator] second note")
+    context.append_user_prompt("[operator] first note")
+    context.append_user_prompt("[operator] second note")
     before = len(_persisted(capture))
 
     second = await agent.run("two", message_history=context.messages)
@@ -265,7 +265,7 @@ async def test_two_sequential_runs_on_one_instance_persist_each_message_once() -
 async def test_a_message_recorded_between_runs_is_not_re_persisted() -> None:
     """A cursor carried between runs would re-persist what happened between them (AC #4).
 
-    ``record_operator_action`` appends to the context between turns — the production shape
+    ``append_user_prompt`` appends to the context between turns — the production shape
     ``ReactAgent`` drives. The next run's cursor must open at the history it is actually
     handed, not where the previous run stopped, or every message added in between is
     persisted a second time.
@@ -275,7 +275,7 @@ async def test_a_message_recorded_between_runs_is_not_re_persisted() -> None:
     agent: Agent[None, str] = Agent(model=TestModel(), capabilities=[capability])
 
     await agent.run("one")
-    context.record_operator_action("[operator] noted between turns")
+    context.append_user_prompt("[operator] noted between turns")
     handed_over = context.messages
     second = await agent.run("two", message_history=handed_over)
 
