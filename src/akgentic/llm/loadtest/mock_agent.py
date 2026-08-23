@@ -65,7 +65,9 @@ class MockReactAgent:
         Args:
             capabilities: Accepted and ignored — the mock never builds a
                 ``pydantic_ai.Agent``, so there is nothing to forward this to.
-                None of the four ``ReactAgent`` mounts has a client to be here:
+                None of ``ReactAgent``'s five mounts has a client to be here —
+                ``LimitRecoveryCapability`` for the reason given under
+                ``limit_recovery`` below, and for the other four:
                 what ``EventSourcingCapability`` does for a real run — hand every
                 message to ``ContextManager.add_message()`` — this class already
                 does directly from ``_emit_request`` / ``_emit_tool_call`` /
