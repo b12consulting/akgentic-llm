@@ -177,12 +177,6 @@ class ReactAgent:
         self._deps_type = deps_type
         self._result_type = result_type
 
-        # The whole agent-lifetime budget — both counters, both pre-flight checks, the
-        # usage fold and the restore seeding — lives here. Held on the instance because
-        # restore_context() reseeds it and the two read-through properties below report
-        # it; it is also the first entry of the capability stack assembled further down.
-        self._budget = LifetimeBudgetCapability(limits=config.agent_usage_limits)
-
         # Create context manager (no max_messages by default)
         self._context = ContextManager()
 
@@ -199,6 +193,18 @@ class ReactAgent:
             exp_multiplier=config.runtime_cfg.http_client_config.backoff_multiplier,
             exp_max_s=config.runtime_cfg.http_client_config.backoff_max,
         )
+
+        # Create model from config
+        self._model = create_model(config.model_cfg, self._http_client)
+
+        # Wrap result_type with provider-aware output strategy for structured output
+        wrapped_result_type: Any = get_output_type(config.model_cfg, result_type)
+
+        # The whole agent-lifetime budget — both counters, both pre-flight checks, the
+        # usage fold and the restore seeding — lives here. Held on the instance because
+        # restore_context() reseeds it and the two read-through properties below report
+        # it; it is also the first entry of the capability stack assembled further down.
+        self._budget = LifetimeBudgetCapability(limits=config.agent_usage_limits)
 
         # Resolve the compaction strategy as runtime state (never a Pydantic
         # field). Built AFTER self._http_client so the summarizer reuses the
@@ -220,12 +226,6 @@ class ReactAgent:
             threshold_fn=self._compaction_threshold,
             event_factory=self._build_compaction_event,
         )
-
-        # Create model from config
-        self._model = create_model(config.model_cfg, self._http_client)
-
-        # Wrap result_type with provider-aware output strategy for structured output
-        wrapped_result_type: Any = get_output_type(config.model_cfg, result_type)
 
         # The whole capability stack, assembled once, here — the only place its order is
         # decided. The budget is first of all, so a run it refuses reaches none of the
