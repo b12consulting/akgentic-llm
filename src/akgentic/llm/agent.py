@@ -112,7 +112,6 @@ class ReactAgent:
         result_type: type[Any] = str,
         observer: ContextObserver | None = None,
         capabilities: Sequence[AgentCapability[Any]] | None = None,
-        event_loop: asyncio.AbstractEventLoop | None = None,
         limit_recovery: LimitRecoveryCapability | None = None,
     ) -> None:
         """Initialize REACT agent.
@@ -163,10 +162,6 @@ class ReactAgent:
                 not a documented public guarantee, and could change in a future
                 release — a capability should still avoid orphaning tool calls on
                 purpose.
-            event_loop: Deprecated — accepted and ignored. The agent creates and
-                owns its own loop (``self._loop``); the passed loop is neither
-                adopted nor used by ``run_sync``. Kept in the signature for one
-                release so callers can stop passing it without a flag day.
             limit_recovery: The run-tier recovery policy, as a
                 ``LimitRecoveryCapability`` (or a subclass overriding its
                 ``handle_limit_exceeded`` seam). Defaults to the base class, whose
@@ -181,7 +176,7 @@ class ReactAgent:
         # The agent owns its loop: create it and make it current on the
         # constructing thread BEFORE building the httpx client / model, so the
         # connection pool stays a per-agent resource bound to one stable loop
-        # (ADR-008). The deprecated `event_loop=` argument is ignored.
+        # (ADR-008).
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
         self._closed = False

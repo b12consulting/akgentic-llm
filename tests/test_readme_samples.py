@@ -550,22 +550,8 @@ def test_react_agent_constructor_accepts_every_documented_argument(agents: Any) 
         result_type=str,
         observer=_Observer(),
         capabilities=[],
-        event_loop=None,  # deprecated, accepted and ignored
     )
     assert agent.pydantic_agent is not None
-
-
-def test_event_loop_argument_is_ignored(agents: Any) -> None:
-    """§ReactAgent API — ``event_loop=`` is accepted and ignored, as documented."""
-    foreign = asyncio.new_event_loop()
-    try:
-        agent = agents(
-            ReactAgentConfig(model_cfg=ModelConfig(provider="openai", model="gpt-4o")),
-            event_loop=foreign,
-        )
-        assert agent._loop is not foreign
-    finally:
-        foreign.close()
 
 
 # ---------------------------------------------------------------------------

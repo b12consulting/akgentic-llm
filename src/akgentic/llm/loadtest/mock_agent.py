@@ -55,7 +55,6 @@ class MockReactAgent:
         result_type: type[Any] = str,
         observer: ContextObserver | None = None,
         capabilities: Sequence[AgentCapability[Any]] | None = None,
-        event_loop: asyncio.AbstractEventLoop | None = None,
         limit_recovery: LimitRecoveryCapability | None = None,
     ) -> None:
         """Mirror ``ReactAgent.__init__`` without building a model or provider.
@@ -64,8 +63,7 @@ class MockReactAgent:
         scenario is resolved from ``config`` and loaded eagerly.
 
         Args:
-            capabilities: Accepted and ignored, mirroring the ``event_loop``
-                accept-and-ignore pattern below — the mock never builds a
+            capabilities: Accepted and ignored — the mock never builds a
                 ``pydantic_ai.Agent``, so there is nothing to forward this to.
                 None of the four ``ReactAgent`` mounts has a client to be here:
                 what ``EventSourcingCapability`` does for a real run — hand every
@@ -81,10 +79,6 @@ class MockReactAgent:
                 agent-lifetime budget is enforced here, so an
                 ``agent_request_limit`` that stops the real class after N runs
                 does not stop the mock.
-            event_loop: Deprecated — accepted and ignored. The mock creates and
-                owns its own loop (``self._loop``) for drop-in parity with
-                ``ReactAgent``; the passed loop is neither adopted nor used by
-                ``run_sync``.
             limit_recovery: Accepted and ignored, mirroring ``capabilities`` above.
                 The mock raises no usage-limit error on any path — no run-tier
                 budget is enforced here at all — so there is no breach for a
@@ -92,8 +86,7 @@ class MockReactAgent:
                 keyword itself.
         """
         # The mock owns its loop too (drop-in parity over the ReactAgent close
-        # surface): build no client/model, so loop creation can go first. The
-        # deprecated `event_loop=` argument is ignored.
+        # surface): build no client/model, so loop creation can go first.
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
         self._closed = False

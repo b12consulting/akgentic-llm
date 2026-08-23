@@ -5,7 +5,7 @@ asyncio loop in ``__init__``, ``run_sync`` always runs on that loop (no
 ``asyncio.run()`` fallback) and raises once the agent is closed, ``aclose()``
 stays async and resource-only (httpx, double-close guarded), and the new
 synchronous idempotent ``close()`` drives ``aclose()`` then drains and closes
-the loop. The deprecated ``event_loop=`` argument is accepted and ignored.
+the loop.
 
 Also retains Story 10-1 (Epic 10, ADR-008) coverage of the instance-held
 ``httpx.AsyncClient`` handle and ``aclose()`` releasing that pool.
@@ -265,33 +265,3 @@ def test_close_cancels_pending_tasks(minimal_config: ReactAgentConfig) -> None:
     assert not any("pending" in m.lower() for m in messages), messages
 
 
-# ---------------------------------------------------------------------------
-# AC #7 — event_loop= is accepted and ignored (deprecated compat shim)
-# ---------------------------------------------------------------------------
-
-
-def test_event_loop_arg_is_accepted_and_ignored(minimal_config: ReactAgentConfig) -> None:
-    """Passing ``event_loop=`` does not raise and is not adopted as ``self._loop``."""
-    passed_loop = asyncio.new_event_loop()
-    used_loop: list[asyncio.AbstractEventLoop] = []
-
-    async def stub_run(*_: Any, **__: Any) -> str:
-        used_loop.append(asyncio.get_running_loop())
-        return "ran-on-owned-loop"
-
-    try:
-        # Construction does not raise despite the deprecated argument.
-        agent = ReactAgent(config=minimal_config, event_loop=passed_loop)
-        try:
-            # The passed loop is NOT adopted as the agent's own loop.
-            assert agent._loop is not passed_loop
-            # run_sync still runs on the agent's own loop, never the passed one.
-            with patch.object(ReactAgent, "run", new=stub_run):
-                agent.run_sync("q")
-            assert used_loop == [agent._loop]
-            # The passed loop was never used (still open, untouched by the agent).
-            assert not passed_loop.is_closed()
-        finally:
-            agent.close()
-    finally:
-        passed_loop.close()

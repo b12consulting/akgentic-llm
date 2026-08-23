@@ -518,7 +518,6 @@ class ReactAgent:
         result_type: type[Any] = str,         # default output type
         observer: ContextObserver | None = None,
         capabilities: Sequence[AgentCapability[Any]] | None = None,  # pydantic-ai AgentCapability sequence
-        event_loop: asyncio.AbstractEventLoop | None = None,  # DEPRECATED — accepted and ignored
     ) -> None: ...
 
     # Execution
@@ -578,10 +577,6 @@ What the mechanism does when a caller invokes it:
 healing instruction described under [Usage limits](#usage-limits) is already there as the tool
 result the model reasons from. `conclude_without_tools_sync()` is the synchronous bridge,
 mirroring `run_sync()`: closed-agent guard, then the agent's own loop.
-
-`event_loop=` is **deprecated and ignored**: `ReactAgent.__init__` always creates and owns its
-own loop, and `run_sync()` runs on that one. It is kept in the signature for one release so
-callers can stop passing it without a flag day.
 
 `ReactAgent.__init__` creates that loop eagerly, so an agent built and discarded without
 `close()` leaks it. Call `close()` (or `await aclose()` then `close()`) when you are done.

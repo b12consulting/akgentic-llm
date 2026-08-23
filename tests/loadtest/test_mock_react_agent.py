@@ -142,7 +142,7 @@ def test_capabilities_accepted_and_ignored() -> None:
 def test_limit_recovery_accepted_and_ignored() -> None:
     """`limit_recovery=` constructs without error and does not change run() output.
 
-    The same accept-and-ignore mirror `capabilities` and `event_loop` get, and for a stronger
+    The same accept-and-ignore mirror `capabilities` gets, and for a stronger
     reason: the mock enforces no run-tier budget and raises no usage-limit error on any path,
     so there is no breach for a recovery policy to decide about. Only the keyword is mirrored;
     a behavioural mirror would have nothing to mirror.
@@ -478,29 +478,6 @@ def _last_index(items: list[str], value: str) -> int:
 # ---------------------------------------------------------------------------
 # Additional surface / branch coverage
 # ---------------------------------------------------------------------------
-
-
-def test_event_loop_arg_accepted_and_ignored() -> None:
-    """``event_loop=`` is accepted but ignored: the mock owns its own loop.
-
-    Re-points the old fallback test (the asyncio.run fallback was removed): a
-    passed loop is not adopted as ``self._loop`` and ``run_sync`` still runs on
-    the owned loop, returning ``""``.
-    """
-    passed_loop = asyncio.new_event_loop()
-    try:
-        agent = MockReactAgent(config=_make_config("@Expert"), event_loop=passed_loop)
-        try:
-            # The passed loop is NOT adopted as the mock's own loop.
-            assert agent._loop is not passed_loop
-            # run_sync runs on the owned loop and still returns "".
-            assert agent.run_sync("hi", deps=_Deps("@Expert")) == ""
-            # The passed loop was never used (untouched by the agent).
-            assert not passed_loop.is_closed()
-        finally:
-            agent.close()
-    finally:
-        passed_loop.close()
 
 
 def test_restore_context_filters_llm_messages() -> None:
