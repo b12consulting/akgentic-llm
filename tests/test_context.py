@@ -368,7 +368,7 @@ class TestCheckpointSurfaceRemoved:
 
 
 class TestRecordOperatorAction:
-    """Test ContextManager.record_operator_action and drain (FR1, FR2a, FR2b, FR3)."""
+    """Test ContextManager.append_user_prompt and drain (FR1, FR2a, FR2b, FR3)."""
 
     def test_buffers_before_first_run(self) -> None:
         """FR2a: recording on an empty manager buffers — no _messages, no event."""
@@ -376,7 +376,7 @@ class TestRecordOperatorAction:
         observer = MockObserver()
         manager.subscribe(observer)
 
-        manager.record_operator_action("op-1")
+        manager.append_user_prompt("op-1")
 
         # Buffered, not appended to the run buffer.
         assert manager.messages == []
@@ -387,28 +387,28 @@ class TestRecordOperatorAction:
         """FR2a/FR3: multiple pre-run entries buffer in record order."""
         manager = ContextManager()
 
-        manager.record_operator_action("first")
-        manager.record_operator_action("second")
+        manager.append_user_prompt("first")
+        manager.append_user_prompt("second")
 
         assert manager.messages == []
-        assert manager.drain_pending_operator_actions() == ["first", "second"]
+        assert manager.drain_pending_user_prompts() == ["first", "second"]
 
     def test_drain_returns_and_clears(self) -> None:
         """FR3: drain returns buffered entries in order then resets to empty."""
         manager = ContextManager()
-        manager.record_operator_action("alpha")
-        manager.record_operator_action("beta")
+        manager.append_user_prompt("alpha")
+        manager.append_user_prompt("beta")
 
-        drained = manager.drain_pending_operator_actions()
+        drained = manager.drain_pending_user_prompts()
 
         assert drained == ["alpha", "beta"]
         # Buffer is now empty — a second drain yields nothing.
-        assert manager.drain_pending_operator_actions() == []
+        assert manager.drain_pending_user_prompts() == []
 
     def test_drain_empty_returns_empty_list(self) -> None:
         """FR3: draining an untouched buffer returns an empty list."""
         manager = ContextManager()
-        assert manager.drain_pending_operator_actions() == []
+        assert manager.drain_pending_user_prompts() == []
 
     def test_appends_after_first_run(self) -> None:
         """FR2b: with non-empty _messages, the entry is appended as a ModelRequest."""
@@ -420,7 +420,7 @@ class TestRecordOperatorAction:
         manager.add_message(create_system_message("sys"))
         baseline_events = len(observer.messages_added)
 
-        manager.record_operator_action("op-after-run")
+        manager.append_user_prompt("op-after-run")
 
         # Appended one ModelRequest carrying a single UserPromptPart.
         assert len(manager.messages) == 2
@@ -432,7 +432,7 @@ class TestRecordOperatorAction:
         # Exactly one new LlmMessageEvent emitted for the append.
         assert len(observer.messages_added) == baseline_events + 1
         # The pre-run buffer was never touched.
-        assert manager.drain_pending_operator_actions() == []
+        assert manager.drain_pending_user_prompts() == []
 
     def test_append_emits_exactly_one_llm_message_event(self) -> None:
         """FR2b: exactly one LlmMessageEvent fires for a post-run operator action."""
@@ -442,7 +442,7 @@ class TestRecordOperatorAction:
         # Subscribe AFTER the prior message so we count only the operator-action event.
         manager.subscribe(observer)
 
-        manager.record_operator_action("op")
+        manager.append_user_prompt("op")
 
         assert len(observer.messages_added) == 1
         assert observer.messages_added[0].parts[0].content == "op"  # type: ignore[attr-defined]

@@ -10,13 +10,28 @@ from pydantic_ai import UsageLimits as PydanticUsageLimits
 from pydantic_ai.messages import ModelMessage
 from pydantic_ai.usage import RunUsage
 
-# RUN_LIMIT_HEALING_MESSAGE is re-exported, not used: healing itself moved into
-# HealingCapability, but `akgentic.llm.agent.RUN_LIMIT_HEALING_MESSAGE` stays importable
-# for callers written against it. capabilities.py holds the one definition.
+# Re-exported, not used here: healing moved into HealingCapability and the usage-limit
+# hierarchy moved next to the capability that raises the agent tier, but
+# `akgentic.llm.agent.<name>` stays importable for callers written against the old home.
+# capabilities.py holds the one definition of each.
 from .capabilities import (
     RUN_LIMIT_HEALING_MESSAGE as RUN_LIMIT_HEALING_MESSAGE,
 )
-from .capabilities import EventSourcingCapability, HealingCapability
+from .capabilities import (
+    AgentUsageLimitError as AgentUsageLimitError,
+)
+from .capabilities import (
+    CompactionCapability,
+    EventSourcingCapability,
+    HealingCapability,
+    LifetimeBudgetCapability,
+)
+from .capabilities import (
+    RunUsageLimitError as RunUsageLimitError,
+)
+from .capabilities import (
+    UsageLimitError as UsageLimitError,
+)
 from .compaction import CompactionResult, CompactionStrategy, create_compaction
 from .config import ReactAgentConfig, RunUsageLimits
 from .context import ContextManager
@@ -55,42 +70,6 @@ def _evict_anyio_run_vars(loop: asyncio.AbstractEventLoop) -> None:
         _run_vars.pop(loop, None)
     except Exception:
         pass
-
-
-class UsageLimitError(Exception):
-    """Raised when a usage limit is exceeded during agent execution.
-
-    Base of both tiers — catch this to handle either; catch a subclass to react to
-    one. Every breach raises one of the two subclasses below, never this class
-    directly, but it stays the documented catch-all: an ``except UsageLimitError``
-    written before the tiers were split still catches everything it used to
-    (ADR-016 §D1).
-    """
-
-    pass
-
-
-class RunUsageLimitError(UsageLimitError):
-    """One run() call exhausted its RunUsageLimits budget.
-
-    Requests, tool calls or tokens spent within the turn — pydantic-ai stopped the
-    run mid-graph. The agent may still have lifetime budget, so this is
-    **recoverable**: the turn may not call another tool, but the agent can be asked
-    to conclude with what it already gathered.
-    """
-
-    pass
-
-
-class AgentUsageLimitError(UsageLimitError):
-    """The agent has spent its AgentUsageLimits budget over its whole lifetime.
-
-    Raised pre-flight, by the token check or the run-count check, before the call
-    executes. **Terminal** for this agent — no follow-up run can be admitted,
-    because the budget that would pay for it is exactly the one that is spent.
-    """
-
-    pass
 
 
 class ReactAgent:
@@ -143,18 +122,29 @@ class ReactAgent:
             result_type: Type for agent result validation (default: str)
             observer: Context observer to register automatically (optional)
             capabilities: Optional sequence of pydantic-ai AgentCapability instances.
-                They are NOT forwarded unchanged: two internal capabilities —
-                EventSourcingCapability then HealingCapability — are mounted ahead of
-                them, because those two own persistence, system-prompt recording and
-                dangling-tool-call healing for every run this agent drives.
-                Ordering is fixed: a capability's before_model_request hook runs AFTER
-                compaction — ContextManager rewrites messages first, the result is
-                passed as message_history, and only then does the capability chain
-                run. Two consequences, neither guessable from the signature: a
-                capability sees only the POST-compaction history, never what
-                compaction folded away; and because pydantic-ai unwinds the chain in
-                reverse, a caller capability's `after_*` hooks run BEFORE the
-                persistence sweep, so its durable edits are the ones persisted.
+                They are NOT forwarded unchanged: four internal capabilities —
+                LifetimeBudgetCapability, then CompactionCapability, then
+                EventSourcingCapability, then HealingCapability — are mounted ahead of
+                them, because those four own the agent-lifetime budget, auto-compaction,
+                persistence, system-prompt recording and dangling-tool-call healing for
+                every run this agent drives. The budget is outermost so a run it refuses
+                reaches none of the others — including the summarizer LLM call.
+                That is the MOUNT order, and it is a default rather than a guarantee:
+                pydantic-ai's CombinedCapability topologically re-sorts the whole chain
+                as soon as ANY capability declares get_ordering(), so a caller declaring
+                position='outermost' — or wraps=[...] naming one of the four — lands
+                ahead of them. None of the four declares an ordering, so a caller that
+                declares nothing does sit inside all four, and the two consequences below
+                hold for that caller. A caller that re-sorts itself gets neither.
+                First: a capability sees only the POST-compaction history, never what
+                compaction folded away — the fold happens in CompactionCapability's
+                wrap_run head, which encloses every hook a caller capability has.
+                Second: because pydantic-ai unwinds the chain in reverse, a caller
+                capability's `after_*` hooks run BEFORE the persistence sweep, so its
+                durable edits are the ones persisted. Persistence survives any ordering
+                regardless — the closing sweep sits in a `finally` outside every node
+                hook — but `on_run_error` precedence does not, and is deliberately left
+                uncontracted (see backlog.md).
                 Under pydantic-ai 2.x (verified against 2.31.0), a capability that
                 orphans a tool call/return pair (e.g. by splitting one while injecting
                 content) is NOT left broken: pydantic-ai's own dangling-tool-call
@@ -187,16 +177,11 @@ class ReactAgent:
         self._deps_type = deps_type
         self._result_type = result_type
 
-        # Agent-lifetime run counter backing agent_usage_limits.agent_request_limit.
-        # In memory only: never a Pydantic field, never persisted. Not lost on resume —
-        # restore_context() recomputes it from the replayed LlmUsageEvents.
-        self._agent_run_count: int = 0
-
-        # Agent-lifetime token accumulator backing agent_usage_limits' token fields.
-        # Same lifecycle as _run_count (in memory, reseeded from the same replayed
-        # events). pydantic-ai's own RunUsage, so folding and comparison are both its
-        # code. NEVER handed to run(usage=…) — see _check_agent_token_budget.
-        self._agent_usage: RunUsage = RunUsage()
+        # The whole agent-lifetime budget — both counters, both pre-flight checks, the
+        # usage fold and the restore seeding — lives here. Held on the instance because
+        # restore_context() reseeds it and the two read-through properties below report
+        # it; it is also the first entry of the capability stack assembled further down.
+        self._budget = LifetimeBudgetCapability(limits=config.agent_usage_limits)
 
         # Create context manager (no max_messages by default)
         self._context = ContextManager()
@@ -220,8 +205,20 @@ class ReactAgent:
         # agent's shared httpx client (no second pool); the summarizer model uses
         # summary_model_cfg when set, else the primary model_cfg.
         summary_cfg = config.compaction_cfg.summary_model_cfg or config.model_cfg
-        self._compaction: CompactionStrategy = create_compaction(
+        strategy: CompactionStrategy = create_compaction(
             config.compaction_cfg, summary_cfg, self._http_client
+        )
+
+        # The whole of auto-compaction — the token gate, the durable fold and the
+        # in-place fold of the run's own history — lives here. Held on the instance
+        # because the manual /compact bridge delegates to it and the read-through
+        # `_compaction` property below reports its strategy; it is also the second
+        # entry of the capability stack assembled further down.
+        self._compactor = CompactionCapability(
+            strategy=strategy,
+            context=self._context,
+            threshold_fn=self._compaction_threshold,
+            event_factory=self._build_compaction_event,
         )
 
         # Create model from config
@@ -230,11 +227,18 @@ class ReactAgent:
         # Wrap result_type with provider-aware output strategy for structured output
         wrapped_result_type: Any = get_output_type(config.model_cfg, result_type)
 
-        # The whole capability stack, assembled once, here. The two internal ones come
-        # first so the caller's sit inside them: pydantic-ai unwinds the chain in
-        # reverse, so a caller capability's after_* hooks run before the persistence
-        # sweep and its durable edits are what gets persisted.
+        # The whole capability stack, assembled once, here — the only place its order is
+        # decided. The budget is first of all, so a run it refuses reaches none of the
+        # others and in particular never pays for compaction's summarizer; nothing but
+        # this list holds that. Compaction is second so persistence opens its cursor on
+        # the POST-fold history, though that one is belt-and-braces — _anchor re-opens the
+        # cursor at the first node hook either way. The internal ones come first so the
+        # caller's sit inside them: pydantic-ai unwinds the chain in reverse, so a caller
+        # capability's after_* hooks run before the persistence sweep and its durable edits
+        # are what gets persisted.
         capability_stack: list[AgentCapability[Any]] = [
+            self._budget,
+            self._compactor,
             EventSourcingCapability(context=self._context),
             HealingCapability(context=self._context),
             *(capabilities or []),
@@ -369,19 +373,19 @@ class ReactAgent:
         output_type: type[Any] | None,
         limits: RunUsageLimits | None,
     ) -> Any:
-        """Shared run core: pre-flight, compaction, one ``run()`` call.
+        """Shared run core: fold the prompt, convert the run tier, one ``run()`` call.
 
         Everything ``run()`` does, with the run-tier budget as a parameter so the
         tool-free conclusion can substitute its own without ``run()`` growing a
         public knob for it. Reusing this core is what gives the conclusion the same
-        pre-flight, the same persistence, the same system-prompt recording and the
-        same usage fold — so a conclusion emits an ``LlmUsageEvent`` like any other
-        run.
+        pre-flight, the same auto-compaction, the same persistence, the same
+        system-prompt recording and the same usage fold — so a conclusion emits an
+        ``LlmUsageEvent`` like any other run.
 
-        Persistence, system-prompt recording and healing are not performed here at
-        all: they belong to ``EventSourcingCapability`` and ``HealingCapability``,
-        mounted ahead of the caller's capabilities in ``__init__``. What is left is a
-        pre-flight and one awaited call.
+        None of those five is performed here: they belong to the capability stack
+        assembled in ``__init__``, and each fires inside the one awaited ``run()``
+        below. What is left is the buffered-user-prompt fold, the run-tier limits
+        conversion, that call, and the run-tier exception mapping.
 
         Args:
             user_prompt: The prompt for this turn.
@@ -401,23 +405,13 @@ class ReactAgent:
                 method's, to alter, because that is what
                 ``Akgent._handle_failure`` formats onto ``ErrorMessage.traceback``.
         """
-        # Pre-flight: reject before spending anything (a rejected run must not even
-        # pay for compaction's summarizer call). Tokens first, so a token rejection
-        # consumes no run budget.
-        self._check_agent_token_budget()
-        self._check_and_consume_agent_budget()
-        # Auto-compact (at most once per turn) BEFORE the run reads the history.
-        # message_history is read once at entry and the graph only appends, so
-        # compacting here takes effect for the whole turn.
-        await self._maybe_compact()
-        user_prompt = self._fold_pending_operator_actions(user_prompt)
+        user_prompt = self._fold_pending_user_prompts(user_prompt)
         pydantic_limits = self._to_pydantic_limits(limits)
 
-        # This run's own accumulator, mutated in place by the graph for the whole run.
-        # A fresh object, never self._agent_usage: handing pydantic-ai the lifetime
-        # accumulator would check the per-run cap against lifetime totals — silently,
-        # with no error.
-        run_usage = RunUsage()
+        # No `usage=`: the run's own accumulator is the one pydantic-ai's graph creates,
+        # and LifetimeBudgetCapability folds it from `wrap_run`'s ctx. Handing in the
+        # lifetime accumulator instead would check the per-run cap against lifetime
+        # totals — silently, with no error.
         try:
             result = await self._pydantic_agent.run(
                 user_prompt=user_prompt,
@@ -425,98 +419,29 @@ class ReactAgent:
                 usage_limits=pydantic_limits,
                 message_history=self._context.messages,
                 output_type=get_output_type(self._config.model_cfg, output_type),
-                usage=run_usage,
             )
             return result.output
         except UsageLimitExceeded as e:
             raise RunUsageLimitError(str(e)) from e
-        finally:
-            # In `finally`: tokens a failed run burned were still burned.
-            self._fold_run_usage(run_usage)
 
-    def _check_agent_token_budget(self) -> None:
-        """Refuse to START a run once the agent-lifetime token budget is spent.
+    @property
+    def _agent_run_count(self) -> int:
+        """Runs consumed over this agent's lifetime, read through to the capability.
 
-        Builds a pydantic-ai ``UsageLimits`` from ``agent_usage_limits``' three token
-        fields and reuses its ``check_tokens()`` against the lifetime accumulator, so
-        an agent-tier breach carries pydantic-ai's own message wording. The tier is
-        carried by the **class** — ``AgentUsageLimitError`` here, ``RunUsageLimitError``
-        at the run-tier site — so nothing downstream has to parse text to tell the
-        tiers apart. Unset limits (the default, all ``None``) make the check a no-op.
-
-        **A run may overshoot the budget, by construction.** A run's token cost is
-        unknown until it completes, so this is "do not start a run once the budget is
-        spent", never "never exceed it": the last run admitted can carry the total
-        arbitrarily past the limit, and only the next one is refused.
-
-        The accumulator is compared here rather than handed to ``run(usage=…)``
-        because a run takes exactly one usage object — passing the lifetime total
-        would check the *run* tier's limits against it and silently turn a per-run
-        cap into a lifetime one (ADR-013 §Out of scope, reopened for the token
-        tier).
-
-        Raises:
-            AgentUsageLimitError: If lifetime usage has already exceeded a token
-                limit. A subclass of UsageLimitError.
+        One source of truth: ``LifetimeBudgetCapability`` owns the counter, enforces it
+        and is reseeded by ``restore_context``. This reports it.
         """
-        limits = self._config.agent_usage_limits
-        pydantic_limits = PydanticUsageLimits(
-            input_tokens_limit=limits.input_tokens_limit,
-            output_tokens_limit=limits.output_tokens_limit,
-            total_tokens_limit=limits.total_tokens_limit,
-        )
-        try:
-            pydantic_limits.check_tokens(self._agent_usage)
-        except UsageLimitExceeded as e:
-            raise AgentUsageLimitError(str(e)) from e
+        return self._budget.run_count
 
-    def _fold_run_usage(self, run_usage: RunUsage) -> None:
-        """Add one run's token usage to the agent-lifetime accumulator.
+    @property
+    def _agent_usage(self) -> RunUsage:
+        """This agent's lifetime token accumulator, read through to the capability."""
+        return self._budget.usage
 
-        The argument is the ``RunUsage`` handed **in** as ``run(usage=…)``, not one
-        read back off a result. pydantic-ai defaults that parameter (``usage or
-        RunUsage()``), stores that exact object on the graph state and from then on
-        only mutates it in place, so it holds the run's real cost whether the run
-        returned or raised. That is why it is passed in at all: a run that failed
-        partway has no ``AgentRunResult`` to read usage off, so the accumulator the
-        graph mutates is the only anchor that survives the exception. Called from a
-        ``finally``, so a failed run still contributes what it spent — the provider
-        billed it either way.
+    def _fold_pending_user_prompts(self, user_prompt: UserPrompt) -> UserPrompt:
+        """Prepend any user prompts buffered before the first run to the run prompt.
 
-        Args:
-            run_usage: This run's own accumulator, as handed to ``run(usage=…)``.
-        """
-        self._agent_usage.incr(run_usage)
-
-    def _check_and_consume_agent_budget(self) -> None:
-        """Spend one unit of the agent-lifetime run budget, or refuse to run.
-
-        Check-then-consume: the counter advances **before** the call executes, so a
-        ``run()`` that fails partway — including one that raises the run-tier
-        ``RunUsageLimitError`` — has already been counted. That ordering is deliberate:
-        an agent whose run-tier limit fires repeatedly must also exhaust its
-        agent-tier budget, since both mean "this agent is burning too many turns"
-        (ADR-013 §D2). Do not move the increment after the call.
-
-        The rejection itself does not consume, so the counter reports runs consumed,
-        never runs attempted, and the message stays stable under repeated rejection.
-        ``agent_request_limit=None`` never blocks.
-
-        Raises:
-            AgentUsageLimitError: If the agent has already used its lifetime run
-                budget. A subclass of UsageLimitError.
-        """
-        limit = self._config.agent_usage_limits.agent_request_limit
-        if limit is not None and self._agent_run_count >= limit:
-            raise AgentUsageLimitError(
-                f"Exceeded the agent_request_limit of {limit} (run_count={self._agent_run_count})"
-            )
-        self._agent_run_count += 1
-
-    def _fold_pending_operator_actions(self, user_prompt: UserPrompt) -> UserPrompt:
-        """Prepend any buffered pre-first-run operator actions to the run prompt.
-
-        Drains ``ContextManager._pending_operator_actions`` and folds the entries
+        Drains ``ContextManager._pending_user_prompts`` and folds the entries
         into ``user_prompt`` so they reach the model **as prompt content** rather
         than as a system-less ``ModelRequest`` in ``message_history`` — which
         would make pydantic-ai's history non-empty and suppress system-prompt
@@ -535,10 +460,10 @@ class ReactAgent:
             user_prompt: The caller's prompt for this run (str or multimodal list).
 
         Returns:
-            The prompt with buffered operator actions prepended, or the original
+            The prompt with the buffered entries prepended, or the original
             prompt when the buffer is empty.
         """
-        pending = self._context.drain_pending_operator_actions()
+        pending = self._context.drain_pending_user_prompts()
         if not pending:
             return user_prompt
         preamble = "\n\n".join(pending)
@@ -546,34 +471,31 @@ class ReactAgent:
             return f"{preamble}\n\n{user_prompt}"
         return [preamble, *user_prompt]
 
+    @property
+    def _compaction(self) -> CompactionStrategy:
+        """The resolved compaction strategy, read through to the mounted capability.
+
+        One source of truth: ``CompactionCapability`` holds the strategy and is what
+        actually calls it. Deliberately read-only — a test that swapped a strategy onto
+        ``ReactAgent`` instead of onto the capability would be testing nothing, silently,
+        so the assignment raises instead. Swap ``agent._compactor.strategy``.
+        """
+        return self._compactor.strategy
+
     def _compaction_threshold(self) -> int | None:
         """Token budget that arms the auto-trigger, or None when compaction is off.
 
-        ``int(context_length * trigger_ratio)`` when ``model_cfg.context_length``
-        is set; ``None`` (auto-compaction disabled) otherwise.
-        """
-        context_length = self._config.model_cfg.context_length
-        if context_length is None:
-            return None
-        return int(context_length * self._config.compaction_cfg.trigger_ratio)
-
-    async def _maybe_compact(self) -> None:
-        """Auto-compact once when the last run's input_tokens exceed the threshold.
-
-        Reads the provider-reported ``last_input_tokens`` (no ``tiktoken``). No-ops
-        when auto-trigger is off, the budget is unset (``context_length is None``),
-        no usage has been reported yet (``last_input_tokens is None`` — never
-        mis-fires on missing data), or usage is at/below the threshold. Fires at
-        most once per ``run()`` call.
+        ``int(context_length * trigger_ratio)`` when auto-compaction is on and
+        ``model_cfg.context_length`` is set; ``None`` (auto-compaction disabled)
+        otherwise. Both ways of being off — the switch and the missing budget — answer
+        ``None`` here so "compaction is off" is one concept the capability reads once.
+        The arithmetic is unchanged.
         """
         cfg = self._config.compaction_cfg
-        if not cfg.auto_trigger:
-            return
-        threshold = self._compaction_threshold()
-        used = self._context.last_input_tokens
-        if threshold is None or used is None or used <= threshold:
-            return
-        await self._compact_now()
+        context_length = self._config.model_cfg.context_length
+        if not cfg.auto_trigger or context_length is None:
+            return None
+        return int(context_length * cfg.trigger_ratio)
 
     def _build_compaction_event(self, result: CompactionResult) -> LlmContextCompactedEvent:
         """Build the append-only event from a strategy result (auto + manual share this)."""
@@ -589,23 +511,18 @@ class ReactAgent:
         )
 
     async def _compact_now(self) -> str:
-        """Run the strategy and fold its result in — the shared async core (R1 + R2).
+        """Force a compaction now — the manual half of the one fold site (FR5).
 
-        Awaits the strategy inside the running loop (ADR-009). A zero-replacement
-        result is a clean no-op: no event, no synthetic summary. Both the auto path
-        (``_maybe_compact``) and the sync ``compact()`` bridge converge here.
+        Delegates to ``CompactionCapability.compact_now`` with no live message list:
+        there is no run in flight on this path, so the durable write is the only one and
+        the next run picks the folded history up from ``ContextManager``. The auto path
+        reaches the same method from the capability's own ``wrap_run``, which is what
+        keeps the two from diverging.
 
         Returns:
             A human-readable status string.
         """
-        result = await self._compaction.compact(self._context.messages)
-        if result.replaced_message_count == 0:
-            return "Nothing to compact."
-        self._context.compact(self._build_compaction_event(result))
-        return (
-            f"Compacted: replaced {result.replaced_message_count} "
-            f"earlier message(s) with a summary."
-        )
+        return await self._compactor.compact_now()
 
     def compact(self) -> str:
         """Force a compaction now, bypassing the budget gate (manual /compact, FR15).
@@ -813,7 +730,7 @@ class ReactAgent:
         self._seed_agent_budget_from_events(events)
 
     def _seed_agent_budget_from_events(self, events: Sequence[EventMessage]) -> None:
-        """Recompute both agent-lifetime budgets from replayed usage events.
+        """Recompute both agent-lifetime budgets from replayed usage events, and seed them.
 
         One ``aggregate_usage`` pass seeds the run counter and the token
         accumulator: the run count is the number of **distinct runs**, never of
@@ -822,20 +739,23 @@ class ReactAgent:
         ``run_id``), and the token totals sum those same runs. ``by_run=True`` is
         what populates ``runs`` at all — without it both seeds are zero every time.
 
-        Assignment, not accumulation, so replaying the same stream twice is
-        idempotent and a shorter stream lowers the value. A ``run()`` that failed
-        before any ``ModelResponse`` left no usage event and is invisible here; that
-        is deliberate (ADR-013 §Out of scope) — it consumed no model resources.
+        Both values are handed to ``LifetimeBudgetCapability.seed()``, which **assigns**
+        rather than accumulates — so replaying the same stream twice is idempotent and a
+        shorter stream lowers the value. A ``run()`` that failed before any
+        ``ModelResponse`` left no usage event and is invisible here; that is deliberate
+        (ADR-013 §Out of scope) — it consumed no model resources.
 
         Args:
             events: The same event-like list passed to ``restore_context``.
         """
         usage = [e.event for e in events if isinstance(e.event, LlmUsageEvent)]
         summary = aggregate_usage(usage, by_run=True)
-        self._agent_run_count = len(summary.runs)
-        self._agent_usage = RunUsage(
-            input_tokens=sum(r.total_input_tokens for r in summary.runs),
-            output_tokens=sum(r.total_output_tokens for r in summary.runs),
+        self._budget.seed(
+            run_count=len(summary.runs),
+            usage=RunUsage(
+                input_tokens=sum(r.total_input_tokens for r in summary.runs),
+                output_tokens=sum(r.total_output_tokens for r in summary.runs),
+            ),
         )
 
     def _seed_system_prompt_from_events(self, events: Sequence[EventMessage]) -> None:

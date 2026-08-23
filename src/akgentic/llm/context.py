@@ -106,7 +106,7 @@ class ContextManager:
         self._messages: list[ModelMessage] = []
         self._observers: list[ContextObserver] = []
         self._last_system_prompt_hash: str | None = None
-        self._pending_operator_actions: list[str] = []
+        self._pending_user_prompts: list[str] = []
         self._last_input_tokens: int | None = None
 
     @property
@@ -157,14 +157,21 @@ class ContextManager:
         self._emit_tool_events(message)
         self._emit_usage_event(message)
 
-    def record_operator_action(self, entry: str) -> None:
-        """Record a human operator-action entry, respecting pydantic-ai's first-run rule.
+    def append_user_prompt(self, entry: str) -> None:
+        """Append user-role text to the context, respecting pydantic-ai's first-run rule.
+
+        The one way to put a user-role turn into the context outside a run. Named
+        for what it does rather than for a caller: the entries are operator
+        actions (``/compact``, ``/clear``), context-update blocks composed from
+        tool state, and whatever else a consumer needs the model to read as
+        having come from the user side. The previous name, ``record_operator_action``,
+        described only the first of those and had stopped being true.
 
         pydantic-ai injects its registered ``@system_prompt`` functions only when
         the ``message_history`` it is handed arrives empty (``if not messages``).
         It never *adds* a missing system prompt to a non-empty history. That
-        couples how an operator action may be recorded to whether the run buffer
-        has been materialized yet:
+        couples how an entry may be recorded to whether the run buffer has been
+        materialized yet:
 
         - **After the first run** a system-bearing ``ModelRequest`` already exists
           in ``_messages``, so appending a bare user-role ``ModelRequest`` is safe:
@@ -178,27 +185,27 @@ class ContextManager:
           ``user_prompt`` (keeping ``message_history`` empty).
 
         Args:
-            entry: The fully formatted operator-action text to record.
+            entry: The fully formatted text to add, rendered by the caller.
         """
         if self._messages:
             self.add_message(ModelRequest(parts=[UserPromptPart(content=entry)]))
         else:
-            self._pending_operator_actions.append(entry)
+            self._pending_user_prompts.append(entry)
 
-    def drain_pending_operator_actions(self) -> list[str]:
-        """Return buffered pre-first-run operator actions and clear the buffer.
+    def drain_pending_user_prompts(self) -> list[str]:
+        """Return the entries buffered before the first run, and clear the buffer.
 
-        Returns the buffered entries in record order, then resets the buffer to
+        Returns them in the order they were added, then resets the buffer to
         empty. ``ReactAgent.run`` calls this to fold the entries into the next
         run's ``user_prompt`` so they reach the model without suppressing
-        system-prompt injection (see ``record_operator_action``).
+        system-prompt injection (see ``append_user_prompt``).
 
         Returns:
-            The buffered operator-action entries, in record order. Empty when
+            The buffered entries, in the order they were added. Empty when
             nothing has been buffered.
         """
-        pending = self._pending_operator_actions
-        self._pending_operator_actions = []
+        pending = self._pending_user_prompts
+        self._pending_user_prompts = []
         return pending
 
     def _emit_tool_events(self, message: ModelMessage) -> None:

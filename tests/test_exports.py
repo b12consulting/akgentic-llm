@@ -1,5 +1,7 @@
 """Test public API exports."""
 
+import pytest
+
 import akgentic.llm
 
 
@@ -65,6 +67,8 @@ def test_key_exports_present():
     assert hasattr(akgentic.llm, "ToolReturnEvent")
 
     # Run-loop capabilities
+    assert hasattr(akgentic.llm, "LifetimeBudgetCapability")
+    assert hasattr(akgentic.llm, "CompactionCapability")
     assert hasattr(akgentic.llm, "EventSourcingCapability")
     assert hasattr(akgentic.llm, "HealingCapability")
 
@@ -120,3 +124,42 @@ def test_systempromptregistry_not_exported():
     """SystemPromptRegistry should NOT be exported (removed in architecture refactor)."""
     assert "SystemPromptRegistry" not in akgentic.llm.__all__
     assert not hasattr(akgentic.llm, "SystemPromptRegistry")
+
+
+def test_the_usage_limit_hierarchy_is_importable_from_both_modules():
+    """The three exception classes stay importable from ``akgentic.llm.agent``.
+
+    They are defined in ``capabilities.py`` — ``LifetimeBudgetCapability`` raises the agent
+    tier and ``agent.py`` imports that module, not the reverse — and ``agent.py`` re-exports
+    them with the ``X as X`` pattern for callers written against their old home. That
+    re-export is the whole guarantee the move rests on, and nothing else fails if the three
+    lines are dropped: ruff treats ``X as X`` as an explicit re-export, so removing it is
+    silent. Asserted on IDENTITY, not on ``hasattr``: two separately-defined classes with the
+    same name would satisfy a presence check while breaking every ``except`` written against
+    the other module.
+    """
+    import akgentic.llm.agent as agent_module
+    import akgentic.llm.capabilities as capabilities_module
+
+    for name in ("UsageLimitError", "RunUsageLimitError", "AgentUsageLimitError"):
+        one_class = getattr(capabilities_module, name)
+        assert getattr(agent_module, name) is one_class, f"{name} is not the same class"
+        assert getattr(akgentic.llm, name) is one_class, f"{name} is not the same class"
+
+
+def test_catching_the_base_still_catches_both_tiers():
+    """``except UsageLimitError`` written against the old home catches both subclasses.
+
+    The additive guarantee the hierarchy's move must not break: a caller that imported the
+    base from ``akgentic.llm.agent`` before the split keeps catching everything it used to.
+    """
+    from akgentic.llm.agent import (
+        AgentUsageLimitError,
+        RunUsageLimitError,
+        UsageLimitError,
+    )
+
+    for tier in (RunUsageLimitError, AgentUsageLimitError):
+        assert issubclass(tier, UsageLimitError)
+        with pytest.raises(UsageLimitError):
+            raise tier("breach")

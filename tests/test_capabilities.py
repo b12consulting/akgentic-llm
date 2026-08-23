@@ -1,4 +1,4 @@
-"""Tests for EventSourcingCapability and HealingCapability, mounted standalone.
+"""Tests for LifetimeBudget, EventSourcing and Healing capabilities, mounted standalone.
 
 Every run here is driven by a **bare pydantic-ai ``Agent``** — never a ``ReactAgent``. That is
 the point of the decomposition: each capability must be mountable and provable on its own, on
@@ -11,12 +11,12 @@ and ``test_system_prompt_event.py``. ``asyncio_mode = "auto"`` — plain ``async
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import pytest
 from pydantic_ai import Agent, RunCancelled, UsageLimitExceeded
-from pydantic_ai.capabilities import AbstractCapability, ProcessHistory
+from pydantic_ai.capabilities import AbstractCapability, AgentNode, ProcessHistory, WrapRunHandler
 from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
@@ -31,11 +31,21 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.run import AgentRunResult
 from pydantic_ai.tools import RunContext
-from pydantic_ai.usage import RunUsage, UsageLimits
+from pydantic_ai.usage import RequestUsage, RunUsage, UsageLimits
 
-from akgentic.llm import ContextManager, EventSourcingCapability, HealingCapability
+from akgentic.llm import (
+    AgentUsageLimitError,
+    AgentUsageLimits,
+    CompactionCapability,
+    CompactionResult,
+    ContextManager,
+    EventSourcingCapability,
+    HealingCapability,
+    LifetimeBudgetCapability,
+)
 from akgentic.llm.capabilities import RUN_LIMIT_HEALING_MESSAGE
 from akgentic.llm.event import (
+    LlmContextCompactedEvent,
     LlmMessageEvent,
     LlmSystemPromptEvent,
     LlmUsageEvent,
@@ -207,7 +217,7 @@ async def test_a_history_pydantic_ai_normalises_does_not_shift_the_cursor() -> N
 
     ``UserPromptNode`` rebinds the run's history to a *normalised copy* of what it was handed:
     consecutive ``ModelRequest``s are merged into one, orphaned tool results dropped. Two
-    back-to-back ``record_operator_action`` calls — the shape ``ReactAgent`` drives whenever
+    back-to-back ``append_user_prompt`` calls — the shape ``ReactAgent`` drives whenever
     the mailbox delivers twice between turns — merge, so the copy is one message shorter than
     the snapshot ``wrap_run`` measured its cursor against. A cursor carried across that rebind
     sits one past where the run's own messages begin, and the user's prompt is silently never
@@ -219,8 +229,8 @@ async def test_a_history_pydantic_ai_normalises_does_not_shift_the_cursor() -> N
     )
 
     await agent.run("one")
-    context.record_operator_action("[operator] first note")
-    context.record_operator_action("[operator] second note")
+    context.append_user_prompt("[operator] first note")
+    context.append_user_prompt("[operator] second note")
     before = len(_persisted(capture))
 
     second = await agent.run("two", message_history=context.messages)
@@ -255,7 +265,7 @@ async def test_two_sequential_runs_on_one_instance_persist_each_message_once() -
 async def test_a_message_recorded_between_runs_is_not_re_persisted() -> None:
     """A cursor carried between runs would re-persist what happened between them (AC #4).
 
-    ``record_operator_action`` appends to the context between turns — the production shape
+    ``append_user_prompt`` appends to the context between turns — the production shape
     ``ReactAgent`` drives. The next run's cursor must open at the history it is actually
     handed, not where the previous run stopped, or every message added in between is
     persisted a second time.
@@ -265,7 +275,7 @@ async def test_a_message_recorded_between_runs_is_not_re_persisted() -> None:
     agent: Agent[None, str] = Agent(model=TestModel(), capabilities=[capability])
 
     await agent.run("one")
-    context.record_operator_action("[operator] noted between turns")
+    context.append_user_prompt("[operator] noted between turns")
     handed_over = context.messages
     second = await agent.run("two", message_history=handed_over)
 
@@ -744,3 +754,641 @@ async def test_two_plain_runs_persist_every_message_each_run_produced() -> None:
     persisted_ids = {id(m) for m in _persisted(capture)}
     assert {id(m) for m in first.new_messages()} <= persisted_ids
     assert {id(m) for m in second.new_messages()} <= persisted_ids
+
+
+# ---------------------------------------------------------------------------
+# Story 24.1 — LifetimeBudgetCapability, mounted on a bare Agent
+# ---------------------------------------------------------------------------
+
+
+def _budget(**limits: int | None) -> LifetimeBudgetCapability:
+    """A budget capability carrying only the agent-tier limits named."""
+    return LifetimeBudgetCapability(limits=AgentUsageLimits(**limits))
+
+
+def _answering_model(input_tokens: int = 0, output_tokens: int = 0) -> FunctionModel:
+    """A model answering with one ``TextPart`` and an exact, caller-chosen token spend.
+
+    ``FunctionModel`` estimates usage only when the response carries none, so setting it
+    here pins what the run costs — the fold's assertions are on exact totals.
+    """
+
+    def model_fn(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        return ModelResponse(
+            parts=[TextPart(content="ok")],
+            usage=RequestUsage(input_tokens=input_tokens, output_tokens=output_tokens),
+        )
+
+    return FunctionModel(model_fn)
+
+
+def _spending_tool_caller(input_tokens: int, output_tokens: int) -> FunctionModel:
+    """A model that spends an exact amount and then asks for the ``boom`` tool."""
+
+    def model_fn(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        return ModelResponse(
+            parts=[ToolCallPart(tool_name="boom", args={})],
+            usage=RequestUsage(input_tokens=input_tokens, output_tokens=output_tokens),
+        )
+
+    return FunctionModel(model_fn)
+
+
+def _agent_whose_tool_raises(model: FunctionModel, capabilities: list[Any]) -> Agent[None, str]:
+    """A bare Agent whose only tool raises, so a run dies after the model was paid for."""
+    agent: Agent[None, str] = Agent(model=model, capabilities=capabilities)
+
+    @agent.tool_plain
+    def boom() -> str:
+        raise RuntimeError("boom")
+
+    return agent
+
+
+@dataclass
+class _HookProbe(AbstractCapability[Any]):
+    """Records every hook pydantic-ai fires on it, in order."""
+
+    calls: list[str] = field(default_factory=list)
+
+    async def wrap_run(
+        self, ctx: RunContext[Any], *, handler: WrapRunHandler
+    ) -> AgentRunResult[Any]:
+        """Record that the run reached this capability, then run it."""
+        self.calls.append("wrap_run")
+        return await handler()
+
+    async def before_node_run(
+        self, ctx: RunContext[Any], *, node: AgentNode[Any]
+    ) -> AgentNode[Any]:
+        """Record a node boundary and pass the node through untouched."""
+        self.calls.append("before_node_run")
+        return node
+
+    async def on_run_error(
+        self, ctx: RunContext[Any], *, error: BaseException
+    ) -> AgentRunResult[Any]:
+        """Record the error hook, then re-raise unchanged."""
+        self.calls.append("on_run_error")
+        raise error
+
+
+@dataclass
+class _UsageProbe(AbstractCapability[Any]):
+    """Captures the run's own usage accumulator, as the run itself will spend through it."""
+
+    seen: list[tuple[RunUsage, int]] = field(default_factory=list)
+
+    async def wrap_run(
+        self, ctx: RunContext[Any], *, handler: WrapRunHandler
+    ) -> AgentRunResult[Any]:
+        """Record the accumulator the graph made for this run, and its total right now.
+
+        The total is snapshotted here rather than read back later: the run spends THROUGH
+        this very object — that is what makes it the fold's anchor — so it is non-zero by
+        the time the assertions run.
+        """
+        self.seen.append((ctx.usage, ctx.usage.total_tokens))
+        return await handler()
+
+
+async def test_it_mounts_on_a_bare_agent_and_counts_its_runs() -> None:
+    """It needs nothing from ReactAgent: one instance, one bare Agent, two runs (AC #1, #5).
+
+    Lifetime state must survive run boundaries, which is why the class does NOT override
+    ``for_run``: pydantic-ai's default hands back ``self``, so both runs land on the same
+    counters. Reintroduce a ``for_run`` returning a copy and both totals fall back to one
+    run's worth.
+    """
+    budget = _budget(agent_request_limit=5)
+    agent: Agent[None, str] = Agent(model=_answering_model(10, 5), capabilities=[budget])
+
+    await agent.run("first")
+    await agent.run("second")
+
+    assert budget.run_count == 2
+    assert budget.usage.total_tokens == 30
+
+
+async def test_a_spent_run_budget_refuses_the_run() -> None:
+    """The N+1 run is refused with the documented message (AC #2b)."""
+    budget = _budget(agent_request_limit=2)
+    agent: Agent[None, str] = Agent(model=_answering_model(), capabilities=[budget])
+
+    await agent.run("first")
+    await agent.run("second")
+    with pytest.raises(AgentUsageLimitError) as exc_info:
+        await agent.run("third")
+
+    assert str(exc_info.value) == "Exceeded the agent_request_limit of 2 (run_count=2)"
+
+
+async def test_the_rejection_itself_consumes_nothing() -> None:
+    """The counter reports runs CONSUMED, never runs attempted (AC #3).
+
+    Two refusals in a row, and the message is byte-identical both times: an increment on
+    the rejection path would make the second read ``run_count=2`` and the counter would
+    drift every time a caller retried.
+    """
+    budget = _budget(agent_request_limit=1)
+    agent: Agent[None, str] = Agent(model=_answering_model(), capabilities=[budget])
+
+    await agent.run("the only run")
+    messages = []
+    for _ in range(2):
+        with pytest.raises(AgentUsageLimitError) as exc_info:
+            await agent.run("refused")
+        messages.append(str(exc_info.value))
+
+    assert budget.run_count == 1
+    assert messages == ["Exceeded the agent_request_limit of 1 (run_count=1)"] * 2
+
+
+async def test_a_spent_token_budget_refuses_the_run() -> None:
+    """The token half refuses too, carrying pydantic-ai's own wording (AC #2a)."""
+    budget = _budget(total_tokens_limit=100)
+    agent: Agent[None, str] = Agent(model=_answering_model(40, 20), capabilities=[budget])
+
+    await agent.run("first")
+    await agent.run("second")
+    with pytest.raises(AgentUsageLimitError) as exc_info:
+        await agent.run("third")
+
+    assert budget.usage.total_tokens == 120
+    assert str(exc_info.value).startswith(
+        "Exceeded the total_tokens_limit of 100 (total_tokens=120)"
+    )
+
+
+async def test_a_token_rejection_consumes_no_run_budget() -> None:
+    """The two gates are independent, which is why tokens are checked first (AC #2).
+
+    A token refusal that also burned a unit of ``agent_request_limit`` would let repeated
+    refusals shrink an unrelated budget.
+    """
+    budget = _budget(agent_request_limit=5, total_tokens_limit=100)
+    agent: Agent[None, str] = Agent(model=_answering_model(150), capabilities=[budget])
+
+    await agent.run("first")
+    for _ in range(2):
+        with pytest.raises(AgentUsageLimitError):
+            await agent.run("refused on tokens")
+
+    assert budget.run_count == 1
+
+
+async def test_the_counter_advances_before_the_wrapped_call_executes() -> None:
+    """A run that fails partway has already been counted (AC #3).
+
+    Check-then-consume: move the increment after ``handler()`` and a run that dies in a
+    tool costs the agent nothing, so a failing loop never exhausts its lifetime budget.
+    """
+    budget = _budget(agent_request_limit=3)
+    agent = _agent_whose_tool_raises(_spending_tool_caller(0, 0), [budget])
+
+    with pytest.raises(RuntimeError, match="boom"):
+        await agent.run("dies in the tool")
+
+    assert budget.run_count == 1
+
+
+async def test_an_unset_run_limit_never_blocks_but_still_counts() -> None:
+    """``agent_request_limit=None`` (the default) blocks nothing and still counts (AC #3)."""
+    budget = _budget()
+    assert budget.limits.agent_request_limit is None
+    agent: Agent[None, str] = Agent(model=_answering_model(), capabilities=[budget])
+
+    for _ in range(4):
+        await agent.run("unbounded")
+
+    assert budget.run_count == 4
+
+
+async def test_a_failed_run_still_folds_what_it_burned() -> None:
+    """Tokens a failed run burned are still counted — the provider billed them (AC #4).
+
+    This is also what pins the fold's anchor. ``wrap_run``'s ``ctx.usage`` is
+    ``GraphAgentState.usage``, which the graph only ever mutates in place, so it carries
+    the run's real cost out through the ``finally`` even though the run has no result to
+    read usage off. An anchor that were a snapshot instead would fold zero here, silently.
+    """
+    budget = _budget(total_tokens_limit=1000)
+    agent = _agent_whose_tool_raises(_spending_tool_caller(40, 20), [budget])
+
+    with pytest.raises(RuntimeError, match="boom"):
+        await agent.run("spend, then fail")
+
+    assert budget.usage.total_tokens == 60
+
+
+async def test_the_accumulator_is_never_the_runs_own_budget_object() -> None:
+    """The lifetime total is folded into, never handed to, the run (AC #4).
+
+    Making the accumulator the object the run spends through raises nothing and logs
+    nothing: it would check the RUN tier's limits against lifetime totals, turning every
+    per-run cap into a lifetime one. Asserted on identity, and on the run starting at zero
+    when the lifetime total is already non-zero.
+    """
+    budget = _budget()
+    probe = _UsageProbe()
+    agent: Agent[None, str] = Agent(model=_answering_model(100, 50), capabilities=[budget, probe])
+
+    await agent.run("first")
+    await agent.run("second")
+
+    assert budget.usage.total_tokens == 300
+    # Non-zero lifetime total by the second run, so "the run starts at zero" is a real
+    # claim there rather than a tautology.
+    assert [total_at_handover for _, total_at_handover in probe.seen] == [0, 0]
+    assert all(usage is not budget.usage for usage, _ in probe.seen)
+
+
+async def test_a_refused_run_reaches_no_downstream_capability() -> None:
+    """A spent agent is refused before anything downstream runs (AC #9).
+
+    The property the position buys, and the reason the budget is mounted outermost: every
+    inner capability — including, once compaction joins the stack, the one that pays for a
+    summarizer LLM call — is downstream of this refusal.
+
+    It is a property of the ORDER, not of the class. Nothing pins the budget outermost:
+    pydantic-ai re-sorts the whole chain topologically as soon as any capability declares
+    ``get_ordering()``, so a caller declaring ``position='outermost'`` legitimately lands
+    ahead of it. Swap the two list entries below and this test goes red.
+    """
+    budget = _budget(agent_request_limit=1)
+    probe = _HookProbe()
+    agent: Agent[None, str] = Agent(model=_answering_model(), capabilities=[budget, probe])
+
+    await agent.run("the only run")
+    assert probe.calls, "the probe saw nothing even on the admitted run"
+    probe.calls.clear()
+
+    with pytest.raises(AgentUsageLimitError):
+        await agent.run("refused")
+
+    assert probe.calls == []
+
+
+def test_seeding_assigns_rather_than_accumulates() -> None:
+    """Restore seeding is assignment: idempotent, and a shorter stream lowers it (AC #6).
+
+    Driven above zero first, so an ``incr`` and a ``max(...)`` high-water mark both go red
+    rather than passing on an untouched fresh instance.
+    """
+    budget = _budget(agent_request_limit=10)
+    budget.seed(run_count=3, usage=RunUsage(input_tokens=30, output_tokens=15))
+    assert (budget.run_count, budget.usage.total_tokens) == (3, 45)
+
+    budget.seed(run_count=3, usage=RunUsage(input_tokens=30, output_tokens=15))
+    assert (budget.run_count, budget.usage.total_tokens) == (3, 45), "seeding accumulated"
+
+    budget.seed(run_count=1, usage=RunUsage(input_tokens=10, output_tokens=5))
+    assert (budget.run_count, budget.usage.total_tokens) == (1, 15), (
+        "a shorter stream did not lower it"
+    )
+
+
+async def test_a_seeded_budget_is_what_the_next_run_is_enforced_against() -> None:
+    """Seeded values are enforced, not merely stored (AC #6, #8)."""
+    budget = _budget(agent_request_limit=2)
+    agent: Agent[None, str] = Agent(model=_answering_model(), capabilities=[budget])
+    budget.seed(run_count=2, usage=RunUsage())
+
+    with pytest.raises(AgentUsageLimitError) as exc_info:
+        await agent.run("one run too many")
+
+    assert str(exc_info.value) == "Exceeded the agent_request_limit of 2 (run_count=2)"
+
+
+def test_it_does_not_override_for_run() -> None:
+    """The default ``for_run`` (return ``self``) is what keeps the counters alive (AC #5).
+
+    ``EventSourcingCapability`` overrides it because its cursor is per-run; this state is
+    per-AGENT. A per-run copy would reset both counters every run and the limit would never
+    fire — with no error and no log line. Asserted structurally as well as behaviourally
+    because the behavioural failure is quiet.
+    """
+    assert LifetimeBudgetCapability.for_run is AbstractCapability.for_run
+
+
+# ---------------------------------------------------------------------------
+# Story 24.2 — the fold anchor: a write to ``wrap_run``'s ``ctx.messages``
+# ---------------------------------------------------------------------------
+
+
+def _history_recording_model(seen: list[list[ModelMessage]]) -> FunctionModel:
+    """A model that records the history list it is handed, then answers with one TextPart."""
+
+    def model_fn(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        seen.append(list(messages))
+        return ModelResponse(parts=[TextPart(content="ok")])
+
+    return FunctionModel(model_fn)
+
+
+@dataclass
+class _RewriteHistoryInWrapRun(AbstractCapability[Any]):
+    """Replace the run's history in ``wrap_run``, before ``handler()`` — the fold's shape."""
+
+    replacement: list[ModelMessage] = field(default_factory=list)
+
+    async def wrap_run(
+        self, ctx: RunContext[Any], *, handler: WrapRunHandler
+    ) -> AgentRunResult[Any]:
+        """Mirror ``replacement`` onto the run's live list, in place, then run."""
+        ctx.messages[:] = self.replacement
+        return await handler()
+
+
+async def test_a_wrap_run_write_to_ctx_messages_reaches_the_model() -> None:
+    """A pre-``handler()`` write to ``ctx.messages`` IS the run's history (Story 24.2 Task 1).
+
+    The premise ``CompactionCapability``'s fold rests on, proven rather than inherited.
+    Epic 23 established that ``wrap_run``'s ``ctx.messages`` is *frozen* — but frozen means
+    it stops tracking the run's later growth, not that it is a detached copy. In
+    pydantic-ai 2.27.1 ``build_run_context`` passes ``messages=ctx.state.message_history``
+    (``_agent_graph.py:2285``) — the same list object, no copy — and ``wrap_run`` is invoked
+    with that context (``agent/__init__.py:1767``). ``UserPromptNode.run`` then *reads* that
+    object at ``_agent_graph.py:530`` (``messages[:] = _clean_message_history(
+    ctx.state.message_history)``) before rebinding ``state`` to the normalised copy at
+    ``:532``. So a write performed BEFORE ``handler()`` lands in the list line 530
+    normalises; only a write performed after it is lost.
+
+    Asserted on what the MODEL received, not on what ``ctx.messages`` held afterwards:
+    line 530 also normalises, so the two are not the same claim.
+    """
+    seen: list[list[ModelMessage]] = []
+    replacement: list[ModelMessage] = [
+        ModelRequest(parts=[UserPromptPart(content="[Conversation summary] folded")]),
+    ]
+    agent: Agent[None, str] = Agent(
+        model=_history_recording_model(seen),
+        capabilities=[_RewriteHistoryInWrapRun(replacement=list(replacement))],
+    )
+    history: list[ModelMessage] = [
+        ModelRequest(parts=[UserPromptPart(content="a long earlier question")]),
+        ModelResponse(parts=[TextPart(content="a long earlier answer")]),
+    ]
+
+    await agent.run("next question", message_history=history)
+
+    assert seen, "the model was never called"
+    contents = [
+        p.content
+        for m in seen[0]
+        if isinstance(m, ModelRequest)
+        for p in m.parts
+        if isinstance(p, UserPromptPart)
+    ]
+    assert "[Conversation summary] folded" in contents, "the wrap_run write never reached the run"
+    assert "a long earlier question" not in contents, "the replaced history came back"
+
+
+async def test_a_wrap_run_rebind_of_ctx_messages_does_NOT_reach_the_model() -> None:
+    """Rebinding the name instead of mutating the list is the mutation that loses the fold.
+
+    ``ctx.messages = folded`` looks identical at the call site and is silently inert: the
+    graph holds the original list object, so the run proceeds on the unfolded history. This
+    is why ``CompactionCapability`` mirrors with ``ctx.messages[:] = …`` and why that slice
+    assignment is load-bearing rather than stylistic.
+    """
+    seen: list[list[ModelMessage]] = []
+
+    @dataclass
+    class _RebindHistory(AbstractCapability[Any]):
+        async def wrap_run(
+            self, ctx: RunContext[Any], *, handler: WrapRunHandler
+        ) -> AgentRunResult[Any]:
+            ctx.messages = [ModelRequest(parts=[UserPromptPart(content="never seen")])]
+            return await handler()
+
+    agent: Agent[None, str] = Agent(
+        model=_history_recording_model(seen), capabilities=[_RebindHistory()]
+    )
+    history: list[ModelMessage] = [
+        ModelRequest(parts=[UserPromptPart(content="a long earlier question")]),
+        ModelResponse(parts=[TextPart(content="a long earlier answer")]),
+    ]
+
+    await agent.run("next question", message_history=history)
+
+    contents = [
+        p.content
+        for m in seen[0]
+        if isinstance(m, ModelRequest)
+        for p in m.parts
+        if isinstance(p, UserPromptPart)
+    ]
+    assert "never seen" not in contents
+    assert "a long earlier question" in contents
+
+
+# ---------------------------------------------------------------------------
+# Story 24.2 — CompactionCapability, mounted on a bare Agent
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _RecordingStrategy:
+    """A ``CompactionStrategy`` recording its calls and returning a fixed result."""
+
+    result: CompactionResult
+    calls: int = 0
+    seen: list[list[ModelMessage]] = field(default_factory=list)
+
+    async def compact(self, messages: list[ModelMessage]) -> CompactionResult:
+        """Record the history handed over, then return the configured result."""
+        self.calls += 1
+        self.seen.append(list(messages))
+        return self.result
+
+
+def _compaction_event(result: CompactionResult) -> LlmContextCompactedEvent:
+    """The ``event_factory`` a bare mount supplies; ``ReactAgent`` passes its own."""
+    return LlmContextCompactedEvent(
+        run_id=None,
+        strategy_id="summarize",
+        summary=result.summary,
+        replaced_message_count=result.replaced_message_count,
+        summarizer_prompt_version="v1",
+        tokens_before=None,
+        tokens_after=result.tokens_after,
+    )
+
+
+def _compactor(
+    strategy: _RecordingStrategy, context: ContextManager, threshold: int | None
+) -> CompactionCapability:
+    """A ``CompactionCapability`` armed at ``threshold`` (``None`` ⇒ compaction off)."""
+    return CompactionCapability(
+        strategy=strategy,
+        context=context,
+        threshold_fn=lambda: threshold,
+        event_factory=_compaction_event,
+    )
+
+
+def _seeded_context(used: int | None) -> tuple[ContextManager, EventCapture]:
+    """A context carrying two messages and a provider-reported ``last_input_tokens``."""
+    context, capture = _manager_with_capture()
+    context.add_message(ModelRequest(parts=[UserPromptPart(content="earlier question")]))
+    context.add_message(ModelResponse(parts=[TextPart(content="earlier answer")]))
+    context._last_input_tokens = used
+    return context, capture
+
+
+async def test_it_mounts_on_a_bare_agent_and_folds_above_the_threshold() -> None:
+    """It needs nothing from ReactAgent: one instance, one bare Agent, one fold (AC #1, #2)."""
+    context, _ = _seeded_context(used=900)
+    strategy = _RecordingStrategy(CompactionResult("S", 2))
+    agent: Agent[None, str] = Agent(
+        model=TestModel(), capabilities=[_compactor(strategy, context, threshold=850)]
+    )
+
+    await agent.run("next", message_history=context.messages)
+
+    assert strategy.calls == 1
+
+
+async def test_compaction_off_never_fires_however_large_the_history() -> None:
+    """``threshold_fn()`` returning None means compaction is off — a no-op (AC #2)."""
+    context, _ = _seeded_context(used=10_000_000)
+    strategy = _RecordingStrategy(CompactionResult("S", 2))
+    agent: Agent[None, str] = Agent(
+        model=TestModel(), capabilities=[_compactor(strategy, context, threshold=None)]
+    )
+
+    await agent.run("next", message_history=context.messages)
+
+    assert strategy.calls == 0
+
+
+async def test_no_usage_reported_never_mis_fires() -> None:
+    """``last_input_tokens is None`` is missing data, not a small number (AC #2).
+
+    Treating it as zero would be safe; treating it as "unknown, so fold" would run a
+    summarizer on every first turn of every agent whose provider reports no usage.
+    """
+    context, _ = _seeded_context(used=None)
+    strategy = _RecordingStrategy(CompactionResult("S", 2))
+    agent: Agent[None, str] = Agent(
+        model=TestModel(), capabilities=[_compactor(strategy, context, threshold=850)]
+    )
+
+    await agent.run("next", message_history=context.messages)
+
+    assert strategy.calls == 0
+
+
+async def test_usage_exactly_at_the_threshold_does_not_fire() -> None:
+    """Strictly above fires; at the threshold does not (AC #2)."""
+    context, _ = _seeded_context(used=850)
+    strategy = _RecordingStrategy(CompactionResult("S", 2))
+    agent: Agent[None, str] = Agent(
+        model=TestModel(), capabilities=[_compactor(strategy, context, threshold=850)]
+    )
+
+    await agent.run("next", message_history=context.messages)
+
+    assert strategy.calls == 0
+
+
+async def test_a_zero_replacement_result_writes_nothing_at_all() -> None:
+    """Nothing to compact ⇒ no event, no fold, no synthetic summary (AC #3)."""
+    context, capture = _seeded_context(used=900)
+    strategy = _RecordingStrategy(CompactionResult("", 0))
+    capability = _compactor(strategy, context, threshold=850)
+    before = context.messages
+
+    status = await capability.compact_now()
+
+    assert status == "Nothing to compact."
+    assert strategy.calls == 1
+    assert context.messages == before
+    assert [e for e in capture.events if isinstance(e, LlmContextCompactedEvent)] == []
+
+
+async def test_the_fold_writes_both_histories_and_they_agree() -> None:
+    """The durable write and the live write are one operation (AC #3, #4).
+
+    Both are needed and neither implies the other: ``Agent.run()`` seeds the run's state
+    from a copy of the history it is handed, so mutating the run's list never reaches
+    ``ContextManager`` and folding ``ContextManager`` never reaches the run. Dropping
+    either write turns this red — the live list stops matching the durable one, or the
+    durable one is never folded at all.
+    """
+    context, capture = _seeded_context(used=900)
+    strategy = _RecordingStrategy(CompactionResult("the summary", 2))
+    capability = _compactor(strategy, context, threshold=850)
+    live: list[ModelMessage] = context.messages
+
+    status = await capability.compact_now(live)
+
+    assert status == "Compacted: replaced 2 earlier message(s) with a summary."
+    assert live == context.messages
+    assert len([e for e in capture.events if isinstance(e, LlmContextCompactedEvent)]) == 1
+    contents = [
+        p.content
+        for m in live
+        if isinstance(m, ModelRequest)
+        for p in m.parts
+        if isinstance(p, UserPromptPart)
+    ]
+    assert contents == ["[Conversation summary] the summary"]
+
+
+async def test_the_model_receives_exactly_the_post_fold_durable_history() -> None:
+    """The run's next model request and the durable history are byte-identical (AC #4).
+
+    The whole reason both writes exist, asserted against what the MODEL was handed rather
+    than against ``ctx.messages``: ``UserPromptNode`` normalises the folded list before the
+    request is built, so the two are not the same claim. Drop the live write and the model
+    sees the unfolded history; drop the durable write and ``context.messages`` still holds
+    it.
+
+    **Asserted at PART level, deliberately.** A message-level slice comparison cannot express
+    this claim here and is silently vacuous if written: ``_clean_message_history`` merges
+    consecutive ``ModelRequest``s, so the folded summary request and the run's own prompt
+    arrive as ONE message. ``seen[0]`` is therefore length 1, and any
+    ``seen[0][:-1] == context.messages[:len(seen[0]) - 1]`` form reduces to ``[] == []`` —
+    green under every mutation. The parts survive the merge intact, so they are what carries
+    the identity claim.
+    """
+    seen: list[list[ModelMessage]] = []
+    context, _ = _seeded_context(used=900)
+    strategy = _RecordingStrategy(CompactionResult("the summary", 2))
+    agent: Agent[None, str] = Agent(
+        model=_history_recording_model(seen),
+        capabilities=[_compactor(strategy, context, threshold=850)],
+    )
+
+    await agent.run("next question", message_history=context.messages)
+
+    assert seen, "the model was never called"
+    # Every part of the durable history reached the model, in order and unaltered, ahead of
+    # the run's own prompt — which is the byte-identity claim, stated where the merge cannot
+    # hide it.
+    durable_parts = [p for m in context.messages for p in m.parts]
+    seen_parts = [p for m in seen[0] for p in m.parts]
+    assert durable_parts, "the durable history was never folded"
+    assert seen_parts[: len(durable_parts)] == durable_parts
+    assert len(seen_parts) == len(durable_parts) + 1, "only the run's own prompt was added"
+    folded = [
+        p.content
+        for m in seen[0]
+        if isinstance(m, ModelRequest)
+        for p in m.parts
+        if isinstance(p, UserPromptPart)
+    ]
+    assert folded[0] == "[Conversation summary] the summary"
+    assert "earlier question" not in folded
+
+
+def test_it_does_not_override_for_run_either() -> None:
+    """No per-run state, so the default ``for_run`` (return ``self``) is correct (AC #1).
+
+    ``wrap_run`` fires once per run by construction and the gate re-reads
+    ``context.last_input_tokens`` every time, so there is nothing a per-run copy would
+    protect — and nothing a shared instance can leak between runs.
+    """
+    assert CompactionCapability.for_run is AbstractCapability.for_run

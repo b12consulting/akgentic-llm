@@ -331,11 +331,11 @@ class RunUsageLimits(TokenUsageLimits):
 class AgentUsageLimits(TokenUsageLimits):
     """Agent-lifetime usage budget: bounds an agent across every run it performs.
 
-    Both this tier's limits are enforced by pre-flight checks in ReactAgent.run(),
-    against counters ReactAgent accumulates over its whole lifetime (and reseeds from
-    replayed usage events on restore). Breaching either raises AgentUsageLimitError,
-    a subclass of UsageLimitError, with pydantic-ai's own message text. The run tier
-    raises a different subclass, so the two are told apart by class.
+    Both this tier's limits are enforced pre-flight by LifetimeBudgetCapability, which
+    owns the counters, accumulates them across every run the agent performs and is
+    reseeded from replayed usage events on restore. Breaching either raises
+    AgentUsageLimitError, a subclass of UsageLimitError, with pydantic-ai's own message
+    text. The run tier raises a different subclass, so the two are told apart by class.
 
     agent_request_limit is consumed BEFORE the call executes, so a run that fails
     partway still counts.

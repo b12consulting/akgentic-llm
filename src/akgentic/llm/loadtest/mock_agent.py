@@ -65,13 +65,20 @@ class MockReactAgent:
             capabilities: Accepted and ignored, mirroring the ``event_loop``
                 accept-and-ignore pattern below — the mock never builds a
                 ``pydantic_ai.Agent``, so there is nothing to forward this to.
-                Ignoring it stays honest parity even though ``ReactAgent`` now
-                mounts two internal capabilities of its own: what
-                ``EventSourcingCapability`` does for a real run — hand every
+                None of the four ``ReactAgent`` mounts has a client to be here:
+                what ``EventSourcingCapability`` does for a real run — hand every
                 message to ``ContextManager.add_message()`` — this class already
                 does directly from ``_emit_request`` / ``_emit_tool_call`` /
                 ``_emit_tool_return`` / ``_emit_final_response``, so it is its own
-                event source rather than a client of one.
+                event source rather than a client of one; ``HealingCapability``
+                has nothing to heal, a replayed turn never leaving a tool call
+                dangling; and ``CompactionCapability``'s gate reads
+                provider-reported input tokens, which every response emitted here
+                reports as ``RequestUsage()`` — zero, so the gate cannot arm.
+                ``LifetimeBudgetCapability`` is the one real divergence: no
+                agent-lifetime budget is enforced here, so an
+                ``agent_request_limit`` that stops the real class after N runs
+                does not stop the mock.
             event_loop: Deprecated — accepted and ignored. The mock creates and
                 owns its own loop (``self._loop``) for drop-in parity with
                 ``ReactAgent``; the passed loop is neither adopted nor used by
@@ -166,8 +173,9 @@ class MockReactAgent:
         as a ``run()`` would consume it. That is the honest mirror — a conclusion is
         a real turn, not a peek.
 
-        No usage-limit exception is defined or raised here; the tier classes live in
-        ``akgentic.llm.agent`` and there is exactly one definition of each.
+        No usage-limit exception is defined or raised here: there is exactly one
+        definition of each tier class — in ``akgentic.llm.capabilities``, re-exported
+        from ``akgentic.llm.agent`` — and none of them is here.
         """
         return await self._replay(reason, deps, output_type, with_tools=False)
 
