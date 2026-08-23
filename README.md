@@ -586,10 +586,16 @@ callers can stop passing it without a flag day.
 
 `capabilities` is an optional constructor argument on `ReactAgent` (accepted-and-ignored on
 `MockReactAgent`) — a sequence of pydantic-ai `AgentCapability` instances. They are **not**
-forwarded unchanged: `ReactAgent` mounts two internal capabilities of its own first and appends
+forwarded unchanged: `ReactAgent` mounts four internal capabilities of its own first and appends
 yours after them, so the wrapped `Agent(...)` always receives
-`[EventSourcingCapability, HealingCapability, *(capabilities or [])]`. The stack is never `[]`,
-even when the argument is omitted — those two are how every run persists its messages and closes
+
+```python
+[LifetimeBudgetCapability, CompactionCapability, EventSourcingCapability, HealingCapability,
+ *(capabilities or [])]
+```
+
+The stack is never `[]`, even when the argument is omitted — those four are how every run
+enforces the agent-lifetime budget, folds an over-long history, persists its messages and closes
 out its dangling tool calls. See [Run-loop capabilities](#run-loop-capabilities) below.
 
 **Why it exists.** [Context Compaction](#context-compaction) and
@@ -607,9 +613,11 @@ transformation use case ADR-011 names:
 
 **Write the processor to be idempotent.** It runs on **every model request**, not once per
 run, so an unconditional prepend stacks one block per step within a single run. Injected
-content is also durable — it lands in the history the run persists — so on a first run the
-block is recorded like any other message, and an unguarded prepend would then sit on top of
-the copy already persisted. Guard the injection on what is already there, as below.
+content is also persisted, but **asymmetrically**: on the first run there is no recorded tail
+yet, so the block falls inside the window the persistence sweep covers and *is* recorded like
+any other message; from the second run on it is prepended *ahead* of the recorded tail and is
+*not*. Either way, an unguarded prepend would sit on top of the copy already persisted. Guard
+the injection on what is already there, as below.
 
 ```python
 from pydantic_ai.capabilities import ProcessHistory
@@ -642,10 +650,12 @@ Prepending is also the only safe direction: pydantic-ai rejects a processed list
 or does not end with a `ModelRequest`.
 
 **Ordering caveats — none is guessable from the signature:**
-- A capability's `before_model_request` hook runs **after** compaction: `ContextManager`
-  rewrites messages first, the result is passed as `message_history`, and only then does the
-  capability chain run. A capability sees only the **post-compaction** history — it never sees
-  what compaction folded away.
+- A capability's `before_model_request` hook runs **after** compaction. The promise holds, but
+  not by the mechanism it once did: the fold is no longer performed by `ReactAgent` ahead of the
+  run. It happens in `CompactionCapability.wrap_run`'s **head**, and that `wrap_run` encloses
+  every hook a caller capability has. So a capability still sees only the **post-compaction**
+  history and never what compaction folded away — because it is mounted *inside* the fold, not
+  because the fold ran before the run started.
 - A capability that orphans a tool call/return pair — e.g. by splitting one while injecting
   content — is **not** left broken. pydantic-ai's own dangling-tool-call repair
   (`_agent_graph._clean_message_history` with `repair_last_response=True`) runs on the model
@@ -656,7 +666,7 @@ or does not end with a `ModelRequest`.
   This is pydantic-ai's internal pipeline behaviour, **not a documented public guarantee**, and
   it could change in a future release — a capability should still avoid orphaning tool calls on
   purpose.
-- Your capabilities sit **inside** the two internal ones — unless one of them declares its own
+- Your capabilities sit **inside** the four internal ones — unless one of them declares its own
   ordering constraints, see [Run-loop capabilities](#run-loop-capabilities) — so `before_*` hooks
   fire after theirs and `after_*` hooks before theirs. Your durable `after_*` edits are what gets
   persisted: `EventSourcingCapability`'s closing sweep lives in `wrap_run`'s `finally`, outside
@@ -664,30 +674,65 @@ or does not end with a `ModelRequest`.
 
 ### Run-loop capabilities
 
-`ReactAgent` does not implement persistence or error recovery in its run method. Both are
-standalone pydantic-ai capabilities, exported from `akgentic.llm`, and each is mountable on a
-bare `Agent` of your own:
+`ReactAgent` does not implement the lifetime budget, compaction, persistence or error recovery
+in its run method. All four are standalone pydantic-ai capabilities, exported from
+`akgentic.llm`, and each is mountable on a bare `Agent` of your own:
 
 | Class | Owns | Hook anchors |
 |---|---|---|
+| `LifetimeBudgetCapability(limits=…)` | The agent-**lifetime** budget — one run count and three token caps. Refuses a spent agent before the wrapped run does anything, then folds what the run burned into the lifetime total | `wrap_run`'s head (both refusals — the only enforcement site), `wrap_run`'s `finally` (the usage fold, so tokens a *failed* run burned still count) |
+| `CompactionCapability(strategy=…, context=…, threshold_fn=…, event_factory=…)` | Folds the conversation when provider-reported input tokens cross the armed threshold, applying the result to `ContextManager` **and** to the run's own history | `wrap_run`'s head — once per run by construction: it keeps no per-run state and overrides no `for_run` |
 | `EventSourcingCapability(context=…)` | Hands every message a run produces to `ContextManager.add_message()`, exactly once, in run order; records the run's system-prompt rendering | `after_node_run` (steady state, keeps emission incremental), `before_node_run` (re-anchors the live history), `wrap_run`'s `finally` (closing sweep + system-prompt recording) |
 | `HealingCapability(context=…)` | Appends one `ToolReturnPart` per tool call left dangling by a failed run, so the *next* run is not rejected for unprocessed tool calls | `on_run_error` — it always re-raises the original exception, never returns to recover |
 
-**Ordering.** The stack is `[EventSourcingCapability, HealingCapability, *yours]`, and the
-**first capability is the outermost**: `before_*` hooks fire in list order, `after_*` in reverse,
-and `wrap_run`s nest with the first wrapping all the rest. Assembling your own stack, keep the
-same shape — the persistence you rely on is the outer layer, not a peer of your own hooks. Note
-that the guarantee in the caveat above holds regardless of list position, because the closing
-sweep sits in `wrap_run`'s `finally` rather than in a node hook.
+**Ordering.** The stack is
+`[LifetimeBudgetCapability, CompactionCapability, EventSourcingCapability, HealingCapability,
+*yours]`, and the **first capability is the outermost**: `before_*` hooks fire in list order,
+`after_*` in reverse, and `wrap_run`s nest with the first wrapping all the rest. Each position
+earns its place, and they are not equally load-bearing:
 
-List position is not the last word, though. If **any** capability in the chain declares
+- **Budget outermost.** Every inner capability and every model request is downstream of its
+  `wrap_run` head, so a refusal there is the only one that costs nothing. Concretely: a
+  lifetime-spent agent is refused *before* compaction pays for a summarizer LLM call. This is
+  the one coupling that genuinely depends on list position — moving compaction ahead of the
+  budget is observable in the test suite.
+- **Compaction before event sourcing.** The persistence cursor opens on the post-fold history,
+  so the synthetic summary request sits behind it and is never re-persisted as an
+  `LlmMessageEvent` (which would double-apply it on replay, since
+  `LlmContextCompactedEvent` already carries the summary). Be clear about the strength of this
+  one: it is **belt-and-braces, not the mechanism**. `EventSourcingCapability` re-opens its
+  cursor against the normalised list at the first node hook, which absorbs a fold performed
+  anywhere ahead of it — swapping the two leaves the behaviour unchanged.
+- **Internal before caller.** Because the chain unwinds in reverse, a caller capability's
+  `after_*` hooks run *before* the persistence sweep, so its durable edits are the ones
+  persisted.
+- **Healing last of the internals.** Error hooks fire after `wrap_run` has unwound, so the
+  dangling `ModelResponse` is already persisted by the time the healer looks for it. That is
+  structural rather than positional.
+
+**The order is a default, not a guarantee.** If **any** capability in the chain declares
 `get_ordering()` — a fixed `position`, or a `wraps=` / `wrapped_by=` constraint — pydantic-ai
 topologically re-sorts the whole chain to satisfy it, keeping the given order only as a
-tiebreaker. Neither class here declares one, so the shipped stack is the list above; a caller
-capability that declares `position='outermost'` moves itself ahead of both. Persistence survives
-that (same reason as above). `on_run_error` precedence does not: pydantic-ai walks that hook
-from the innermost capability outwards, and this package states no contract today about a
-recovering capability pre-empting `HealingCapability`.
+tiebreaker. None of the four declares one, so the shipped stack is the list above; a caller
+capability that declares `position='outermost'` lands ahead of all four, whatever the list says.
+What survives that and what does not:
+
+- **Persistence survives any ordering.** The closing sweep is in `wrap_run`'s `finally`, outside
+  every capability's node hooks, so durable `after_*` edits are always the ones persisted.
+- **`on_run_error` precedence does not**, and is **deliberately uncontracted**. pydantic-ai walks
+  that hook from the innermost capability outwards, and this package states no contract about a
+  recovering capability pre-empting `HealingCapability`. Pinning the budget outermost by
+  declaring an ordering would be a behavioural change owed its own decision, so none of the four
+  does it.
+
+**Compaction writes twice, as one operation.** When the gate arms, `CompactionCapability` applies
+the fold to `ContextManager` *and* mirrors the result into the run's own history list, in one
+method. Both writes are needed because `Agent.run()` seeds the run's state from a **copy** of the
+history it is handed: mutating the run's list never reaches `ContextManager`, and folding
+`ContextManager` never reaches the run. The second write **mirrors** the first rather than folding
+again — a second fold would double-fold, and mirroring preserves message *identity*, which the
+persistence sweep's tail anchor locates by. `ReactAgent.compact()` reaches the same method with no
+live list, since there is no run in flight on that path.
 
 **Durable state only.** Persist from `RunContext.messages` **inside a node hook**. Never from
 `ModelRequestContext.messages` mid-chain: that request copy legitimately carries other
@@ -725,11 +770,32 @@ assert context.messages == list(result.all_messages())
 assert recorder.messages == context.messages
 ```
 
-**The event API is unchanged.** This decomposition moved *where* persistence lives, not what it
-emits: the same seven event types (`LlmMessageEvent`, `ToolCallEvent`, `ToolReturnEvent`,
-`LlmUsageEvent`, `LlmSystemPromptEvent`, `LlmContextCompactedEvent`, `LlmContextClearedEvent`),
-the same payload shapes, the same per-message ordering (`LlmMessageEvent` → tool events →
-`LlmUsageEvent`). A consumer of this package's event stream has nothing to change.
+**A history processor must preserve message identity for messages it does not own.** That is a
+contract, not advice: the persistence sweep depends on it. The sweep bounds itself on the last
+message it recorded, located by **identity**, with a positional cursor as the fallback. A
+processor that *shifts* history (a prepend) moves that message without changing which object it
+is, and identity absorbs the shift; one that *rebuilds* history out of equal copies leaves
+positions intact, and the cursor absorbs the rebuild. Two edits defeat both at once, because each
+destroys the identity anchor **while** moving what sits behind it:
+
+- **rebuild plus prepend** — e.g. `[deepcopy(m) for m in messages]` with a block prepended —
+  re-persists an earlier run's `ModelResponse` as a copy, and emits a spurious extra
+  `LlmUsageEvent`;
+- **removing the anchor message itself** — an interior removal — silently drops later runs' own
+  `ModelRequest`s.
+
+Both are exactly the shape a **summarising or redacting** processor has. pydantic-ai's own
+layered equivalent reaches for `run_id` as a third layer here; this one has no third layer, and
+whether it owes one is an open decision, not a shipped guarantee. Until that is settled: prepend
+to the list you were handed, do not rebuild it.
+
+**The event API is unchanged** — across both the persistence decomposition and the later move of
+the lifetime budget and compaction into capabilities. Those changed *where* the concerns live,
+not what a run emits: the same seven event types (`LlmMessageEvent`, `ToolCallEvent`,
+`ToolReturnEvent`, `LlmUsageEvent`, `LlmSystemPromptEvent`, `LlmContextCompactedEvent`,
+`LlmContextClearedEvent`), the same payload shapes, the same per-message ordering
+(`LlmMessageEvent` → tool events → `LlmUsageEvent`), the same run-id correlation. A consumer of
+this package's event stream has nothing to change.
 
 **One behavioural difference, and it is the fix working.** The hand-rolled loop this replaces had
 a blind tail: messages a run appended after its last drain — a cancellation tail, or an
@@ -945,6 +1011,15 @@ any subscriber can fold the same change client-side.
 Compaction can fire **automatically** (usage-based: when the provider-reported input tokens
 cross `trigger_ratio × context_length`, no tokenizer required) or **on demand** via
 `ReactAgent.compact()` and `ReactAgent.clear_context()`.
+
+**Where the auto-trigger runs.** It is `CompactionCapability`'s `wrap_run` head — *inside* the
+run, before the run reads its history, and once per run by construction rather than by a guard.
+`ReactAgent` does not test the gate itself. The two manual paths are unchanged, and are
+deliberately **not** capabilities: `compact()` and `clear_context()` run outside any agent run,
+where a run-scoped hook has no purchase. `compact()` still reaches the same single fold site the
+auto path does, only with no run in flight. And because `conclude_without_tools()` goes through
+the same capability stack as `run()`, the gate fires for a tool-free conclusion exactly as it
+does for a normal turn.
 
 ### Compaction & Clear Events
 
