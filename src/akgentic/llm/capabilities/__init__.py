@@ -84,14 +84,22 @@ from .errors import (
 )
 from .event_sourcing import EventSourcingCapability
 from .healing import HealingCapability
+from .limit_recovery import (
+    DEFAULT_CONCLUSION_REASON,
+    ConclusionDecision,
+    LimitRecoveryCapability,
+)
 
 __all__ = [
+    "DEFAULT_CONCLUSION_REASON",
     "RUN_LIMIT_HEALING_MESSAGE",
     "AgentUsageLimitError",
     "CompactionCapability",
+    "ConclusionDecision",
     "EventSourcingCapability",
     "HealingCapability",
     "LifetimeBudgetCapability",
+    "LimitRecoveryCapability",
     "RunUsageLimitError",
     "UsageLimitError",
 ]

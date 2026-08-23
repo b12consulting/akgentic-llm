@@ -25,6 +25,7 @@ from pydantic_ai.messages import (
 )
 from pydantic_ai.usage import RequestUsage
 
+from akgentic.llm.capabilities import LimitRecoveryCapability
 from akgentic.llm.context import ContextManager
 from akgentic.llm.event import ContextObserver, LlmMessageEvent
 from akgentic.llm.loadtest.scenario import (
@@ -55,6 +56,7 @@ class MockReactAgent:
         observer: ContextObserver | None = None,
         capabilities: Sequence[AgentCapability[Any]] | None = None,
         event_loop: asyncio.AbstractEventLoop | None = None,
+        limit_recovery: LimitRecoveryCapability | None = None,
     ) -> None:
         """Mirror ``ReactAgent.__init__`` without building a model or provider.
 
@@ -83,6 +85,11 @@ class MockReactAgent:
                 owns its own loop (``self._loop``) for drop-in parity with
                 ``ReactAgent``; the passed loop is neither adopted nor used by
                 ``run_sync``.
+            limit_recovery: Accepted and ignored, mirroring ``capabilities`` above.
+                The mock raises no usage-limit error on any path — no run-tier
+                budget is enforced here at all — so there is no breach for a
+                recovery policy to decide about, and nothing to mirror beyond the
+                keyword itself.
         """
         # The mock owns its loop too (drop-in parity over the ReactAgent close
         # surface): build no client/model, so loop creation can go first. The

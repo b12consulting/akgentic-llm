@@ -71,6 +71,8 @@ def test_key_exports_present():
     assert hasattr(akgentic.llm, "CompactionCapability")
     assert hasattr(akgentic.llm, "EventSourcingCapability")
     assert hasattr(akgentic.llm, "HealingCapability")
+    assert hasattr(akgentic.llm, "LimitRecoveryCapability")
+    assert hasattr(akgentic.llm, "ConclusionDecision")
 
     # Prompts
     assert hasattr(akgentic.llm, "PromptTemplate")
@@ -154,7 +156,7 @@ def test_the_usage_limit_hierarchy_is_importable_from_both_modules():
 
 
 def test_every_public_capability_name_still_resolves_from_the_package():
-    """The eight public names stay importable from ``akgentic.llm.capabilities``.
+    """The eleven public names stay importable from ``akgentic.llm.capabilities``.
 
     ``capabilities`` is a package of one module per capability, so each name now reaches
     callers through a re-export in ``capabilities/__init__.py``. Dropping one of those lines
@@ -166,13 +168,29 @@ def test_every_public_capability_name_still_resolves_from_the_package():
     iterates ``__all__`` passes green when a name is dropped from the import and from
     ``__all__`` in the same edit — which is exactly the edit that breaks callers.
 
+    Each name's other homes are named EXPLICITLY, in their own sets, rather than sliced out
+    of the tuple. A slice makes the tuple's order load-bearing in a way nothing states, so
+    reordering two rows silently moves a name from one home's list to another's and the test
+    still passes.
+
     Asserted on IDENTITY, not on ``hasattr``: two separately-defined classes of the same name
     satisfy a presence check while breaking every ``except`` and every ``isinstance`` written
-    against the other module.
+    against the other module. The failure the identity check exists for is the **shadowed**
+    name — a second class of the same name, so every import still resolves and only identity
+    changes. A *deleted* re-export is loud here for an unrelated reason (``akgentic/llm/
+    __init__.py`` imports several of these, so collection fails), and that is a property of
+    what ``__init__.py`` happens to re-export today, not something to lean on.
     """
     import akgentic.llm.agent as agent_module
     import akgentic.llm.capabilities as capabilities_package
-    from akgentic.llm.capabilities import budget, compaction, errors, event_sourcing, healing
+    from akgentic.llm.capabilities import (
+        budget,
+        compaction,
+        errors,
+        event_sourcing,
+        healing,
+        limit_recovery,
+    )
 
     one_definition_of = (
         ("RUN_LIMIT_HEALING_MESSAGE", errors),
@@ -183,29 +201,53 @@ def test_every_public_capability_name_still_resolves_from_the_package():
         ("CompactionCapability", compaction),
         ("EventSourcingCapability", event_sourcing),
         ("HealingCapability", healing),
+        ("LimitRecoveryCapability", limit_recovery),
+        ("ConclusionDecision", limit_recovery),
+        ("DEFAULT_CONCLUSION_REASON", limit_recovery),
     )
+
+    # Also reached through akgentic.llm: every capability class, plus the exception
+    # hierarchy. The two wording constants are deliberately absent — neither ever was there.
+    reaches_the_package = {
+        "UsageLimitError",
+        "RunUsageLimitError",
+        "AgentUsageLimitError",
+        "LifetimeBudgetCapability",
+        "CompactionCapability",
+        "EventSourcingCapability",
+        "HealingCapability",
+        "LimitRecoveryCapability",
+        "ConclusionDecision",
+    }
+    # Also reached through akgentic.llm.agent, for code written against their pre-capability
+    # home. The recovery names are NEW rather than moved, so they get no such re-export: the
+    # ``X as X`` block in agent.py exists for names that used to live there.
+    reaches_the_agent_module = {
+        "RUN_LIMIT_HEALING_MESSAGE",
+        "UsageLimitError",
+        "RunUsageLimitError",
+        "AgentUsageLimitError",
+    }
+    declared = {name for name, _ in one_definition_of}
+    assert reaches_the_package <= declared
+    assert reaches_the_agent_module <= declared
 
     for name, sibling in one_definition_of:
         assert hasattr(capabilities_package, name), (
             f"{name} is no longer re-exported from akgentic.llm.capabilities"
         )
-        assert getattr(capabilities_package, name) is getattr(sibling, name), (
+        one_object = getattr(sibling, name)
+        assert getattr(capabilities_package, name) is one_object, (
             f"akgentic.llm.capabilities.{name} is not the object {sibling.__name__} defines"
         )
-
-    # The four capability classes reach callers through akgentic.llm as well.
-    for name, sibling in one_definition_of[4:]:
-        assert getattr(akgentic.llm, name) is getattr(sibling, name), (
-            f"akgentic.llm.{name} is not the object {sibling.__name__} defines"
-        )
-
-    # The constant and the three exception classes reach callers through akgentic.llm.agent,
-    # for code written against their pre-capability home. RUN_LIMIT_HEALING_MESSAGE is
-    # deliberately NOT on akgentic.llm — it never was, and __init__.py is untouched here.
-    for name, sibling in one_definition_of[:4]:
-        assert getattr(agent_module, name) is getattr(sibling, name), (
-            f"akgentic.llm.agent.{name} is not the object {sibling.__name__} defines"
-        )
+        if name in reaches_the_package:
+            assert getattr(akgentic.llm, name) is one_object, (
+                f"akgentic.llm.{name} is not the object {sibling.__name__} defines"
+            )
+        if name in reaches_the_agent_module:
+            assert getattr(agent_module, name) is one_object, (
+                f"akgentic.llm.agent.{name} is not the object {sibling.__name__} defines"
+            )
 
 
 def test_catching_the_base_still_catches_both_tiers():

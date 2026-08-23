@@ -40,9 +40,11 @@ from .agent import (
 )
 from .capabilities import (
     CompactionCapability,
+    ConclusionDecision,
     EventSourcingCapability,
     HealingCapability,
     LifetimeBudgetCapability,
+    LimitRecoveryCapability,
 )
 from .compaction import (
     COMPACTION_STRATEGIES,
@@ -116,6 +118,8 @@ __all__ = [
     "CompactionCapability",
     "EventSourcingCapability",
     "HealingCapability",
+    "LimitRecoveryCapability",
+    "ConclusionDecision",
     # Compaction
     "LlmContextCompactedEvent",
     "LlmContextClearedEvent",

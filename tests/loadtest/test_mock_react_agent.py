@@ -139,6 +139,31 @@ def test_capabilities_accepted_and_ignored() -> None:
     assert out_with.messages == out_without.messages
 
 
+def test_limit_recovery_accepted_and_ignored() -> None:
+    """`limit_recovery=` constructs without error and does not change run() output.
+
+    The same accept-and-ignore mirror `capabilities` and `event_loop` get, and for a stronger
+    reason: the mock enforces no run-tier budget and raises no usage-limit error on any path,
+    so there is no breach for a recovery policy to decide about. Only the keyword is mirrored;
+    a behavioural mirror would have nothing to mirror.
+    """
+    from akgentic.llm import LimitRecoveryCapability
+
+    without_policy = MockReactAgent(config=_make_config("@Manager"))
+    with_policy = MockReactAgent(
+        config=_make_config("@Manager"), limit_recovery=LimitRecoveryCapability()
+    )
+
+    out_without = without_policy.run_sync(
+        "sandpile please", deps=_Deps("@Manager"), output_type=_StructuredOutput
+    )
+    out_with = with_policy.run_sync(
+        "sandpile please", deps=_Deps("@Manager"), output_type=_StructuredOutput
+    )
+
+    assert out_with.messages == out_without.messages
+
+
 # ---------------------------------------------------------------------------
 # FR2 — zero tokens, no egress
 # ---------------------------------------------------------------------------
