@@ -278,7 +278,7 @@ class TestReactAgentInit:
         """Omitting `capabilities` is behaviourally identical to passing `capabilities=[]`."""
         agent_omitted = ReactAgent(config=minimal_config)
         agent_explicit_empty = ReactAgent(config=minimal_config, capabilities=[])
-        # Compared by type rather than by value: both stacks now carry the two internal
+        # Compared by type rather than by value: both stacks now carry the four internal
         # capabilities, each bound to ITS OWN agent's ContextManager, and dataclass
         # equality makes two capabilities on different contexts unequal. The claim being
         # made is about the shape of the stack, which the sequence of types expresses.

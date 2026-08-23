@@ -42,10 +42,11 @@ call any LLM without coupling to a specific vendor or framework primitive.
 `akgentic-llm` is the LLM execution layer between agent logic and LLM providers. It provides:
 
 - **ReactAgent** — a thin wrapper around one awaited `pydantic_ai.Agent.run()` call that persists
-  message history across calls — through a mounted `EventSourcingCapability`, cursor-based so
-  nothing depends on message object identity — and translates pydantic-ai's `UsageLimitExceeded`
-  into a framework-local `RunUsageLimitError` — one of the two tiers under the exported base
-  `UsageLimitError` (see [Usage limits](#usage-limits))
+  message history across calls — through a mounted `EventSourcingCapability`, whose sweep is
+  bounded by the last message it recorded, located by **identity**, with a positional cursor as
+  the fallback (see [Run-loop capabilities](#run-loop-capabilities)) — and translates
+  pydantic-ai's `UsageLimitExceeded` into a framework-local `RunUsageLimitError` — one of the two
+  tiers under the exported base `UsageLimitError` (see [Usage limits](#usage-limits))
 - **Provider abstraction** — `create_model()` dispatches to one of six provider factories
   (OpenAI, Azure, Anthropic, Google, Mistral, NVIDIA), wrapping the result in pydantic-ai's
   `FallbackModel` when `ModelConfig.fallback_models` is non-empty; `get_output_type()` wraps
@@ -68,13 +69,16 @@ ReactAgent
   │     │
   │     ├── await pydantic_agent.run(        # pydantic-ai REACT loop, one awaited call
   │     │       user_prompt,
+  │     │       usage_limits=…,              # RUN tier only; no usage= is ever passed
   │     │       message_history=context.messages,
   │     │       output_type=get_output_type(model_cfg, output_type),
-  │     │       usage=run_usage,             # this run's own accumulator
   │     │   )
   │     │     │
-  │     │     └── EventSourcingCapability, after each graph node:
-  │     │           context.add_message()   # persists + notifies observers
+  │     │     ├── LifetimeBudgetCapability  # refuses a spent agent; folds what a run burned
+  │     │     ├── CompactionCapability      # folds an over-long history before the run reads it
+  │     │     ├── EventSourcingCapability, after each graph node:
+  │     │     │     context.add_message()   # persists + notifies observers
+  │     │     └── HealingCapability         # closes out tool calls a failed run left dangling
   │     │
   │     └── return result.output
   │
