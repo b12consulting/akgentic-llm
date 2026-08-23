@@ -365,9 +365,7 @@ def _join_message_text(messages: list[ModelMessage]) -> str:
     return "\n".join(_extract_text_from_part(part) for msg in messages for part in msg.parts)
 
 
-def _estimate_retained(
-    system: list[ModelMessage], summary: str, tail: list[ModelMessage]
-) -> int:
+def _estimate_retained(system: list[ModelMessage], summary: str, tail: list[ModelMessage]) -> int:
     """Estimate the post-compaction context size: system parts + summary + retained tail."""
     return (
         _estimate_tokens(_join_message_text(system))
@@ -468,9 +466,7 @@ class SummarizingCompaction:
             tokens_after=_estimate_retained(system, output, []),
         )
 
-    def _truncation_fallback(
-        self, system: list[ModelMessage], replaced: int
-    ) -> CompactionResult:
+    def _truncation_fallback(self, system: list[ModelMessage], replaced: int) -> CompactionResult:
         """Count-based degrade-to-truncation (no tiktoken): fold all non-system content."""
         summary = (
             f"[NOTE: {replaced} earlier conversation message(s) were "

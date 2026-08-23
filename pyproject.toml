@@ -20,7 +20,19 @@ authors = [
 keywords = ["llm", "agents", "ai", "pydantic-ai", "react"]
 
 dependencies = [
-    "pydantic-ai[mistral]>=2,<3",
+    # Ceilings pinned to a reproduced upstream break, NOT precautionary caps. The LLM SDK ecosystem
+    # is migrating from encode's httpx to httpx2 (github.com/pydantic/httpx2), and a client of the
+    # wrong stack is rejected at RUNTIME, not just by a type checker:
+    #   TypeError: Invalid `http_client` argument; Expected an instance of `httpx2.AsyncClient`
+    # Boundaries verified against PyPI: pydantic-ai 2.32.0, anthropic 1.0.0, openai 3.0.
+    # anthropic and openai must be bounded HERE even though they arrive transitively, because
+    # pydantic-ai declares them without ceilings (anthropic>=0.108.0), so capping pydantic-ai alone
+    # still resolves the migrated majors.
+    # mistralai and google-genai have NOT migrated yet; they will need the same treatment when they
+    # do. See decisions/adr-020 — this is a holding action, not a resting state.
+    "pydantic-ai[mistral]>=2,<2.32",
+    "anthropic<1",
+    "openai<3",
     # NEVER cap this: genai-prices ships the price table itself, so an upper bound
     # freezes prices and the framework reports stale costs. The floor is the v2
     # pricing-data line; a ceiling here also transitively caps pydantic-ai, since
@@ -79,5 +91,12 @@ target-version = "py312"
 line-length = 100
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "N", "W"]
-ignore = []
+select = ["E", "F", "I", "N", "UP", "ANN", "ASYNC", "C901", "PLR0912", "PLR0915"]
+ignore = ["ANN401", "N802"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 10
+
+[tool.ruff.lint.pylint]
+max-branches = 12
+max-statements = 50

@@ -7,16 +7,16 @@ from typing import Any, cast
 
 from pydantic_ai import Agent, AgentCapability, BinaryContent, UsageLimitExceeded
 from pydantic_ai import UsageLimits as PydanticUsageLimits
-from pydantic_ai.agent import AgentRun
-from pydantic_ai.messages import (
-    ModelMessage,
-    ModelRequest,
-    ModelRequestPart,
-    ModelResponse,
-    ToolReturnPart,
-)
+from pydantic_ai.messages import ModelMessage
 from pydantic_ai.usage import RunUsage
 
+# RUN_LIMIT_HEALING_MESSAGE is re-exported, not used: healing itself moved into
+# HealingCapability, but `akgentic.llm.agent.RUN_LIMIT_HEALING_MESSAGE` stays importable
+# for callers written against it. capabilities.py holds the one definition.
+from .capabilities import (
+    RUN_LIMIT_HEALING_MESSAGE as RUN_LIMIT_HEALING_MESSAGE,
+)
+from .capabilities import EventSourcingCapability, HealingCapability
 from .compaction import CompactionResult, CompactionStrategy, create_compaction
 from .config import ReactAgentConfig, RunUsageLimits
 from .context import ContextManager
@@ -35,16 +35,6 @@ from .providers import create_http_client, create_model, get_output_type
 logger = logging.getLogger(__name__)
 
 UserPrompt = str | list[str | BinaryContent]
-
-# What the MODEL reads as the tool result of the call the run-tier breach aborted.
-# Not a diagnostic: the operator's traceback travels the other channel
-# (``ErrorMessage.traceback``, formatted by ``Akgent._handle_failure``). Defined once
-# here so the call site and its test never drift into two wordings (ADR-016 §D2).
-RUN_LIMIT_HEALING_MESSAGE = (
-    "This turn's tool and request budget is exhausted, so this tool call was "
-    "aborted and no further tool calls are possible. Answer now using what you "
-    "already have, and say plainly what you could not verify."
-)
 
 
 def _evict_anyio_run_vars(loop: asyncio.AbstractEventLoop) -> None:
@@ -152,14 +142,19 @@ class ReactAgent:
             toolsets: List of toolsets (optional, e.g., MCP servers)
             result_type: Type for agent result validation (default: str)
             observer: Context observer to register automatically (optional)
-            capabilities: Optional sequence of pydantic-ai AgentCapability instances,
-                forwarded unchanged to the wrapped Agent(...) as `capabilities or []`.
+            capabilities: Optional sequence of pydantic-ai AgentCapability instances.
+                They are NOT forwarded unchanged: two internal capabilities —
+                EventSourcingCapability then HealingCapability — are mounted ahead of
+                them, because those two own persistence, system-prompt recording and
+                dangling-tool-call healing for every run this agent drives.
                 Ordering is fixed: a capability's before_model_request hook runs AFTER
                 compaction — ContextManager rewrites messages first, the result is
                 passed as message_history, and only then does the capability chain
-                run. One consequence, not guessable from the signature: a capability
-                sees only the POST-compaction history; it never sees what compaction
-                folded away.
+                run. Two consequences, neither guessable from the signature: a
+                capability sees only the POST-compaction history, never what
+                compaction folded away; and because pydantic-ai unwinds the chain in
+                reverse, a caller capability's `after_*` hooks run BEFORE the
+                persistence sweep, so its durable edits are the ones persisted.
                 Under pydantic-ai 2.x (verified against 2.31.0), a capability that
                 orphans a tool call/return pair (e.g. by splitting one while injecting
                 content) is NOT left broken: pydantic-ai's own dangling-tool-call
@@ -200,7 +195,7 @@ class ReactAgent:
         # Agent-lifetime token accumulator backing agent_usage_limits' token fields.
         # Same lifecycle as _run_count (in memory, reseeded from the same replayed
         # events). pydantic-ai's own RunUsage, so folding and comparison are both its
-        # code. NEVER handed to iter() — see _check_agent_token_budget.
+        # code. NEVER handed to run(usage=…) — see _check_agent_token_budget.
         self._agent_usage: RunUsage = RunUsage()
 
         # Create context manager (no max_messages by default)
@@ -235,6 +230,16 @@ class ReactAgent:
         # Wrap result_type with provider-aware output strategy for structured output
         wrapped_result_type: Any = get_output_type(config.model_cfg, result_type)
 
+        # The whole capability stack, assembled once, here. The two internal ones come
+        # first so the caller's sit inside them: pydantic-ai unwinds the chain in
+        # reverse, so a caller capability's after_* hooks run before the persistence
+        # sweep and its durable edits are what gets persisted.
+        capability_stack: list[AgentCapability[Any]] = [
+            EventSourcingCapability(context=self._context),
+            HealingCapability(context=self._context),
+            *(capabilities or []),
+        ]
+
         # Create pydantic-ai Agent.
         # pydantic-ai's Agent() overloads declare `deps_type: type[AgentDepsT]
         # = object` (no `None`); ReactAgent forwards its own `deps_type:
@@ -248,7 +253,7 @@ class ReactAgent:
             deps_type=deps_type,  # type: ignore[arg-type]
             end_strategy=config.runtime_cfg.end_strategy,
             output_type=wrapped_result_type,
-            capabilities=capabilities or [],
+            capabilities=capability_stack,
         )
 
     async def run(
@@ -256,8 +261,9 @@ class ReactAgent:
     ) -> Any:
         """Execute agent with REACT pattern.
 
-        Runs pydantic-ai agent iteratively, updating context after each
-        iteration step.
+        One awaited ``pydantic_ai.Agent.run()`` call. Context is still updated
+        incrementally as the run produces messages, but that is
+        ``EventSourcingCapability``'s ``after_node_run`` sweep, not this method.
 
         Args:
             user_prompt: User message to process
@@ -308,8 +314,8 @@ class ReactAgent:
         Args:
             reason: Why the turn must conclude now. Reaches the model as the run's
                 user prompt, on top of the healed context — so the
-                ``ToolReturnPart`` written by ``_heal_unprocessed_tool_calls`` is
-                already there as the tool result the model reasons from.
+                ``ToolReturnPart`` written by ``HealingCapability`` is already there
+                as the tool result the model reasons from.
             deps: Optional dependency object (must match deps_type).
             output_type: Optional per-call output type override (see ``run()``).
 
@@ -363,14 +369,19 @@ class ReactAgent:
         output_type: type[Any] | None,
         limits: RunUsageLimits | None,
     ) -> Any:
-        """Shared run core: pre-flight, compaction, one ``iter()`` turn, healing.
+        """Shared run core: pre-flight, compaction, one ``run()`` call.
 
         Everything ``run()`` does, with the run-tier budget as a parameter so the
         tool-free conclusion can substitute its own without ``run()`` growing a
         public knob for it. Reusing this core is what gives the conclusion the same
-        pre-flight, the same ``new_messages()`` drain, the same system-prompt
-        recording and the same usage fold — so a conclusion emits an
-        ``LlmUsageEvent`` like any other run.
+        pre-flight, the same persistence, the same system-prompt recording and the
+        same usage fold — so a conclusion emits an ``LlmUsageEvent`` like any other
+        run.
+
+        Persistence, system-prompt recording and healing are not performed here at
+        all: they belong to ``EventSourcingCapability`` and ``HealingCapability``,
+        mounted ahead of the caller's capabilities in ``__init__``. What is left is a
+        pre-flight and one awaited call.
 
         Args:
             user_prompt: The prompt for this turn.
@@ -379,73 +390,49 @@ class ReactAgent:
             limits: The run-tier budget to bound this turn with, or None.
 
         Returns:
-            Agent result output, or None when the run produced no result.
+            Agent result output. ``run()`` either produces a result or raises, so
+            there is no "no result" case to return.
 
         Raises:
             AgentUsageLimitError: Raised pre-flight by either agent-tier check.
             RunUsageLimitError: Raised when pydantic-ai breaches a run-tier limit.
-            Exception: Anything else the run raised, re-raised unchanged after the
-                context is healed — the object and its ``__traceback__`` are the
-                caller's, not this method's, to alter.
+            Exception: Anything else the run raised, propagating unchanged — the
+                object and its ``__traceback__`` are the caller's, not this
+                method's, to alter, because that is what
+                ``Akgent._handle_failure`` formats onto ``ErrorMessage.traceback``.
         """
         # Pre-flight: reject before spending anything (a rejected run must not even
         # pay for compaction's summarizer call). Tokens first, so a token rejection
         # consumes no run budget.
         self._check_agent_token_budget()
         self._check_and_consume_agent_budget()
-        # Auto-compact (at most once per turn) BEFORE iter() snapshots the
-        # history. iter() reads message_history once at entry and the loop only
-        # appends, so compacting here takes effect for the whole turn.
+        # Auto-compact (at most once per turn) BEFORE the run reads the history.
+        # message_history is read once at entry and the graph only appends, so
+        # compacting here takes effect for the whole turn.
         await self._maybe_compact()
         user_prompt = self._fold_pending_operator_actions(user_prompt)
         pydantic_limits = self._to_pydantic_limits(limits)
 
+        # This run's own accumulator, mutated in place by the graph for the whole run.
+        # A fresh object, never self._agent_usage: handing pydantic-ai the lifetime
+        # accumulator would check the per-run cap against lifetime totals — silently,
+        # with no error.
+        run_usage = RunUsage()
         try:
-            # Track messages added in THIS run to prevent duplicates
-            # (new_messages() can return same messages across iterations)
-            added_message_ids: set[int] = set()
-
-            # No `usage=` argument: pydantic-ai starts this run at zero so the run
-            # tier stays per-run. Handing it the lifetime accumulator would check
-            # the per-run cap against lifetime totals — silently, with no error.
-            async with self._pydantic_agent.iter(
+            result = await self._pydantic_agent.run(
                 user_prompt=user_prompt,
                 deps=deps,
                 usage_limits=pydantic_limits,
                 message_history=self._context.messages,
                 output_type=get_output_type(self._config.model_cfg, output_type),
-            ) as run:
-                try:
-                    async for _ in run:
-                        # new_messages() may return previously emitted messages
-                        # during tool call iterations - only add each once
-                        for message in run.new_messages():
-                            msg_id = id(message)
-                            if msg_id not in added_message_ids:
-                                added_message_ids.add(msg_id)
-                                self._context.add_message(message)
-
-                    # Record this run's effective system prompt rendering exactly
-                    # once, after pydantic-ai's in-place dynamic re-evaluation and
-                    # the new_messages() drain, before returning (ADR-004 §2).
-                    self._record_run_system_prompt(run)
-
-                    return run.result.output if run.result else None
-                finally:
-                    # In `finally`: tokens a failed run burned were still burned.
-                    self._fold_run_usage(run)
-
+                usage=run_usage,
+            )
+            return result.output
         except UsageLimitExceeded as e:
-            self._heal_unprocessed_tool_calls(RUN_LIMIT_HEALING_MESSAGE)
             raise RunUsageLimitError(str(e)) from e
-        except Exception as e:
-            # Type and message — what a model can act on ("ReadTimeout: pool
-            # timeout" → route around it); the stack, which it cannot, is dropped
-            # here only. Bare `raise`, never `raise e`: the exception object and its
-            # __traceback__ must reach the caller unchanged, because that is what
-            # Akgent._handle_failure formats onto ErrorMessage.traceback.
-            self._heal_unprocessed_tool_calls(f"Tool call aborted: {type(e).__name__}: {e}")
-            raise
+        finally:
+            # In `finally`: tokens a failed run burned were still burned.
+            self._fold_run_usage(run_usage)
 
     def _check_agent_token_budget(self) -> None:
         """Refuse to START a run once the agent-lifetime token budget is spent.
@@ -462,10 +449,11 @@ class ReactAgent:
         spent", never "never exceed it": the last run admitted can carry the total
         arbitrarily past the limit, and only the next one is refused.
 
-        The accumulator is compared here rather than handed to ``iter()`` because
-        ``iter()`` takes exactly one usage — passing the lifetime total would check
-        the *run* tier's limits against it and silently turn a per-run cap into a
-        lifetime one (ADR-013 §Out of scope, reopened for the token tier).
+        The accumulator is compared here rather than handed to ``run(usage=…)``
+        because a run takes exactly one usage object — passing the lifetime total
+        would check the *run* tier's limits against it and silently turn a per-run
+        cap into a lifetime one (ADR-013 §Out of scope, reopened for the token
+        tier).
 
         Raises:
             AgentUsageLimitError: If lifetime usage has already exceeded a token
@@ -482,20 +470,23 @@ class ReactAgent:
         except UsageLimitExceeded as e:
             raise AgentUsageLimitError(str(e)) from e
 
-    def _fold_run_usage(self, run: AgentRun[Any, Any]) -> None:
-        """Add one completed run's token usage to the agent-lifetime accumulator.
+    def _fold_run_usage(self, run_usage: RunUsage) -> None:
+        """Add one run's token usage to the agent-lifetime accumulator.
 
-        ``run.usage`` is a **property** on pydantic-ai's ``AgentRun`` — reading it
-        as an attribute, with no parentheses, is the correct, non-deprecated form
-        and is exactly what this call site does. The deprecated form is calling it
-        like the old method, ``run.usage()``; nothing in this codebase does that.
-        Called from a ``finally``, so a run that failed partway still contributes
-        what it spent — the provider billed it either way.
+        The argument is the ``RunUsage`` handed **in** as ``run(usage=…)``, not one
+        read back off a result. pydantic-ai defaults that parameter (``usage or
+        RunUsage()``), stores that exact object on the graph state and from then on
+        only mutates it in place, so it holds the run's real cost whether the run
+        returned or raised. That is why it is passed in at all: a run that failed
+        partway has no ``AgentRunResult`` to read usage off, so the accumulator the
+        graph mutates is the only anchor that survives the exception. Called from a
+        ``finally``, so a failed run still contributes what it spent — the provider
+        billed it either way.
 
         Args:
-            run: The pydantic-ai run object yielded by ``iter()``.
+            run_usage: This run's own accumulator, as handed to ``run(usage=…)``.
         """
-        self._agent_usage.incr(run.usage)
+        self._agent_usage.incr(run_usage)
 
     def _check_and_consume_agent_budget(self) -> None:
         """Spend one unit of the agent-lifetime run budget, or refuse to run.
@@ -554,28 +545,6 @@ class ReactAgent:
         if isinstance(user_prompt, str):
             return f"{preamble}\n\n{user_prompt}"
         return [preamble, *user_prompt]
-
-    def _record_run_system_prompt(self, run: AgentRun[Any, Any]) -> None:
-        """Record the completed run's effective system prompt rendering once.
-
-        Derives the run's ``run_id`` from its own messages — the same value
-        ``_emit_tool_events`` reads via ``message.run_id`` — so the emitted
-        ``LlmSystemPromptEvent.run_id`` correlates with that run's
-        ``LlmMessageEvent``/``ToolCallEvent``/``LlmUsageEvent`` values. When the
-        run produced no new messages (no ``run_id`` available), the recording
-        call is skipped — there is nothing to record (ADR-004 §2).
-
-        Args:
-            run: The completed pydantic-ai run object, exposing
-                ``new_messages()``.
-        """
-        new_messages = run.new_messages()
-        if not new_messages:
-            return
-        run_id = getattr(new_messages[-1], "run_id", None)
-        if run_id is None:
-            return
-        self._context.record_system_prompt(str(run_id))
 
     def _compaction_threshold(self) -> int | None:
         """Token budget that arms the auto-trigger, or None when compaction is off.
@@ -776,50 +745,6 @@ class ReactAgent:
             output_tokens_limit=limits.output_tokens_limit,
             total_tokens_limit=limits.total_tokens_limit,
         )
-
-    def _heal_unprocessed_tool_calls(self, model_message: str) -> None:
-        """Complete any pending tool calls in context with a message for the model.
-
-        When the REACT loop fails mid-execution, the last message may be a
-        ModelResponse with tool calls that never received results. This
-        appends a ModelRequest with ToolReturnPart for each pending call,
-        preventing the 'unprocessed tool calls' error on the next run().
-
-        The structural half is ADR-003 and unchanged: one part per dangling call,
-        appended as one request. What each part *carries* is a sentence written for
-        the model — the reader of a tool result — not a diagnostic for an operator.
-
-        Args:
-            model_message: The tool result the **model** reads on its next turn —
-                used verbatim as each healing ``ToolReturnPart.content``, with no
-                wrapper added. This is not a diagnostic channel: the operator's
-                traceback reaches the orchestrator through ``ErrorMessage.traceback``
-                instead. Each call site therefore supplies a complete, self-contained
-                sentence the model can act on (ADR-016 §D2, amending ADR-003).
-        """
-        messages = self._context.messages
-        if not messages:
-            return
-
-        last = messages[-1]
-        if not isinstance(last, ModelResponse) or not last.tool_calls:
-            return
-
-        # The union ModelRequest.parts declares, rather than the concrete
-        # ToolReturnPart built here, so the list stays open to other part kinds.
-        # Either annotation type-checks — parts is a covariant Sequence, not a
-        # list — so this is a choice, not a constraint imposed by variance.
-        error_parts: list[ModelRequestPart] = [
-            ToolReturnPart(
-                tool_name=call.tool_name,
-                content=model_message,
-                tool_call_id=call.tool_call_id,
-            )
-            for call in last.tool_calls
-        ]
-
-        logger.warning("Healing %d unprocessed tool call(s) after error", len(error_parts))
-        self._context.add_message(ModelRequest(parts=error_parts))
 
     # API wrapper methods
 

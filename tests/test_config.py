@@ -687,9 +687,7 @@ class TestReactAgentCompactionConfig:
     def test_max_messages_negative_invalid(self):
         """max_messages=-1 violates ge=0 — AC 4."""
         with pytest.raises(ValidationError):
-            ReactAgentConfig(
-                max_messages=-1, compaction_cfg=CompactionConfig(auto_trigger=False)
-            )
+            ReactAgentConfig(max_messages=-1, compaction_cfg=CompactionConfig(auto_trigger=False))
 
     def test_compaction_fields_round_trip(self):
         """compaction_cfg and max_messages survive a dump -> validate round-trip — AC 4."""

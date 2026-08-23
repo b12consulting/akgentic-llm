@@ -14,8 +14,16 @@ def test_no_unexpected_exports():
     # Submodules are always visible via dir() but not in star imports.
     # `loadtest` is an optional-extra subpackage, deliberately absent from __all__.
     submodules = {
-        "agent", "compaction", "config", "context", "event", "loadtest",
-        "pricing", "prompts", "providers",
+        "agent",
+        "capabilities",
+        "compaction",
+        "config",
+        "context",
+        "event",
+        "loadtest",
+        "pricing",
+        "prompts",
+        "providers",
     }
     exported = {name for name in dir(akgentic.llm) if not name.startswith("_")}
     exported_without_submodules = exported - submodules
@@ -55,6 +63,10 @@ def test_key_exports_present():
     assert not hasattr(akgentic.llm, "LlmCheckpointRestoredEvent")
     assert hasattr(akgentic.llm, "ToolCallEvent")
     assert hasattr(akgentic.llm, "ToolReturnEvent")
+
+    # Run-loop capabilities
+    assert hasattr(akgentic.llm, "EventSourcingCapability")
+    assert hasattr(akgentic.llm, "HealingCapability")
 
     # Prompts
     assert hasattr(akgentic.llm, "PromptTemplate")

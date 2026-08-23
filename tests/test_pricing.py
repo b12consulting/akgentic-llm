@@ -306,8 +306,9 @@ class TestAggregateUsageByRun:
     def test_by_run_multi_model_per_run(self) -> None:
         events = [
             _make_event(run_id="run-1", model_name="claude-sonnet-4-20250514", input_tokens=100),
-            _make_event(run_id="run-1", model_name="gpt-4o", provider_name="openai",
-                        input_tokens=200),
+            _make_event(
+                run_id="run-1", model_name="gpt-4o", provider_name="openai", input_tokens=200
+            ),
         ]
         result = aggregate_usage(events, by_run=True)
         assert len(result.runs) == 1

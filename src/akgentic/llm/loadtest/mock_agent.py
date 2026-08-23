@@ -65,6 +65,13 @@ class MockReactAgent:
             capabilities: Accepted and ignored, mirroring the ``event_loop``
                 accept-and-ignore pattern below — the mock never builds a
                 ``pydantic_ai.Agent``, so there is nothing to forward this to.
+                Ignoring it stays honest parity even though ``ReactAgent`` now
+                mounts two internal capabilities of its own: what
+                ``EventSourcingCapability`` does for a real run — hand every
+                message to ``ContextManager.add_message()`` — this class already
+                does directly from ``_emit_request`` / ``_emit_tool_call`` /
+                ``_emit_tool_return`` / ``_emit_final_response``, so it is its own
+                event source rather than a client of one.
             event_loop: Deprecated — accepted and ignored. The mock creates and
                 owns its own loop (``self._loop``) for drop-in parity with
                 ``ReactAgent``; the passed loop is neither adopted nor used by
@@ -319,8 +326,10 @@ class MockReactAgent:
 
     def _build_output(self, state: ScenarioState, output_type: type[Any] | None) -> Any:
         """Validate a structured ``output_type`` or return the response text."""
-        if output_type is not None and output_type is not str and hasattr(
-            output_type, "model_validate"
+        if (
+            output_type is not None
+            and output_type is not str
+            and hasattr(output_type, "model_validate")
         ):
             messages = [m.model_dump() for m in state.respond.messages]
             return output_type.model_validate({"messages": messages})

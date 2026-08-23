@@ -22,6 +22,9 @@ Key Concepts:
       subclass to react to one. The tiers are told apart by class, never by
       message text.
     - ContextManager: Message history tracking
+    - EventSourcingCapability / HealingCapability: the run loop's persistence and
+      its dangling-tool-call repair, each mountable a la carte on any bare
+      pydantic-ai Agent
     - PromptTemplate: Template-based prompts with parameter substitution
 """
 
@@ -33,6 +36,10 @@ from .agent import (
     RunUsageLimitError,
     UsageLimitError,
     UserPrompt,
+)
+from .capabilities import (
+    EventSourcingCapability,
+    HealingCapability,
 )
 from .compaction import (
     COMPACTION_STRATEGIES,
@@ -101,6 +108,9 @@ __all__ = [
     "SystemPromptPartSnapshot",
     "ToolCallEvent",
     "ToolReturnEvent",
+    # Run-loop capabilities
+    "EventSourcingCapability",
+    "HealingCapability",
     # Compaction
     "LlmContextCompactedEvent",
     "LlmContextClearedEvent",

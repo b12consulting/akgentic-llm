@@ -29,7 +29,7 @@ Example:
 
 import logging
 import os
-from typing import TYPE_CHECKING, Any, TypeVar, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import httpx
 from pydantic_ai import NativeOutput
@@ -40,8 +40,6 @@ from pydantic_ai.settings import ModelSettings
 from tenacity import retry_if_exception, stop_after_attempt, wait_random_exponential
 
 from .config import ModelConfig, _supports_native_output
-
-T = TypeVar("T")
 
 if TYPE_CHECKING:
     from pydantic_ai.models.anthropic import AnthropicModel
@@ -82,7 +80,7 @@ def _is_retryable_http_error(exc: BaseException) -> bool:
     return status == 429 or 500 <= status < 600
 
 
-def get_output_type(
+def get_output_type[T](
     config: ModelConfig, output_type: type[T] | None
 ) -> NativeOutput[T] | type[T] | None:
     """Get the appropriate output type wrapper for structured output based on provider.
@@ -411,8 +409,7 @@ def _create_google_model(
     api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
     if not api_key:
         raise ValueError(
-            "GOOGLE_API_KEY or GEMINI_API_KEY environment variable is required "
-            "for Google provider"
+            "GOOGLE_API_KEY or GEMINI_API_KEY environment variable is required for Google provider"
         )
     settings = _build_core_settings(config)
     return GoogleModel(

@@ -32,9 +32,10 @@ from typing import Any
 
 import pytest
 from pydantic import BaseModel
-from pydantic_ai import BinaryContent, NativeOutput
+from pydantic_ai import Agent, BinaryContent, NativeOutput
 from pydantic_ai.capabilities import ProcessHistory
 from pydantic_ai.messages import ModelRequest, SystemPromptPart, UserPromptPart
+from pydantic_ai.models.test import TestModel
 
 from akgentic.llm import (
     COMPACTION_STRATEGIES,
@@ -44,6 +45,7 @@ from akgentic.llm import (
     CompactionConfig,
     CompactionResult,
     ContextManager,
+    EventSourcingCapability,
     HttpClientConfig,
     LlmContextClearedEvent,
     LlmContextCompactedEvent,
@@ -177,9 +179,7 @@ def test_quick_start_tools_and_output_type_sample(agents: Any) -> None:
 
     agent = agents(
         ReactAgentConfig(
-            model_cfg=ModelConfig(
-                provider="anthropic", model="claude-3-5-sonnet-20241022"
-            ),
+            model_cfg=ModelConfig(provider="anthropic", model="claude-3-5-sonnet-20241022"),
             run_usage_limits=RunUsageLimits(run_request_limit=10, total_tokens_limit=20_000),
         ),
         tools=[fetch_data],
@@ -574,17 +574,70 @@ def test_capabilities_process_history_sample(agents: Any) -> None:
 
     ``ProcessHistory`` is a pydantic-ai v2 built-in; the import in this sample is
     the one that must not rot when the dependency moves.
+
+    The sample's processor is idempotent because it runs on every model request, not
+    once per run. That is asserted here rather than only stated: applying it twice must
+    leave one block, or the documented example is one a deployment cannot copy.
     """
+    source_references = "... a deployment's source-reference block ..."
+
+    def _is_source_reference(message):  # noqa: ANN001, ANN202
+        return (
+            isinstance(message, ModelRequest)
+            and len(message.parts) == 1
+            and isinstance(message.parts[0], UserPromptPart)
+            and message.parts[0].content == source_references
+        )
 
     def inject_source_reference(messages):  # noqa: ANN001, ANN202
         """Domain-specific history transformation — not a framework concern."""
-        return messages
+        if messages and _is_source_reference(messages[0]):
+            return messages
+        return [ModelRequest(parts=[UserPromptPart(content=source_references)]), *messages]
+
+    once = inject_source_reference([ModelRequest(parts=[UserPromptPart(content="hello")])])
+    assert inject_source_reference(once) == once, "the documented processor is not idempotent"
+    assert len(once) == 2
 
     agent = agents(
         ReactAgentConfig(model_cfg=ModelConfig(provider="openai", model="gpt-4o")),
         capabilities=[ProcessHistory(processor=inject_source_reference)],
     )
     assert agent.pydantic_agent is not None
+
+
+async def test_run_loop_capabilities_sample() -> None:
+    """§Capabilities → Run-loop capabilities — the bare-``Agent`` mount, run as written.
+
+    The claim under test is the modularity one: ``EventSourcingCapability`` needs
+    nothing from ``ReactAgent``, so the sample builds a plain pydantic-ai ``Agent``
+    on a ``TestModel`` — no ``ReactAgent``, no loop to close, no egress.
+
+    Both assertions in the README are kept: the context holds what the run
+    produced, and a subscribed observer saw the same list. The second is what makes
+    the sample worth running — persistence that never reached an observer would
+    still satisfy the first.
+    """
+
+    class Recorder:
+        def __init__(self) -> None:
+            self.messages: list[Any] = []
+
+        def notify_event(self, event: object) -> None:
+            if isinstance(event, LlmMessageEvent):
+                self.messages.append(event.message)
+
+    context = ContextManager()
+    recorder = Recorder()
+    context.subscribe(recorder)
+
+    agent: Agent[None, str] = Agent(
+        model=TestModel(), capabilities=[EventSourcingCapability(context)]
+    )
+    result = await agent.run("hello")
+
+    assert context.messages == list(result.all_messages())
+    assert recorder.messages == context.messages
 
 
 # ---------------------------------------------------------------------------
@@ -727,8 +780,7 @@ def test_observer_sample_imports_and_dispatches() -> None:
                 seen.append(f"Tool returned: {event.tool_name} ({status})")
             elif isinstance(event, LlmUsageEvent):
                 seen.append(
-                    f"Usage: {event.model_name} — "
-                    f"{event.input_tokens}in/{event.output_tokens}out"
+                    f"Usage: {event.model_name} — {event.input_tokens}in/{event.output_tokens}out"
                 )
             elif isinstance(event, LlmSystemPromptEvent):
                 seen.append(f"System prompt for run {event.run_id} ({event.content_hash[:8]}):")
@@ -738,8 +790,7 @@ def test_observer_sample_imports_and_dispatches() -> None:
                 seen.append(f"New message: {event.message}")
             elif isinstance(event, LlmContextCompactedEvent):
                 seen.append(
-                    f"Compacted {event.replaced_message_count} msg(s) "
-                    f"via '{event.strategy_id}'"
+                    f"Compacted {event.replaced_message_count} msg(s) via '{event.strategy_id}'"
                 )
             elif isinstance(event, LlmContextClearedEvent):
                 seen.append(f"Cleared {event.cleared_message_count} msg(s)")
@@ -878,8 +929,7 @@ def test_compaction_tracer_sample(agents: Any) -> None:
                 lines.append(f"  summary: {event.summary[:120]}…")
             elif isinstance(event, LlmContextClearedEvent):
                 lines.append(
-                    f"cleared @ run {event.run_id}: dropped "
-                    f"{event.cleared_message_count} msg(s)"
+                    f"cleared @ run {event.run_id}: dropped {event.cleared_message_count} msg(s)"
                 )
 
     tracer = CompactionTracer()
@@ -944,9 +994,7 @@ async def test_custom_compaction_strategy_sample() -> None:
 
     class KeepLastOnly:
         async def compact(self, messages):  # noqa: ANN001, ANN202
-            return CompactionResult(
-                summary="", replaced_message_count=max(0, len(messages) - 1)
-            )
+            return CompactionResult(summary="", replaced_message_count=max(0, len(messages) - 1))
 
     model_cfg = ModelConfig(provider="openai", model="gpt-4o")
     original = dict(COMPACTION_STRATEGIES)
@@ -1071,9 +1119,7 @@ def test_dynamic_system_prompts_sample(agents: Any) -> None:
     def get_current_workspace() -> str:
         return "/srv/workspace"
 
-    agent = agents(
-        ReactAgentConfig(model_cfg=ModelConfig(provider="openai", model="gpt-4o"))
-    )
+    agent = agents(ReactAgentConfig(model_cfg=ModelConfig(provider="openai", model="gpt-4o")))
 
     # Built-in utilities
     agent.system_prompt(current_datetime_prompt)
