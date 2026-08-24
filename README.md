@@ -396,6 +396,17 @@ all — or produces nothing usable (`None`, or a string that is empty or whitesp
 caller gets a `RunUsageLimitError` built from the breach that started it, never from the
 secondary failure. A "this turn ran out of budget" signal is never replaced by an unrelated one.
 
+After a run-tier breach the context is left runnable rather than diagnostic: the tool calls the
+aborted turn never answered are healed with a short **model-facing instruction** — it tells the
+model this turn's budget is spent, that no further tool call is possible, and to answer now with
+what it already has — so that sentence, not a traceback, is the tool result a follow-up run
+reasons from. That healing is what the recovery seam is consulted *after*: by the time the
+conclusion runs, the healed `ToolReturnPart` is already the last thing the model sees, and the
+conclusion's own prompt is layered on top of it. When the breach does surface, the operator still
+gets the stack: it leaves `run()` as a `RunUsageLimitError` chained from pydantic-ai's own
+`UsageLimitExceeded` (`raise ... from e`), and that exception's traceback is what reaches the
+event stream.
+
 ##### What a consumer has to handle
 
 Degradation is entirely this package's, and it leaves the caller exactly two outcomes — an
@@ -405,12 +416,18 @@ answer, or a raise. There is no partial state to interpret and nothing to attemp
 |---|---|---|
 | runs normally | returns the output | an ordinary output |
 | breaches the **run** tier, seam accepts, conclusion succeeds | returns the conclusion's output | an ordinary output — **indistinguishable** |
-| breaches the run tier, seam declines *or* conclusion fails | re-raises the **ORIGINAL** breach | `RunUsageLimitError` |
+| breaches the run tier, seam declines, *or* the conclusion fails or produces nothing usable | re-raises the **ORIGINAL** breach | `RunUsageLimitError` |
 | breaches the **agent** tier | raises pre-flight, terminal | `AgentUsageLimitError` |
 
 That row-3 guarantee is what lets a consumer's whole usage-limit policy be a single `except
 UsageLimitError` on the base — no tier branch, no retry of its own. `akgentic-agent` is exactly
 that: it catches the base, notifies the team's human, and ends the turn.
+
+**"Indistinguishable" is about the returned value, not the whole trace.** A rescue does leave two
+marks a consumer can observe if it looks for them: the conclusion's events arrive under a *second*
+`run_id`, and the turn costs **two** units of the agent-lifetime run budget. Neither reaches the
+return value, which is why no caller has to branch on either — see
+[Run-tier recovery](#run-tier-recovery) for both.
 
 **Two limitations follow, and both are open questions on ADR-021 rather than oversights:**
 
@@ -422,17 +439,6 @@ that: it catches the base, notifies the team's human, and ends the turn.
   that is empty — is an ordinary success, and this package cannot tell otherwise, because it
   receives the output as `Any`. It is returned, your code routes it, nothing goes out, and no
   exception is raised (§Q2).
-
-After a run-tier breach the context is left runnable rather than diagnostic: the tool calls the
-aborted turn never answered are healed with a short **model-facing instruction** — it tells the
-model this turn's budget is spent, that no further tool call is possible, and to answer now with
-what it already has — so that sentence, not a traceback, is the tool result a follow-up run
-reasons from. That healing is what the recovery seam is consulted *after*: by the time the
-conclusion runs, the healed `ToolReturnPart` is already the last thing the model sees, and the
-conclusion's own prompt is layered on top of it. When the breach does surface, the operator still
-gets the stack: it leaves `run()` as a `RunUsageLimitError` chained from pydantic-ai's own
-`UsageLimitExceeded` (`raise ... from e`), and that exception's traceback is what reaches the
-event stream.
 
 #### Migrating from the pre-split surface
 
