@@ -503,12 +503,16 @@ class ReactAgent:
     ) -> Any:
         """Drive the conclusion the seam asked for, or surface the ORIGINAL breach.
 
-        Escalation parity with what ``akgentic-agent`` does today: **any** failure of the
-        attempt — a second run-tier breach, the terminal ``AgentUsageLimitError`` from the
-        conclusion's own pre-flight, anything else, or an output nothing can be done with —
-        falls through to exactly the behaviour a declined recovery would have produced. The
-        caller sees the original breach and never the secondary one, which would otherwise
-        replace a "this turn ran out of budget" signal with an unrelated failure.
+        **Any** failure of the attempt — a second run-tier breach, the terminal
+        ``AgentUsageLimitError`` from the conclusion's own pre-flight, anything else, or an
+        output nothing can be done with — falls through to exactly the behaviour a declined
+        recovery would have produced. The caller sees the original breach and never the
+        secondary one, which would otherwise replace a "this turn ran out of budget" signal
+        with an unrelated failure.
+
+        That single guarantee is what a consumer's whole usage-limit policy can now rest on:
+        this package either returns an answer or re-raises the breach the turn started with,
+        so the consumer needs no tier branch and no second attempt of its own.
 
         "Nothing usable" is deliberately narrow: ``None``, or a ``str`` that is empty or
         whitespace-only. Richer emptiness — a structured output carrying no requests — is

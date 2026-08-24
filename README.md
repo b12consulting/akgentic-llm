@@ -396,6 +396,33 @@ all — or produces nothing usable (`None`, or a string that is empty or whitesp
 caller gets a `RunUsageLimitError` built from the breach that started it, never from the
 secondary failure. A "this turn ran out of budget" signal is never replaced by an unrelated one.
 
+##### What a consumer has to handle
+
+Degradation is entirely this package's, and it leaves the caller exactly two outcomes — an
+answer, or a raise. There is no partial state to interpret and nothing to attempt a second time:
+
+| the turn | `run()` does | you see |
+|---|---|---|
+| runs normally | returns the output | an ordinary output |
+| breaches the **run** tier, seam accepts, conclusion succeeds | returns the conclusion's output | an ordinary output — **indistinguishable** |
+| breaches the run tier, seam declines *or* conclusion fails | re-raises the **ORIGINAL** breach | `RunUsageLimitError` |
+| breaches the **agent** tier | raises pre-flight, terminal | `AgentUsageLimitError` |
+
+That row-3 guarantee is what lets a consumer's whole usage-limit policy be a single `except
+UsageLimitError` on the base — no tier branch, no retry of its own. `akgentic-agent` is exactly
+that: it catches the base, notifies the team's human, and ends the turn.
+
+**Two limitations follow, and both are open questions on ADR-021 rather than oversights:**
+
+- **The agent tier cannot say goodbye.** `AgentUsageLimitError` is terminal by *construction* —
+  the seam is never consulted for it — so an exhausted agent stops mid-conversation with no
+  final word. The default is right; that it is not overridable is the gap (§Q1).
+- **A conclusion that succeeds emptily tells nobody.** "Nothing usable" is deliberately narrow:
+  `None`, or a blank string. A **structured** output carrying nothing — say a list of requests
+  that is empty — is an ordinary success, and this package cannot tell otherwise, because it
+  receives the output as `Any`. It is returned, your code routes it, nothing goes out, and no
+  exception is raised (§Q2).
+
 After a run-tier breach the context is left runnable rather than diagnostic: the tool calls the
 aborted turn never answered are healed with a short **model-facing instruction** — it tells the
 model this turn's budget is spent, that no further tool call is possible, and to answer now with
@@ -952,6 +979,13 @@ Four more things worth knowing:
   `run_id`, then the healing `ToolReturnPart`, then the conclusion's events under a *second*
   `run_id` — because the conclusion has always been an ordinary second run. No event type, shape
   or ordering changed; the frozen event API described above still applies unmodified.
+
+**This seam is the whole of the degradation policy, deliberately.** A consumer does not implement
+its own — `akgentic-agent` used to, and retired it. Whether to conclude, with what prompt, and
+against which output type all live here, where the healed context and the caller's `output_type`
+are; the consumer is left with a single `except UsageLimitError`. Two things the seam cannot
+currently express are ADR-021 §Q1 and §Q2 — see
+[What a consumer has to handle](#what-a-consumer-has-to-handle).
 
 ## Multimodal Prompts
 

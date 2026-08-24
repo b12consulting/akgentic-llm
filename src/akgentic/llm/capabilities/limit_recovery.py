@@ -14,11 +14,11 @@ from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.run import AgentRunResult
 from pydantic_ai.tools import RunContext
 
-# What the MODEL reads as the prompt of the tool-free conclusion. Adapted from the wording
-# ``akgentic-agent`` uses today, with the requester dropped: this package has no notion of a
-# requester, and inventing a placeholder would be worse than omitting it (in agent-land an
-# unprefixed name is a role to hire). A deployment that wants the requester named returns its
-# own ``ConclusionDecision(reason=...)`` from the seam — that is what the seam is for.
+# What the MODEL reads as the prompt of the tool-free conclusion. It names no requester:
+# this package has no notion of one, and inventing a placeholder would be worse than
+# omitting it — a consumer that routes by recipient would take the placeholder for an
+# address. A deployment that wants the requester named returns its own
+# ``ConclusionDecision(reason=...)`` from the seam; that is what the seam is for.
 DEFAULT_CONCLUSION_REASON = (
     "This turn has run out of its budget, this is your last chance to answer.\n"
     "Answer now with what you have already gathered. State your conclusion plainly, say "
