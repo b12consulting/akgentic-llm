@@ -28,11 +28,12 @@ Zero egress: no sample issues a model request. Provider credentials are faked in
 """
 
 import asyncio
+import inspect
 from typing import Any
 
 import pytest
 from pydantic import BaseModel
-from pydantic_ai import Agent, BinaryContent, NativeOutput
+from pydantic_ai import Agent, BinaryContent, NativeOutput, UsageLimitExceeded
 from pydantic_ai.capabilities import ProcessHistory
 from pydantic_ai.messages import ModelRequest, SystemPromptPart, UserPromptPart
 from pydantic_ai.models.test import TestModel
@@ -44,9 +45,11 @@ from akgentic.llm import (
     AgentUsageLimits,
     CompactionConfig,
     CompactionResult,
+    ConclusionDecision,
     ContextManager,
     EventSourcingCapability,
     HttpClientConfig,
+    LimitRecoveryCapability,
     LlmContextClearedEvent,
     LlmContextCompactedEvent,
     LlmMessageEvent,
@@ -550,22 +553,9 @@ def test_react_agent_constructor_accepts_every_documented_argument(agents: Any) 
         result_type=str,
         observer=_Observer(),
         capabilities=[],
-        event_loop=None,  # deprecated, accepted and ignored
+        limit_recovery=LimitRecoveryCapability(),
     )
     assert agent.pydantic_agent is not None
-
-
-def test_event_loop_argument_is_ignored(agents: Any) -> None:
-    """§ReactAgent API — ``event_loop=`` is accepted and ignored, as documented."""
-    foreign = asyncio.new_event_loop()
-    try:
-        agent = agents(
-            ReactAgentConfig(model_cfg=ModelConfig(provider="openai", model="gpt-4o")),
-            event_loop=foreign,
-        )
-        assert agent._loop is not foreign
-    finally:
-        foreign.close()
 
 
 # ---------------------------------------------------------------------------
@@ -642,6 +632,77 @@ async def test_run_loop_capabilities_sample() -> None:
 
     assert context.messages == list(result.all_messages())
     assert recorder.messages == context.messages
+
+
+async def test_run_tier_recovery_opt_out_sample(agents: Any) -> None:
+    """§Usage limits → Telling the two tiers apart — the opt-out, run as written.
+
+    This is the migration path for anyone the behaviour change surprises, so it is the
+    sample most worth proving: the seam returns ``None``, and the subclass reaches the
+    agent through ``limit_recovery=`` — the only mount point the README names.
+    """
+    config = ReactAgentConfig(model_cfg=ModelConfig(provider="openai", model="gpt-4o"))
+
+    class NeverConcludes(LimitRecoveryCapability):
+        """Restore the pre-recovery contract: a run-tier breach simply raises."""
+
+        async def handle_limit_exceeded(self, ctx, *, error):  # noqa: ANN001, ANN201
+            return None
+
+    policy = NeverConcludes()
+    assert await policy.handle_limit_exceeded(None, error=UsageLimitExceeded("spent")) is None
+
+    agent = agents(config, limit_recovery=policy)
+    assert agent._limit_recovery is policy
+
+
+async def test_run_tier_recovery_house_style_sample(agents: Any) -> None:
+    """§Capabilities → Run-tier recovery — the override example, run as written.
+
+    Asserts the decision's ``reason`` rather than only that a decision came back:
+    the whole point of the override is the prompt the conclusion is started with.
+    """
+    config = ReactAgentConfig(model_cfg=ModelConfig(provider="openai", model="gpt-4o"))
+
+    class HouseStyle(LimitRecoveryCapability):
+        """Conclude with a deployment's own wording instead of the default prompt."""
+
+        async def handle_limit_exceeded(self, ctx, *, error):  # noqa: ANN001, ANN201
+            return ConclusionDecision(reason="Budget spent — answer now with what you have.")
+
+    policy = HouseStyle()
+    decision = await policy.handle_limit_exceeded(None, error=UsageLimitExceeded("spent"))
+    assert isinstance(decision, ConclusionDecision)
+    assert decision.reason == "Budget spent — answer now with what you have."
+
+    agent = agents(config, limit_recovery=policy)
+    assert agent._limit_recovery is policy
+
+
+async def test_run_tier_recovery_seam_signature_and_default_prompt() -> None:
+    """§Capabilities → Run-tier recovery — the seam block and its two default claims.
+
+    The signature block is a listing rather than executable code, so it is checked by
+    ``inspect``. The README also claims the default prompt is ONE string for every kind of
+    run-tier breach, and that it is reachable only from ``akgentic.llm.capabilities`` —
+    both are exercised here, because a reader following the text would otherwise write an
+    import that fails.
+    """
+    from akgentic import llm as llm_package  # noqa: PLC0415
+    from akgentic.llm.capabilities import DEFAULT_CONCLUSION_REASON  # noqa: PLC0415
+
+    signature = inspect.signature(LimitRecoveryCapability.handle_limit_exceeded)
+    assert list(signature.parameters) == ["self", "ctx", "error"]
+    assert signature.parameters["error"].kind is inspect.Parameter.KEYWORD_ONLY
+
+    default = await LimitRecoveryCapability().handle_limit_exceeded(
+        None, error=UsageLimitExceeded("spent")
+    )
+    assert isinstance(default, ConclusionDecision)
+    assert default.reason == DEFAULT_CONCLUSION_REASON
+
+    # Documented as NOT exported from the top-level package.
+    assert not hasattr(llm_package, "DEFAULT_CONCLUSION_REASON")
 
 
 # ---------------------------------------------------------------------------

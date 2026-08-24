@@ -22,9 +22,11 @@ from __future__ import annotations
 import logging
 import uuid
 from datetime import datetime
+from typing import Any
 from unittest.mock import patch
 
 import pytest
+from pydantic_ai import UsageLimitExceeded
 from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
@@ -35,9 +37,12 @@ from pydantic_ai.messages import (
     UserPromptPart,
 )
 from pydantic_ai.models.function import AgentInfo, FunctionModel
+from pydantic_ai.tools import RunContext
 
 from akgentic.llm import (
+    ConclusionDecision,
     HealingCapability,
+    LimitRecoveryCapability,
     LlmMessageEvent,
     ModelConfig,
     ReactAgent,
@@ -49,6 +54,22 @@ from akgentic.llm import (
 from akgentic.llm.agent import RUN_LIMIT_HEALING_MESSAGE
 
 RUN_ID = uuid.UUID("cf92c35f-4ee9-4cff-8361-b8ce3827e021")
+
+
+class _NeverConcludes(LimitRecoveryCapability):
+    """The opt-out seam: a run-tier breach raises instead of concluding.
+
+    This file's subject is what the BREACHING run leaves in the context. The default
+    recovery policy answers a breach with a second, tool-free run whose own messages then
+    sit on top of the healing request, so the trailing message is no longer the one under
+    test. Declining keeps the run under test the only one there is.
+    """
+
+    async def handle_limit_exceeded(
+        self, ctx: RunContext[Any], *, error: UsageLimitExceeded
+    ) -> ConclusionDecision | None:
+        """Decline to conclude."""
+        return None
 
 
 class _EventCapture:
@@ -347,7 +368,7 @@ class TestRunInvokesHealing:
             model_cfg=ModelConfig(provider="openai", model="gpt-4o"),
             run_usage_limits=RunUsageLimits(tool_calls_limit=1),
         )
-        agent = ReactAgent(config=config)
+        agent = ReactAgent(config=config, limit_recovery=_NeverConcludes())
 
         @agent.pydantic_agent.tool_plain
         def tool_a() -> str:

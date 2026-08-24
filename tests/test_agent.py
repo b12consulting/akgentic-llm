@@ -2,11 +2,13 @@
 
 import asyncio
 import inspect
+import logging
 from dataclasses import dataclass, field
 from typing import Any, TypeVar, get_type_hints
 from unittest.mock import MagicMock, patch
 
 import pytest
+from pydantic import BaseModel
 from pydantic_ai import BinaryContent
 from pydantic_ai.exceptions import UsageLimitExceeded
 from pydantic_ai.messages import (
@@ -32,9 +34,12 @@ from akgentic.llm import (
     CompactionCapability,
     CompactionConfig,
     CompactionResult,
+    ConclusionDecision,
+    ContextManager,
     EventSourcingCapability,
     HealingCapability,
     LifetimeBudgetCapability,
+    LimitRecoveryCapability,
     ModelConfig,
     ReactAgent,
     ReactAgentConfig,
@@ -44,6 +49,7 @@ from akgentic.llm import (
     UserPrompt,
 )
 from akgentic.llm.agent import RUN_LIMIT_HEALING_MESSAGE
+from akgentic.llm.capabilities import DEFAULT_CONCLUSION_REASON
 from akgentic.llm.compaction import SummarizingCompaction
 from akgentic.llm.event import (
     LlmContextClearedEvent,
@@ -195,6 +201,24 @@ def _bare_run_context() -> RunContext[None]:
     return RunContext[None](deps=None, model=TestModel(), usage=RunUsage())
 
 
+@dataclass
+class _NeverConcludes(LimitRecoveryCapability):
+    """The documented opt-out seam: a run-tier breach raises, exactly as it used to.
+
+    Mounted by every test whose subject is what a breach does to something *else* — the
+    lifetime run counter, the healed context, the conclusion's own inputs. Those claims are
+    about one run, and the default policy adds a second one on top of it; declining keeps
+    each test's subject the single run it was written about. The recovery path itself has
+    its own tests, which use the default.
+    """
+
+    async def handle_limit_exceeded(
+        self, ctx: RunContext[Any], *, error: UsageLimitExceeded
+    ) -> ConclusionDecision | None:
+        """Decline to conclude."""
+        return None
+
+
 @pytest.fixture
 def minimal_config():
     """Minimal ReactAgentConfig for testing."""
@@ -287,18 +311,23 @@ class TestReactAgentInit:
         ]
 
     def test_internal_capabilities_precede_the_callers(self, minimal_config):
-        """The stack is [LifetimeBudget, Compaction, EventSourcing, Healing, *caller].
+        """[LifetimeBudget, Compaction, EventSourcing, LimitRecovery, Healing, *caller].
 
-        The one guard on an order that nothing else pins. One behavioural coupling depends
-        on it and has its own tests: the budget refuses a spent agent **before** compaction
+        The one guard on an order that nothing else pins. Two behavioural couplings depend
+        on it and have their own tests. The budget refuses a spent agent **before** compaction
         pays for a summarizer (``test_rejection_happens_before_compaction`` and its token
         twin, both verified red when Compaction is moved ahead of LifetimeBudget).
+        LimitRecovery sits immediately BEFORE Healing so that Healing fires FIRST: the
+        ``on_run_error`` walk is over ``reversed(self.capabilities)``, so the later entry
+        runs first, and the recovery seam must see the healed context
+        (``test_healing_has_already_run_when_the_seam_is_consulted``, verified red with the
+        two swapped back).
         Compaction ahead of persistence is belt-and-braces rather than load-bearing —
         swapping those two leaves the outcome unchanged, because ``_anchor`` re-opens the
         cursor at the first node hook. First-in-the-list is outermost: pydantic-ai builds
         each ``wrap_run`` chain over ``reversed(self.capabilities)``.
 
-        The four internal classes are asserted POSITIONALLY, as a contiguous block in that
+        The five internal classes are asserted POSITIONALLY, as a contiguous block in that
         exact sequence, with the caller's after them. That is stronger than pairwise
         ``<`` comparisons: a swap of any adjacent pair fails it outright. Where the block
         *starts* is deliberately not asserted — pydantic-ai composes a base capability of
@@ -323,6 +352,7 @@ class TestReactAgentInit:
             LifetimeBudgetCapability,
             CompactionCapability,
             EventSourcingCapability,
+            LimitRecoveryCapability,
             HealingCapability,
         ]
         start = types.index(LifetimeBudgetCapability)
@@ -1068,8 +1098,15 @@ class TestReactAgentRunCountEnforcement:
 
         The breach is real: one request is all the run tier allows, and the model asks
         for a tool, so the follow-up request pydantic-ai needs is the one refused.
+
+        Recovery is declined so the claim stays about ONE run: the default policy answers a
+        breach with a tool-free conclusion, which is a second run through the same stack and
+        consumes a second unit of the very budget this test counts.
         """
-        agent = ReactAgent(config=_both_tier_config(run_request_limit=1, agent_request_limit=3))
+        agent = ReactAgent(
+            config=_both_tier_config(run_request_limit=1, agent_request_limit=3),
+            limit_recovery=_NeverConcludes(),
+        )
 
         @agent.pydantic_agent.tool_plain
         def noop() -> str:
@@ -1086,8 +1123,14 @@ class TestReactAgentRunCountEnforcement:
 
         Which tier fired is asserted by CLASS; the message assertions that follow
         pin the wording, they do not identify the tier.
+
+        Recovery is declined for the same reason as the twin above: each loop iteration must
+        consume exactly one unit of the agent tier for the arithmetic to mean anything.
         """
-        agent = ReactAgent(config=_both_tier_config(run_request_limit=1, agent_request_limit=2))
+        agent = ReactAgent(
+            config=_both_tier_config(run_request_limit=1, agent_request_limit=2),
+            limit_recovery=_NeverConcludes(),
+        )
 
         @agent.pydantic_agent.tool_plain
         def noop() -> str:
@@ -1852,12 +1895,18 @@ class TestReactAgentConcludeWithoutTools:
         and no hook fires under a stubbed ``iter()``. Only the conclusion stays stubbed,
         to capture the history it was handed. The run-tier breach also puts the trailing
         dangling ``ModelResponse`` there for real, which the second half asserts.
+
+        Recovery is declined so the breaching run leaves the healed context as its LAST
+        word: the default policy would drive its own conclusion here, whose messages would
+        then sit between the healing request and the one this test captures.
         """
         config = ReactAgentConfig(
             model_cfg=ModelConfig(provider="openai", model="gpt-4o"),
             run_usage_limits=RunUsageLimits(tool_calls_limit=1),
         )
-        agent = ReactAgent(config=config, tools=[weather_lookup])
+        agent = ReactAgent(
+            config=config, tools=[weather_lookup], limit_recovery=_NeverConcludes()
+        )
 
         def tool_calling_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
             return ModelResponse(
@@ -1922,24 +1971,13 @@ class TestReactAgentConcludeWithoutTools:
         finally:
             agent.close()
 
-    def test_run_still_raises_and_never_concludes_on_its_own(self, minimal_config):
-        """run()'s contract is unchanged (AC #15).
-
-        A run-tier breach propagates out of ``run()`` exactly as before, and the
-        conclusion is not attempted from inside it: exactly one ``iter()`` call, and
-        ``conclude_without_tools`` never invoked. Recovering inside ``run()`` would
-        make the run tier a brake nobody can observe.
-        """
-        agent = ReactAgent(config=minimal_config)
-        breach = _StubRun(enter_raises=UsageLimitExceeded("Request limit exceeded"))
-
-        with patch.object(agent._pydantic_agent, "iter", return_value=breach) as iter_call:
-            with patch.object(agent, "conclude_without_tools") as conclude:
-                with pytest.raises(RunUsageLimitError):
-                    agent.run_sync("burn the turn")
-
-        assert iter_call.call_count == 1
-        conclude.assert_not_called()
+    # ``test_run_still_raises_and_never_concludes_on_its_own`` stood here until story 26-2.
+    # It asserted the contract this story reverses, and would have STAYED GREEN against the
+    # new behaviour: a stubbed ``iter()`` fires no capability hook, so no decision is ever
+    # recorded and the breach raises on the today's-behaviour branch whatever the policy is.
+    # Its two claims live on in ``TestReactAgentLimitRecovery`` — the default now concludes
+    # (asserted against a REAL breach), a seam returning ``None`` still raises — and its
+    # ``iter_call.call_count == 1`` intent survives as "exactly one conclusion".
 
     def test_run_signature_gained_no_limits_parameter(self):
         """The limits override is internal; run()'s public signature is untouched (AC #15).
@@ -1954,6 +1992,458 @@ class TestReactAgentConcludeWithoutTools:
             "deps",
             "output_type",
         ]
+
+
+def _recovery_config(**limits: int) -> ReactAgentConfig:
+    """Config whose run tier is tight enough for a REAL breach to be cheap to provoke."""
+    return ReactAgentConfig(
+        model_cfg=ModelConfig(provider="openai", model="gpt-4o"),
+        run_usage_limits=RunUsageLimits(**limits),
+    )
+
+
+def _breaching_then_concluding_model(
+    offered: list[list[str]], text: str = "concluded"
+) -> FunctionModel:
+    """Asks for two tools while any are offered; answers plainly once they are gone.
+
+    The test model HAS to behave differently once the tools are gone, or the recovery tests
+    cannot pass at all: a model that always answers with a ``ToolCallPart`` breaches the run
+    (good) and then breaches the *conclusion* too, because ``override(tools=[], toolsets=[])``
+    leaves it calling a tool that no longer exists. ``AgentInfo.function_tools`` is empty
+    exactly when the toolset was overridden away, which is the condition to branch on —
+    ``_tool_then_text_model`` answers on the second *request* instead, which is not the same.
+
+    Two calls in one response, against ``tool_calls_limit=1``: pydantic-ai checks the
+    projected count for the whole response before running any of them, so the breach lands on
+    the FIRST request and the run costs exactly one model call. That is what makes "two
+    ``LlmUsageEvent``s for a rescued turn" a claim about the shape rather than about how
+    chatty the stub is.
+
+    ``offered`` records the tool names each request was given, so the caller can assert both
+    what the conclusion was offered (nothing) and how many conclusions happened (one).
+    """
+
+    def stub(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        names = [t.name for t in info.function_tools]
+        offered.append(names)
+        if names:
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(tool_name="weather_lookup", args={"city": "Paris"}),
+                    ToolCallPart(tool_name="weather_lookup", args={"city": "Lyon"}),
+                ]
+            )
+        return ModelResponse(parts=[TextPart(content=text)])
+
+    return FunctionModel(stub)
+
+
+def _always_calling_model() -> FunctionModel:
+    """Asks for the same tool on every request, tools or no tools.
+
+    The conclusion therefore breaches too: with the toolset overridden away the call names a
+    tool that does not exist, pydantic-ai answers with a retry prompt, and the follow-up
+    request exceeds the conclusion's own ``run_request_limit=1``. That is the recursion
+    guard's scenario.
+    """
+
+    def stub(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        return ModelResponse(
+            parts=[ToolCallPart(tool_name="weather_lookup", args={"city": "Paris"})]
+        )
+
+    return FunctionModel(stub)
+
+
+def _is_healing_message(message: ModelMessage) -> bool:
+    """Whether ``message`` is the ``ModelRequest`` ``HealingCapability`` writes on a breach."""
+    return isinstance(message, ModelRequest) and any(
+        isinstance(p, ToolReturnPart) and str(p.content) == RUN_LIMIT_HEALING_MESSAGE
+        for p in message.parts
+    )
+
+
+@dataclass
+class _RecordingSeam(LimitRecoveryCapability):
+    """Records each consultation and the context as it stood at that moment."""
+
+    consulted: list[UsageLimitExceeded] = field(default_factory=list)
+    context_seen: list[list[ModelMessage]] = field(default_factory=list)
+    context: ContextManager | None = None
+
+    async def handle_limit_exceeded(
+        self, ctx: RunContext[Any], *, error: UsageLimitExceeded
+    ) -> ConclusionDecision | None:
+        """Snapshot the durable context, then decide exactly as the base class would."""
+        self.consulted.append(error)
+        if self.context is not None:
+            self.context_seen.append(list(self.context.messages))
+        return await super().handle_limit_exceeded(ctx, error=error)
+
+
+class TestReactAgentLimitRecovery:
+    """run() degrades a run-tier breach into a tool-free conclusion, behind the seam."""
+
+    async def test_a_run_tier_breach_returns_the_concluded_answer(self):
+        """Default policy: the turn answers instead of raising (AC #7).
+
+        Driven by a REAL breach, never a stubbed ``iter()``: the decision is written by
+        ``LimitRecoveryCapability.on_run_error``, which fires *inside* ``iter()``, so a stub
+        reaches no hook and would prove nothing here — it is exactly how the test this
+        replaces stayed green while asserting the opposite behaviour.
+
+        Three claims, one setup: the conclusion's output is what ``run()`` returns, the
+        conclusion was offered no tools, and it happened exactly once.
+        """
+        offered: list[list[str]] = []
+        agent = ReactAgent(config=_recovery_config(tool_calls_limit=1), tools=[weather_lookup])
+
+        with agent.pydantic_agent.override(model=_breaching_then_concluding_model(offered)):
+            result = await agent.run("do the thing")
+
+        assert result == "concluded"
+        assert offered == [["weather_lookup"], []]
+
+    async def test_a_seam_returning_none_reproduces_todays_behaviour(self):
+        """The opt-out is byte-for-byte the pre-recovery contract (AC #8).
+
+        The compatibility guarantee for every deployment that has not opted in, and for
+        ``akgentic-agent`` during the window before its own recovery epic lands: the breach
+        surfaces as ``RunUsageLimitError`` carrying pydantic-ai's own wording, the original
+        exception is its ``__cause__``, no conclusion is attempted, and healing still ran.
+        """
+        offered: list[list[str]] = []
+        agent = ReactAgent(
+            config=_recovery_config(tool_calls_limit=1),
+            tools=[weather_lookup],
+            limit_recovery=_NeverConcludes(),
+        )
+
+        with agent.pydantic_agent.override(model=_breaching_then_concluding_model(offered)):
+            with patch.object(agent, "conclude_without_tools") as conclude:
+                with pytest.raises(RunUsageLimitError) as exc_info:
+                    await agent.run("do the thing")
+
+        conclude.assert_not_called()
+        assert offered == [["weather_lookup"]]
+        cause = exc_info.value.__cause__
+        assert isinstance(cause, UsageLimitExceeded)
+        assert str(exc_info.value) == str(cause)
+        assert "tool_calls_limit" in str(exc_info.value)
+        assert _is_healing_message(agent.context.messages[-1])
+
+    async def test_a_stale_decision_never_drives_a_later_turn(self, minimal_config):
+        """A decision that outlived its own turn is discarded at the head of the next (AC #5).
+
+        The ``except`` clause normally consumes the decision, but it only fires for a
+        ``UsageLimitExceeded``: a co-mounted capability can transform the breach into another
+        class on its way out, and the decision would then survive into a later run and
+        conclude a turn nobody decided about.
+
+        The stub is the point here rather than a shortcut — the claim is about a breach that
+        reaches NO hook, so nothing overwrites what the previous turn left behind. The
+        decision is planted through the hook itself, not by writing the field.
+        """
+        agent = ReactAgent(config=minimal_config)
+        with pytest.raises(UsageLimitExceeded):
+            await agent._limit_recovery.on_run_error(
+                _bare_run_context(), error=UsageLimitExceeded("an earlier turn")
+            )
+
+        breach = _StubRun(enter_raises=UsageLimitExceeded("Request limit exceeded"))
+        with patch.object(agent._pydantic_agent, "iter", return_value=breach):
+            with patch.object(agent, "conclude_without_tools") as conclude:
+                with pytest.raises(RunUsageLimitError):
+                    await agent.run("burn the turn")
+
+        conclude.assert_not_called()
+        assert agent._limit_recovery.consume_decision() is None
+
+    async def test_healing_has_already_run_when_the_seam_is_consulted(self):
+        """Healing fires FIRST, and neither hook is skipped (AC #6b).
+
+        The whole reason ``LimitRecoveryCapability`` is mounted *before*
+        ``HealingCapability``: pydantic-ai walks ``on_run_error`` over
+        ``reversed(self.capabilities)``, so the later entry runs first. Swap the two back and
+        the seam sees a context whose last message is still the dangling ``ModelResponse``,
+        so a policy that reads the context to decide decides on the wrong one.
+
+        What the order does NOT protect is the conclusion's own starting context. The walk
+        runs every hook and re-raises only afterwards, so healing has always written its
+        ``ToolReturnPart`` by the time ``_run_with_limits`` drives the conclusion — swapping
+        the two leaves ``test_a_run_tier_breach_returns_the_concluded_answer`` and
+        ``test_a_rescued_turn_emits_two_runs_worth_of_events`` green, and this test is what
+        sees it. Keeping a dangling tool call out of the conclusion is the job of using
+        ``on_run_error`` instead of ``wrap_run``, not of this ordering.
+        """
+        offered: list[list[str]] = []
+        seam = _RecordingSeam()
+        agent = ReactAgent(
+            config=_recovery_config(tool_calls_limit=1),
+            tools=[weather_lookup],
+            limit_recovery=seam,
+        )
+        seam.context = agent.context
+
+        with agent.pydantic_agent.override(model=_breaching_then_concluding_model(offered)):
+            result = await agent.run("do the thing")
+
+        assert result == "concluded"
+        assert len(seam.consulted) == 1, "the recovery hook ran exactly once"
+        assert _is_healing_message(seam.context_seen[0][-1]), "healing had not run yet"
+
+    async def test_the_conclusion_keeps_the_runs_output_type_and_deps(self):
+        """Both are threaded verbatim from the breached call (AC #9).
+
+        Pinned with a recorder rather than read out of a real second run: the real run is
+        what the recovery test above already proves, and a recorder is the only way to see
+        exactly what ``conclude_without_tools`` was handed.
+        """
+
+        class Verdict(BaseModel):
+            answer: str
+
+        recorded: dict[str, Any] = {}
+
+        async def recorder(reason: str, *, deps: Any = None, output_type: Any = None) -> Verdict:
+            recorded.update(reason=reason, deps=deps, output_type=output_type)
+            return Verdict(answer="concluded")
+
+        offered: list[list[str]] = []
+        agent = ReactAgent(
+            config=_recovery_config(tool_calls_limit=1),
+            tools=[weather_lookup],
+            deps_type=str,
+        )
+
+        with agent.pydantic_agent.override(model=_breaching_then_concluding_model(offered)):
+            with patch.object(agent, "conclude_without_tools", new=recorder):
+                result = await agent.run("do the thing", "tenant-7", Verdict)
+
+        assert result == Verdict(answer="concluded")
+        assert recorded["deps"] == "tenant-7"
+        assert recorded["output_type"] is Verdict
+        assert recorded["reason"] == DEFAULT_CONCLUSION_REASON
+
+    async def test_a_structured_output_type_survives_a_real_recovery(self, monkeypatch):
+        """The recovered value is an instance of the caller's own type (AC #9).
+
+        The conclusion is NOT forced to plain text: its structured output is what routes
+        through the caller's normal path downstream. google-gla is a non-native provider, so
+        ``get_output_type`` leaves the type raw and pydantic-ai uses an output tool — which
+        the conclusion still has, ``override(tools=[], toolsets=[])`` replacing only the
+        function tools.
+        """
+        monkeypatch.setenv("GOOGLE_API_KEY", "test-key")
+
+        class Verdict(BaseModel):
+            answer: str
+
+        config = ReactAgentConfig(
+            model_cfg=ModelConfig(provider="google-gla", model="gemini-2.0-flash"),
+            run_usage_limits=RunUsageLimits(tool_calls_limit=1),
+        )
+        agent = ReactAgent(config=config, tools=[weather_lookup])
+
+        def stub(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            if info.function_tools:
+                return ModelResponse(
+                    parts=[
+                        ToolCallPart(tool_name="weather_lookup", args={"city": "Paris"}),
+                        ToolCallPart(tool_name="weather_lookup", args={"city": "Lyon"}),
+                    ]
+                )
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name=info.output_tools[0].name, args={"answer": "concluded"}
+                    )
+                ]
+            )
+
+        with agent.pydantic_agent.override(model=FunctionModel(stub)):
+            result = await agent.run("do the thing", output_type=Verdict)
+
+        assert result == Verdict(answer="concluded")
+
+    async def test_a_breach_inside_the_conclusion_does_not_conclude_again(self):
+        """The recursion guard, asserted rather than commented (AC #10).
+
+        The conclusion runs through the same capability stack, so the recovery capability is
+        mounted on it too and records a decision for its own breach. What stops a second
+        conclusion is the explicit recovery parameter ``conclude_without_tools`` leaves off —
+        drop it and this run concludes until the interpreter runs out of stack.
+        """
+        reasons: list[str] = []
+        unguarded = ReactAgent.conclude_without_tools
+
+        async def counting(
+            self: ReactAgent, reason: str, *, deps: Any = None, output_type: Any = None
+        ) -> Any:
+            reasons.append(reason)
+            return await unguarded(self, reason, deps=deps, output_type=output_type)
+
+        agent = ReactAgent(config=_recovery_config(tool_calls_limit=1), tools=[weather_lookup])
+
+        with agent.pydantic_agent.override(model=_always_calling_model()):
+            with patch.object(ReactAgent, "conclude_without_tools", new=counting):
+                with pytest.raises(RunUsageLimitError) as exc_info:
+                    await agent.run("do the thing")
+
+        assert reasons == [DEFAULT_CONCLUSION_REASON]
+        assert "tool_calls_limit" in str(exc_info.value), "the ORIGINAL breach surfaced"
+
+    async def test_a_direct_conclusion_never_recovers_itself(self):
+        """Called directly, a conclusion that breaches raises — it does not conclude (AC #10)."""
+        agent = ReactAgent(config=_recovery_config(tool_calls_limit=1), tools=[weather_lookup])
+        reasons: list[str] = []
+        unguarded = ReactAgent.conclude_without_tools
+
+        async def counting(
+            self: ReactAgent, reason: str, *, deps: Any = None, output_type: Any = None
+        ) -> Any:
+            reasons.append(reason)
+            return await unguarded(self, reason, deps=deps, output_type=output_type)
+
+        with agent.pydantic_agent.override(model=_always_calling_model()):
+            with patch.object(ReactAgent, "conclude_without_tools", new=counting):
+                with pytest.raises(RunUsageLimitError):
+                    await agent.conclude_without_tools("wrap it up")
+
+        assert reasons == ["wrap it up"]
+
+    @pytest.mark.parametrize(
+        "secondary",
+        [RuntimeError("the conclusion blew up"), AgentUsageLimitError("lifetime budget spent")],
+        ids=["generic", "agent-tier"],
+    )
+    async def test_a_raising_conclusion_surfaces_the_original_breach(self, secondary, caplog):
+        """Whatever the conclusion raises, the caller sees the breach (AC #11).
+
+        Escalation parity with what ``akgentic-agent`` does today. The agent-tier case is the
+        one worth stating: an ``AgentUsageLimitError`` from the conclusion's own pre-flight is
+        correct, not a bug — but it is not what this caller asked about, and the terminal
+        signal is not lost either way, since the NEXT ``run()`` is refused pre-flight with it
+        and a direct ``conclude_without_tools()`` still raises it unchanged.
+        """
+        offered: list[list[str]] = []
+        agent = ReactAgent(config=_recovery_config(tool_calls_limit=1), tools=[weather_lookup])
+
+        async def failing(*_: Any, **__: Any) -> Any:
+            raise secondary
+
+        with caplog.at_level(logging.ERROR, logger="akgentic.llm.agent"):
+            with agent.pydantic_agent.override(model=_breaching_then_concluding_model(offered)):
+                with patch.object(agent, "conclude_without_tools", new=failing):
+                    with pytest.raises(RunUsageLimitError) as exc_info:
+                        await agent.run("do the thing")
+
+        assert "tool_calls_limit" in str(exc_info.value)
+        assert str(secondary) not in str(exc_info.value)
+        assert isinstance(exc_info.value.__cause__, UsageLimitExceeded)
+        assert any(record.exc_info for record in caplog.records), "the secondary was logged"
+
+    @pytest.mark.parametrize("output", [None, "   "], ids=["none", "whitespace"])
+    async def test_an_unusable_conclusion_output_surfaces_the_original_breach(
+        self, output, caplog
+    ):
+        """Nothing usable is the same as nothing at all (AC #11).
+
+        Narrow by design: ``None``, or a ``str`` that is empty or whitespace-only. Richer
+        emptiness — a structured output carrying no requests — is the caller's judgement and
+        stays out of this package.
+
+        The log line is asserted, not incidental: nothing raised on this path, so the warning
+        is the ONLY trace that a turn was rescued and the rescue came back empty. Its sibling
+        above has an exception to carry that signal; this one has nothing else.
+        """
+        offered: list[list[str]] = []
+        agent = ReactAgent(config=_recovery_config(tool_calls_limit=1), tools=[weather_lookup])
+
+        async def useless(*_: Any, **__: Any) -> Any:
+            return output
+
+        with caplog.at_level(logging.WARNING, logger="akgentic.llm.agent"):
+            with agent.pydantic_agent.override(model=_breaching_then_concluding_model(offered)):
+                with patch.object(agent, "conclude_without_tools", new=useless):
+                    with pytest.raises(RunUsageLimitError) as exc_info:
+                        await agent.run("do the thing")
+
+        assert "tool_calls_limit" in str(exc_info.value)
+        assert isinstance(exc_info.value.__cause__, UsageLimitExceeded)
+        assert any("no usable output" in r.message for r in caplog.records), (
+            "an empty rescue must leave a trace; nothing raised to carry one"
+        )
+
+    async def test_an_agent_tier_breach_never_consults_the_seam(self):
+        """The terminal tier stays terminal: no seam, no conclusion (AC #12).
+
+        ``AgentUsageLimitError`` is this package's own class, not a ``UsageLimitExceeded``,
+        so the hook's ``isinstance`` check excludes it by construction rather than by a
+        special case.
+        """
+        seam = _RecordingSeam()
+        agent = ReactAgent(config=_agent_limit_config(1), limit_recovery=seam)
+
+        with agent.pydantic_agent.override(model=_text_model()):
+            await agent.run("the only run this agent gets")
+
+            with patch.object(agent, "conclude_without_tools") as conclude:
+                with pytest.raises(AgentUsageLimitError):
+                    await agent.run("one run too many")
+
+        assert seam.consulted == []
+        assert seam.consume_decision() is None
+        conclude.assert_not_called()
+
+    async def test_a_rescued_turn_consumes_two_units_of_the_lifetime_budget(self):
+        """A rescued turn costs TWO runs of the agent-lifetime budget, not one.
+
+        Inherent to the sibling-run design rather than a regression — the conclusion is a
+        second run through the same stack and pays the same agent-tier pre-flight. But it is
+        exactly what ``test_counter_advances_when_the_run_tier_limit_fires`` and its loop
+        twin stopped covering when they took the opt-out seam to keep their own subject a
+        single run, so without this the arithmetic a caller sizing ``agent_request_limit``
+        depends on would be stated only in prose.
+        """
+        offered: list[list[str]] = []
+        agent = ReactAgent(config=_recovery_config(tool_calls_limit=1), tools=[weather_lookup])
+
+        with agent.pydantic_agent.override(model=_breaching_then_concluding_model(offered)):
+            assert await agent.run("do the thing") == "concluded"
+
+        assert agent._agent_run_count == 2
+
+    async def test_a_rescued_turn_emits_two_runs_worth_of_events(self):
+        """The event stream is unchanged in shape by recovery (AC #15).
+
+        A rescued turn is the outer run's events (``run_id`` A) → the healing
+        ``ToolReturnPart`` → the conclusion's events (``run_id`` B), which is byte-for-byte
+        what a rescued turn already emitted when the conclusion was driven from another
+        package. No event dataclass and no ``EventSourcingCapability`` change was needed, and
+        none should be made: the conclusion is simply a second run.
+        """
+        offered: list[list[str]] = []
+        observer = MockObserver()
+        agent = ReactAgent(
+            config=_recovery_config(tool_calls_limit=1),
+            tools=[weather_lookup],
+            observer=observer,
+        )
+
+        with agent.pydantic_agent.override(model=_breaching_then_concluding_model(offered)):
+            assert await agent.run("do the thing") == "concluded"
+
+        usage = [(i, e) for i, e in enumerate(observer.events) if isinstance(e, LlmUsageEvent)]
+        assert len(usage) == 2
+        assert usage[0][1].run_id != usage[1][1].run_id
+        healing_at = next(
+            i
+            for i, e in enumerate(observer.events)
+            if isinstance(e, LlmMessageEvent) and _is_healing_message(e.message)
+        )
+        assert usage[0][0] < healing_at < usage[1][0]
 
 
 class TestReactAgentMultimodalPrompt:

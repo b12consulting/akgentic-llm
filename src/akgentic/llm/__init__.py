@@ -15,17 +15,22 @@ Key Concepts:
     - REACT pattern: Iterative agent execution with tool calls
     - RunUsageLimits: Per-run token/request budget, enforced by pydantic-ai
     - AgentUsageLimits: Agent-lifetime budget, enforced pre-flight on every run
-    - RunUsageLimitError: A run-tier breach — recoverable, the turn may not call
-      another tool but the agent still has lifetime budget
+    - RunUsageLimitError: A run-tier breach — recovered by default rather than
+      raised. The mounted LimitRecoveryCapability decides the turn concludes, and
+      run() returns that conclusion's answer; this class surfaces only when the
+      seam declines (returns None) or the conclusion itself produces nothing usable
     - AgentUsageLimitError: An agent-tier breach — terminal, the agent is finished
     - UsageLimitError: Base of both; catch it to handle either tier, catch a
       subclass to react to one. The tiers are told apart by class, never by
       message text.
     - ContextManager: Message history tracking
     - LifetimeBudgetCapability / CompactionCapability / EventSourcingCapability /
-      HealingCapability: the run loop's agent-lifetime budget, its auto-compaction,
-      its persistence and its dangling-tool-call repair, each mountable a la carte
-      on any bare pydantic-ai Agent
+      LimitRecoveryCapability / HealingCapability: the run loop's agent-lifetime
+      budget, its auto-compaction, its persistence, its run-tier recovery policy
+      and its dangling-tool-call repair, each mountable a la carte on any bare
+      pydantic-ai Agent. That is also ReactAgent's mount order.
+    - ConclusionDecision: what LimitRecoveryCapability's handle_limit_exceeded seam
+      returns to ask for a tool-free conclusion; None asks for none
     - PromptTemplate: Template-based prompts with parameter substitution
 """
 
@@ -40,9 +45,11 @@ from .agent import (
 )
 from .capabilities import (
     CompactionCapability,
+    ConclusionDecision,
     EventSourcingCapability,
     HealingCapability,
     LifetimeBudgetCapability,
+    LimitRecoveryCapability,
 )
 from .compaction import (
     COMPACTION_STRATEGIES,
@@ -116,6 +123,8 @@ __all__ = [
     "CompactionCapability",
     "EventSourcingCapability",
     "HealingCapability",
+    "LimitRecoveryCapability",
+    "ConclusionDecision",
     # Compaction
     "LlmContextCompactedEvent",
     "LlmContextClearedEvent",

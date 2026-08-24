@@ -38,12 +38,14 @@ from akgentic.llm import (
     AgentUsageLimits,
     CompactionCapability,
     CompactionResult,
+    ConclusionDecision,
     ContextManager,
     EventSourcingCapability,
     HealingCapability,
     LifetimeBudgetCapability,
+    LimitRecoveryCapability,
 )
-from akgentic.llm.capabilities import RUN_LIMIT_HEALING_MESSAGE
+from akgentic.llm.capabilities import DEFAULT_CONCLUSION_REASON, RUN_LIMIT_HEALING_MESSAGE
 from akgentic.llm.event import (
     LlmContextCompactedEvent,
     LlmMessageEvent,
@@ -1392,3 +1394,165 @@ def test_it_does_not_override_for_run_either() -> None:
     protect — and nothing a shared instance can leak between runs.
     """
     assert CompactionCapability.for_run is AbstractCapability.for_run
+
+
+# ---------------------------------------------------------------------------
+# Story 26.2 — LimitRecoveryCapability, mounted on a bare Agent
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _RecordingSeam(LimitRecoveryCapability):
+    """Records every seam consultation, then defers to the default decision."""
+
+    consulted: list[UsageLimitExceeded] = field(default_factory=list)
+
+    async def handle_limit_exceeded(
+        self, ctx: RunContext[Any], *, error: UsageLimitExceeded
+    ) -> ConclusionDecision | None:
+        """Record the breach, then answer exactly as the base class would."""
+        self.consulted.append(error)
+        return await super().handle_limit_exceeded(ctx, error=error)
+
+
+@dataclass
+class _DecliningSeam(LimitRecoveryCapability):
+    """A seam that never concludes — the documented opt-out."""
+
+    consulted: list[UsageLimitExceeded] = field(default_factory=list)
+
+    async def handle_limit_exceeded(
+        self, ctx: RunContext[Any], *, error: UsageLimitExceeded
+    ) -> ConclusionDecision | None:
+        """Record the breach and decline, restoring the pre-recovery contract."""
+        self.consulted.append(error)
+        return None
+
+
+def _traceback_chain(error: BaseException) -> list[Any]:
+    """Every traceback object in ``error``'s chain, outermost first."""
+    chain: list[Any] = []
+    tb = error.__traceback__
+    while tb is not None:
+        chain.append(tb)
+        tb = tb.tb_next
+    return chain
+
+
+async def test_a_non_limit_error_re_raises_the_same_object_without_consulting_the_seam() -> None:
+    """Only a run-tier breach reaches the seam; everything else passes through (AC #2).
+
+    ``AgentUsageLimitError`` is the case that matters in production — it is this package's
+    own class, not a ``UsageLimitExceeded``, so the terminal tier is excluded by the
+    ``isinstance`` check rather than by a special case.
+    """
+    capability = _RecordingSeam()
+    error = AgentUsageLimitError("the lifetime budget is spent")
+
+    with pytest.raises(AgentUsageLimitError) as exc_info:
+        await capability.on_run_error(_bare_run_context(), error=error)
+
+    assert exc_info.value is error
+    assert capability.consulted == []
+    assert capability.consume_decision() is None
+
+
+async def test_a_run_tier_breach_consults_the_seam_and_re_raises_the_same_object() -> None:
+    """The seam decides, the hook still raises — it never returns a value (AC #2, #3)."""
+    capability = _RecordingSeam()
+    error = UsageLimitExceeded("budget spent")
+
+    with pytest.raises(UsageLimitExceeded) as exc_info:
+        await capability.on_run_error(_bare_run_context(), error=error)
+
+    assert exc_info.value is error
+    assert capability.consulted == [error]
+    decision = capability.consume_decision()
+    assert decision is not None
+    assert decision.reason == DEFAULT_CONCLUSION_REASON
+
+
+async def test_the_breachs_traceback_reaches_the_caller_untouched() -> None:
+    """Re-raising the same object leaves its existing traceback in the chain (AC #2).
+
+    ``Akgent._handle_failure`` formats that traceback onto ``ErrorMessage.traceback``, so a
+    hook that rebuilt the exception would silently truncate what the operator sees.
+    """
+    try:
+        raise UsageLimitExceeded("budget spent")
+    except UsageLimitExceeded as raised:
+        error = raised
+    original = _traceback_chain(error)
+    assert original, "the error must carry a traceback before the hook sees it"
+
+    with pytest.raises(UsageLimitExceeded) as exc_info:
+        await LimitRecoveryCapability().on_run_error(_bare_run_context(), error=error)
+
+    assert _traceback_chain(exc_info.value)[-len(original) :] == original
+
+
+def test_it_defines_no_wrap_run() -> None:
+    """The decision lives on ``on_run_error`` and nowhere else (AC #2).
+
+    Error hooks fire only once the exception has escaped the whole ``wrap_run`` chain, so a
+    ``wrap_run`` here would pre-empt ``HealingCapability.on_run_error`` and the conclusion
+    would start from a context still carrying a dangling tool call.
+    """
+    assert "wrap_run" not in LimitRecoveryCapability.__dict__
+    assert LimitRecoveryCapability.wrap_run is AbstractCapability.wrap_run
+
+
+def test_it_does_not_override_for_run_structurally() -> None:
+    """The default ``for_run`` (return ``self``) is what makes the decision readable (AC #4).
+
+    Asserted structurally as well as behaviourally (see the twin below) because the
+    behavioural failure is silent: a per-run copy records the decision on an object nobody
+    holds, and recovery simply never happens.
+    """
+    assert LimitRecoveryCapability.for_run is AbstractCapability.for_run
+
+
+async def test_the_decision_is_readable_off_the_instance_that_was_mounted() -> None:
+    """A real breach on a bare Agent writes its decision where the mounter can read it (AC #4).
+
+    The guard for the ``for_run`` trap: reintroduce ``async def for_run(self, ctx): return
+    replace(self)`` — copied from ``EventSourcingCapability`` "for consistency" — and the
+    hook writes onto a per-run copy, so ``consume_decision()`` here answers ``None``.
+    """
+    capability = LimitRecoveryCapability()
+    agent = _agent_with_tool([capability])
+
+    with pytest.raises(UsageLimitExceeded):
+        await agent.run("hello", usage_limits=UsageLimits(tool_calls_limit=1))
+
+    decision = capability.consume_decision()
+    assert decision is not None
+    assert decision.reason == DEFAULT_CONCLUSION_REASON
+
+
+async def test_a_seam_returning_none_records_no_decision() -> None:
+    """The opt-out is a decision of ``None``, not an unset field (AC #3)."""
+    capability = _DecliningSeam()
+    agent = _agent_with_tool([capability])
+
+    with pytest.raises(UsageLimitExceeded) as exc_info:
+        await agent.run("hello", usage_limits=UsageLimits(tool_calls_limit=1))
+
+    assert capability.consulted == [exc_info.value]
+    assert capability.consume_decision() is None
+
+
+async def test_consume_decision_is_read_and_clear() -> None:
+    """The second read answers ``None``: a decision drives at most one conclusion (AC #5)."""
+    capability = LimitRecoveryCapability()
+
+    with pytest.raises(UsageLimitExceeded):
+        await capability.on_run_error(_bare_run_context(), error=UsageLimitExceeded("spent"))
+
+    assert capability.consume_decision() is not None
+    assert capability.consume_decision() is None
+
+
+def test_the_default_reason_is_the_shared_constant() -> None:
+    """``ConclusionDecision()`` carries the package's one conclusion wording (AC #1)."""
+    assert ConclusionDecision().reason is DEFAULT_CONCLUSION_REASON

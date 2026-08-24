@@ -13,7 +13,7 @@ from pydantic_ai.usage import RunUsage
 # Re-exported, not used here: healing moved into HealingCapability and the usage-limit
 # hierarchy moved next to the capability that raises the agent tier, but
 # `akgentic.llm.agent.<name>` stays importable for callers written against the old home.
-# capabilities.py holds the one definition of each.
+# The capabilities package holds the one definition of each.
 from .capabilities import (
     RUN_LIMIT_HEALING_MESSAGE as RUN_LIMIT_HEALING_MESSAGE,
 )
@@ -22,9 +22,11 @@ from .capabilities import (
 )
 from .capabilities import (
     CompactionCapability,
+    ConclusionDecision,
     EventSourcingCapability,
     HealingCapability,
     LifetimeBudgetCapability,
+    LimitRecoveryCapability,
 )
 from .capabilities import (
     RunUsageLimitError as RunUsageLimitError,
@@ -110,7 +112,7 @@ class ReactAgent:
         result_type: type[Any] = str,
         observer: ContextObserver | None = None,
         capabilities: Sequence[AgentCapability[Any]] | None = None,
-        event_loop: asyncio.AbstractEventLoop | None = None,
+        limit_recovery: LimitRecoveryCapability | None = None,
     ) -> None:
         """Initialize REACT agent.
 
@@ -122,19 +124,24 @@ class ReactAgent:
             result_type: Type for agent result validation (default: str)
             observer: Context observer to register automatically (optional)
             capabilities: Optional sequence of pydantic-ai AgentCapability instances.
-                They are NOT forwarded unchanged: four internal capabilities —
+                They are NOT forwarded unchanged: five internal capabilities —
                 LifetimeBudgetCapability, then CompactionCapability, then
-                EventSourcingCapability, then HealingCapability — are mounted ahead of
-                them, because those four own the agent-lifetime budget, auto-compaction,
-                persistence, system-prompt recording and dangling-tool-call healing for
-                every run this agent drives. The budget is outermost so a run it refuses
-                reaches none of the others — including the summarizer LLM call.
+                EventSourcingCapability, then LimitRecoveryCapability, then
+                HealingCapability — are mounted ahead of them, because those five own
+                the agent-lifetime budget, auto-compaction, persistence, system-prompt
+                recording, the run-tier recovery decision (whether a breached turn
+                concludes instead of raising — see `limit_recovery` below) and
+                dangling-tool-call healing for every run this agent drives. The budget
+                is outermost so a run it refuses reaches none of the others — including
+                the summarizer LLM call. Limit recovery is immediately before healing so
+                that healing, the later entry, fires FIRST in the reversed on_run_error
+                walk and the seam is consulted against an already-healed context.
                 That is the MOUNT order, and it is a default rather than a guarantee:
                 pydantic-ai's CombinedCapability topologically re-sorts the whole chain
                 as soon as ANY capability declares get_ordering(), so a caller declaring
-                position='outermost' — or wraps=[...] naming one of the four — lands
-                ahead of them. None of the four declares an ordering, so a caller that
-                declares nothing does sit inside all four, and the two consequences below
+                position='outermost' — or wraps=[...] naming one of the five — lands
+                ahead of them. None of the five declares an ordering, so a caller that
+                declares nothing does sit inside all five, and the two consequences below
                 hold for that caller. A caller that re-sorts itself gets neither.
                 First: a capability sees only the POST-compaction history, never what
                 compaction folded away — the fold happens in CompactionCapability's
@@ -160,15 +167,21 @@ class ReactAgent:
                 not a documented public guarantee, and could change in a future
                 release — a capability should still avoid orphaning tool calls on
                 purpose.
-            event_loop: Deprecated — accepted and ignored. The agent creates and
-                owns its own loop (``self._loop``); the passed loop is neither
-                adopted nor used by ``run_sync``. Kept in the signature for one
-                release so callers can stop passing it without a flag day.
+            limit_recovery: The run-tier recovery policy, as a
+                ``LimitRecoveryCapability`` (or a subclass overriding its
+                ``handle_limit_exceeded`` seam). Defaults to the base class, whose
+                policy is one tool-free conclusion per run-tier breach; a subclass
+                returning ``None`` from the seam restores the pre-recovery contract,
+                where a breach simply raises. This keyword is the ONLY way to mount
+                a subclass: passing one through ``capabilities=`` would mount a
+                *second* recovery capability beside the default rather than replacing
+                it, and ``_run_with_limits`` reads the decision off the instance held
+                here.
         """
         # The agent owns its loop: create it and make it current on the
         # constructing thread BEFORE building the httpx client / model, so the
         # connection pool stays a per-agent resource bound to one stable loop
-        # (ADR-008). The deprecated `event_loop=` argument is ignored.
+        # (ADR-008).
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
         self._closed = False
@@ -176,12 +189,6 @@ class ReactAgent:
         self._config = config
         self._deps_type = deps_type
         self._result_type = result_type
-
-        # The whole agent-lifetime budget — both counters, both pre-flight checks, the
-        # usage fold and the restore seeding — lives here. Held on the instance because
-        # restore_context() reseeds it and the two read-through properties below report
-        # it; it is also the first entry of the capability stack assembled further down.
-        self._budget = LifetimeBudgetCapability(limits=config.agent_usage_limits)
 
         # Create context manager (no max_messages by default)
         self._context = ContextManager()
@@ -199,6 +206,18 @@ class ReactAgent:
             exp_multiplier=config.runtime_cfg.http_client_config.backoff_multiplier,
             exp_max_s=config.runtime_cfg.http_client_config.backoff_max,
         )
+
+        # Create model from config
+        self._model = create_model(config.model_cfg, self._http_client)
+
+        # Wrap result_type with provider-aware output strategy for structured output
+        wrapped_result_type: Any = get_output_type(config.model_cfg, result_type)
+
+        # The whole agent-lifetime budget — both counters, both pre-flight checks, the
+        # usage fold and the restore seeding — lives here. Held on the instance because
+        # restore_context() reseeds it and the two read-through properties below report
+        # it; it is also the first entry of the capability stack assembled further down.
+        self._budget = LifetimeBudgetCapability(limits=config.agent_usage_limits)
 
         # Resolve the compaction strategy as runtime state (never a Pydantic
         # field). Built AFTER self._http_client so the summarizer reuses the
@@ -221,11 +240,12 @@ class ReactAgent:
             event_factory=self._build_compaction_event,
         )
 
-        # Create model from config
-        self._model = create_model(config.model_cfg, self._http_client)
-
-        # Wrap result_type with provider-aware output strategy for structured output
-        wrapped_result_type: Any = get_output_type(config.model_cfg, result_type)
+        # The run-tier recovery POLICY — whether a breached turn concludes instead of
+        # raising, and with what prompt. Held on the instance for the same reason as the two
+        # above: ``_run_with_limits`` reads the decision back off this exact object, which is
+        # also why the class must not override ``for_run``. A caller's subclass arrives here
+        # and replaces the default; it is never mounted alongside it.
+        self._limit_recovery = limit_recovery or LimitRecoveryCapability()
 
         # The whole capability stack, assembled once, here — the only place its order is
         # decided. The budget is first of all, so a run it refuses reaches none of the
@@ -235,11 +255,19 @@ class ReactAgent:
         # cursor at the first node hook either way. The internal ones come first so the
         # caller's sit inside them: pydantic-ai unwinds the chain in reverse, so a caller
         # capability's after_* hooks run before the persistence sweep and its durable edits
-        # are what gets persisted.
+        # are what gets persisted. Limit recovery sits immediately BEFORE healing, and that
+        # position is load-bearing: pydantic-ai walks the on_run_error chain in REVERSE, so
+        # the later entry fires first — healing must write its ToolReturnPart before the
+        # recovery seam is consulted, so that a policy reading the context to decide sees the
+        # healed one. It is NOT what keeps a dangling tool call out of the conclusion: the
+        # walk runs every hook and only then re-raises, so healing has always written its
+        # part by the time `_run_with_limits` drives the conclusion, whatever the order.
+        # Using `on_run_error` rather than `wrap_run` is what protects the conclusion.
         capability_stack: list[AgentCapability[Any]] = [
             self._budget,
             self._compactor,
             EventSourcingCapability(context=self._context),
+            self._limit_recovery,
             HealingCapability(context=self._context),
             *(capabilities or []),
         ]
@@ -269,6 +297,16 @@ class ReactAgent:
         incrementally as the run produces messages, but that is
         ``EventSourcingCapability``'s ``after_node_run`` sweep, not this method.
 
+        On a run-tier breach the mounted ``LimitRecoveryCapability`` is consulted:
+        with the default policy the turn degrades into one tool-free conclusion and
+        that conclusion's output is what this returns, instead of raising. A seam
+        returning ``None`` restores the raising contract exactly.
+
+        **A rescued turn costs TWO units of the agent-lifetime run budget**, not one:
+        the conclusion is a sibling run through the same stack and pays the same
+        agent-tier pre-flight as any other. Size ``agent_request_limit`` accordingly —
+        a turn that breaches buys half as many turns as one that does not.
+
         Args:
             user_prompt: User message to process
             deps: Optional dependency object (must match deps_type)
@@ -283,13 +321,19 @@ class ReactAgent:
         Raises:
             AgentUsageLimitError: If the agent-lifetime budget (tokens or runs)
                 rejects this call before it runs. Terminal for this agent.
-            RunUsageLimitError: If pydantic-ai breaches a run-tier limit mid-run.
-                Recoverable — the agent may still have lifetime budget.
+            RunUsageLimitError: If pydantic-ai breaches a run-tier limit mid-run and
+                the recovery seam declined to conclude — or the conclusion it asked
+                for failed or produced nothing usable, in which case this carries the
+                ORIGINAL breach, never the secondary failure.
             UsageLimitError: Base of both — catch this instead of the subclasses when
                 the caller does not care which tier fired.
         """
         return await self._run_with_limits(
-            user_prompt, deps, output_type, self._config.run_usage_limits
+            user_prompt,
+            deps,
+            output_type,
+            self._config.run_usage_limits,
+            allow_recovery=True,
         )
 
     async def conclude_without_tools(
@@ -298,8 +342,13 @@ class ReactAgent:
         """Turn an interrupted turn into an answer: one follow-up run, no tools.
 
         **Mechanism only** — nothing here decides *whether* to conclude; that policy
-        lives in the caller (ADR-016 §D3/§D4). ``run()`` never calls this itself and
-        keeps raising on every breach.
+        lives in ``LimitRecoveryCapability``'s seam, and ``run()`` drives this method
+        when the seam asks for it. A direct call concludes unconditionally.
+
+        **A conclusion is never itself recovered.** It goes through the same capability
+        stack, so the recovery capability is mounted on it too — but this call leaves
+        ``_run_with_limits``' recovery off, so a breach *during* a conclusion raises
+        rather than starting a second one.
 
         The tools are removed with ``override(tools=[], toolsets=[])``, the only
         construct that *replaces* what is registered: a per-run ``toolsets=[]`` is
@@ -372,6 +421,8 @@ class ReactAgent:
         deps: Any,
         output_type: type[Any] | None,
         limits: RunUsageLimits | None,
+        *,
+        allow_recovery: bool = False,
     ) -> Any:
         """Shared run core: fold the prompt, convert the run tier, one ``run()`` call.
 
@@ -392,14 +443,21 @@ class ReactAgent:
             deps: Optional dependency object.
             output_type: Optional per-call output type override.
             limits: The run-tier budget to bound this turn with, or None.
+            allow_recovery: Whether a run-tier breach may degrade into a tool-free
+                conclusion when the mounted seam asks for one. ``run()`` passes
+                ``True``; ``conclude_without_tools`` leaves it ``False``, which is
+                the whole of the recursion guard — a conclusion is driven through
+                this same core and must never start another one.
 
         Returns:
-            Agent result output. ``run()`` either produces a result or raises, so
-            there is no "no result" case to return.
+            Agent result output — the run's, or the conclusion's when a breach was
+            recovered. ``run()`` either produces a result or raises, so there is no
+            "no result" case to return.
 
         Raises:
             AgentUsageLimitError: Raised pre-flight by either agent-tier check.
-            RunUsageLimitError: Raised when pydantic-ai breaches a run-tier limit.
+            RunUsageLimitError: Raised when pydantic-ai breaches a run-tier limit and
+                no conclusion was driven, or the conclusion failed.
             Exception: Anything else the run raised, propagating unchanged — the
                 object and its ``__traceback__`` are the caller's, not this
                 method's, to alter, because that is what
@@ -407,6 +465,12 @@ class ReactAgent:
         """
         user_prompt = self._fold_pending_user_prompts(user_prompt)
         pydantic_limits = self._to_pydantic_limits(limits)
+
+        # Discard any decision left over from an earlier turn. The `except` below normally
+        # consumes it, but a co-mounted capability may transform the breach into another
+        # class on its way out, in which case that clause never fires and the stale decision
+        # would drive a conclusion for THIS run's breach instead of the one it was made for.
+        self._limit_recovery.consume_decision()
 
         # No `usage=`: the run's own accumulator is the one pydantic-ai's graph creates,
         # and LifetimeBudgetCapability folds it from `wrap_run`'s ctx. Handing in the
@@ -422,7 +486,67 @@ class ReactAgent:
             )
             return result.output
         except UsageLimitExceeded as e:
-            raise RunUsageLimitError(str(e)) from e
+            decision = self._limit_recovery.consume_decision()
+            if not allow_recovery or decision is None:
+                raise RunUsageLimitError(str(e)) from e
+            return await self._conclude_after_breach(
+                decision, e, deps=deps, output_type=output_type
+            )
+
+    async def _conclude_after_breach(
+        self,
+        decision: ConclusionDecision,
+        breach: UsageLimitExceeded,
+        *,
+        deps: Any,
+        output_type: type[Any] | None,
+    ) -> Any:
+        """Drive the conclusion the seam asked for, or surface the ORIGINAL breach.
+
+        **Any** failure of the attempt — a second run-tier breach, the terminal
+        ``AgentUsageLimitError`` from the conclusion's own pre-flight, anything else, or an
+        output nothing can be done with — falls through to exactly the behaviour a declined
+        recovery would have produced. The caller sees the original breach and never the
+        secondary one, which would otherwise replace a "this turn ran out of budget" signal
+        with an unrelated failure.
+
+        That single guarantee is what a consumer's whole usage-limit policy can now rest on:
+        this package either returns an answer or re-raises the breach the turn started with,
+        so the consumer needs no tier branch and no second attempt of its own.
+
+        "Nothing usable" is deliberately narrow: ``None``, or a ``str`` that is empty or
+        whitespace-only. Richer emptiness — a structured output carrying no requests — is
+        the caller's judgement and stays out of this package.
+
+        ``deps`` and ``output_type`` are threaded verbatim from the breached call, so the
+        conclusion produces the same shape the caller asked for and its structured output
+        routes downstream through the caller's normal path.
+
+        Args:
+            decision: What the seam decided; its ``reason`` is the conclusion's prompt.
+            breach: The original run-tier breach, and the only one the caller may see.
+            deps: The breached call's dependency object.
+            output_type: The breached call's per-call output type override.
+
+        Returns:
+            The conclusion's output.
+
+        Raises:
+            RunUsageLimitError: Built from ``breach`` whenever the conclusion did not
+                produce a usable answer.
+        """
+        try:
+            output = await self.conclude_without_tools(
+                decision.reason, deps=deps, output_type=output_type
+            )
+        except Exception:
+            logger.exception("Tool-free conclusion failed; surfacing the original breach")
+            raise RunUsageLimitError(str(breach)) from breach
+
+        if output is None or (isinstance(output, str) and not output.strip()):
+            logger.warning("Tool-free conclusion produced no usable output; surfacing the breach")
+            raise RunUsageLimitError(str(breach)) from breach
+        return output
 
     @property
     def _agent_run_count(self) -> int:
@@ -573,8 +697,11 @@ class ReactAgent:
             RuntimeError: If the agent has been closed
             UsageLimitError: If usage limits are exceeded. run_sync() surfaces
                 whatever run() raised, so either subclass can arrive here:
-                RunUsageLimitError for a run-tier breach, AgentUsageLimitError for
-                an agent-tier one.
+                AgentUsageLimitError for an agent-tier breach, which is terminal,
+                and RunUsageLimitError for a run-tier one — but only when the
+                recovery seam declined, or the conclusion it asked for failed or
+                produced nothing usable. A recovered run-tier breach RETURNS the
+                conclusion's answer from here, exactly as it does from run().
         """
         # Always run on the agent's own loop so the httpx connection pool stays
         # bound to ONE stable loop across calls. There is no asyncio.run()
