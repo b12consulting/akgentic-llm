@@ -22,6 +22,7 @@ call any LLM without coupling to a specific vendor or framework primitive.
 - [ReactAgent API](#reactagent-api)
 - [Capabilities](#capabilities)
   - [Run-loop capabilities](#run-loop-capabilities)
+  - [Hook timeline](#hook-timeline)
   - [Run-tier recovery](#run-tier-recovery)
 - [Multimodal Prompts](#multimodal-prompts)
 - [Context Management](#context-management)
@@ -924,6 +925,137 @@ a new prompt. Two consequences, before you assume this stream is byte-identical 
   did not previously exist.
 
 Group a trace by `run_id`, which every event carries, rather than by arrival order.
+
+### Hook timeline
+
+The five internal capabilities, `PendingMessageDrainCapability` (auto-injected by pydantic-ai)
+and any caller capability all hang off the **same** set of hooks. What separates them is *which*
+hook and *which direction the chain is walked* — and neither is guessable from a signature. This
+section is the map.
+
+**One ordering rule covers every hook family:**
+
+> `before_*` walks the list **forwards** — outermost first.
+> `after_*`, `on_*_error` and the tail of every `wrap_*` walk it **backwards** — innermost first.
+
+So the capability that sees a request **first** is the one that sees a result **last**. That
+asymmetry is load-bearing, and it is the single most common source of surprise: a capability
+mounted `outermost` gets the first word on the way in and the *last* word on the way out.
+
+#### The hooks, by family
+
+| Family | Type | Runs at | Input it is handed | What returning a value does |
+|---|---|---|---|---|
+| `before_run` | observe | once, run start | `ctx` | nothing — observe-only |
+| `wrap_run` | wrap | around the whole run | `handler()` | short-circuit the run, or recover a raised error |
+| `on_run_error` | error | run raised | the exception | **raise** to propagate, **return** an `AgentRunResult` to recover |
+| `after_run` | transform | run produced a result | `AgentRunResult` | replaces the run's result |
+| `before_node_run` | transform | each graph node | the node | replaces the node about to execute |
+| `wrap_node_run` | wrap | around each node | `handler(node)` | retry the node, or redirect graph progression |
+| `after_node_run` | transform | each node succeeded | next node **or** `End` | **replaces graph progression** — an `End` may become a node, and vice versa |
+| `before_model_request` | transform | each model request | `ModelRequestContext` | replaces messages, settings, model, parameters |
+| `wrap_model_request` | wrap | around the provider call | `handler(request_context)` | `ModelRetry` to retry; a `ModelResponse` to substitute |
+| `after_model_request` | transform | each model response | `ModelResponse` | replaces the response; `ModelRetry` rejects it |
+| `before_tool_validate` / `after_tool_validate` | transform | per tool call, arg parsing | raw args / validated args | rewrites arguments |
+| `before_tool_execute` / `after_tool_execute` | transform | per tool call, execution | validated args / the tool's return | rewrites arguments or the result |
+| `before_output_validate` / `after_output_validate` | transform | **structured output only** | raw / parsed output | rewrites the parsed value |
+| `before_output_process` / `after_output_process` | transform | **every** output type | the output | rewrites the final value |
+
+`wrap_*` hooks are the only ones that can decline to call the inner chain at all, and the only
+place a `try`/`finally` observes a cancellation. `after_*` hooks are **not** called for a node
+interrupted by cancellation.
+
+#### A run, top to bottom
+
+One run of `ReactAgent`, with two model requests and a tool call in between. Read it downwards.
+`▼` is the chain walking forwards (outermost→innermost), `▲` backwards.
+
+```
+                                         │  who acts here, in the shipped stack
+─────────────────────────────────────────┼──────────────────────────────────────────────────
+ run starts                              │
+   ▼ before_run                          │  MailboxCapability: clear run-local announce-once
+   ▼ wrap_run — HEAD                     │  LifetimeBudget: refuse a spent agent (costs nothing
+     LifetimeBudget                      │    — every inner capability is downstream of here)
+     └ Compaction                        │  Compaction: fold history if input tokens crossed the
+       └ EventSourcing                   │    armed threshold; write to ContextManager AND to the
+         └ LimitRecovery                 │    run's own list, as one operation
+           └ Healing                     │  EventSourcing: open the persistence cursor
+             └ …yours                    │
+                                         │
+ ┌─ UserPromptNode ──────────────────────┤
+ │   ▼ before_node_run                   │  EventSourcing: re-anchor the live history
+ │   ▼ wrap_node_run ▲                   │
+ │   ▲ after_node_run                    │
+ └───────────────────────────────────────┤
+                                         │
+ ┌─ ModelRequestNode  (request #1) ──────┤
+ │   ▼ before_node_run                   │
+ │   │ ▼ before_model_request            │  PendingMessageDrain (outermost — FIRST): drain the
+ │   │                                   │    'asap' queue into this request
+ │   │                                   │  yours: inject/transform history (ProcessHistory)
+ │   │                                   │  MailboxCapability (agent pkg): raise on a queued
+ │   │                                   │    cancel, else ENQUEUE the arrival notice — which
+ │   │                                   │    this step's drain has already been past, so it
+ │   │                                   │    lands in request #2
+ │   │ ▼ wrap_model_request → PROVIDER ▲ │
+ │   │ ▲ after_model_request             │
+ │   ▲ after_node_run                    │  EventSourcing: emit LlmMessageEvent + LlmUsageEvent
+ └───────────────────────────────────────┤    (steady state — emission stays incremental)
+                                         │
+ ┌─ CallToolsNode ───────────────────────┤
+ │   ▼ before_node_run                   │
+ │   │  per tool call:                   │
+ │   │   ▼ before_tool_validate          │
+ │   │   ▼ wrap_tool_validate ▲          │
+ │   │   ▲ after_tool_validate           │
+ │   │   ▼ before_tool_execute           │
+ │   │   ▼ wrap_tool_execute → TOOL ▲    │
+ │   │   ▲ after_tool_execute            │  MailboxCapability: on a read_mailbox call, consume
+ │   ▲ after_node_run                    │    the named message and enqueue its own rendering
+ └───────────────────────────────────────┤  EventSourcing: ToolCallEvent / ToolReturnEvent
+                                         │
+ ┌─ ModelRequestNode  (request #2) ──────┤
+ │   ▼ before_model_request              │  PendingMessageDrain: NOW the notice (and the
+ │   │                                   │    absorbed message) reach the model
+ │   │ ▼ wrap_model_request → PROVIDER ▲ │
+ │   │ ▲ after_model_request             │
+ └───────────────────────────────────────┤
+                                         │
+ ┌─ CallToolsNode  (final output) ───────┤
+ │   ▼ before_output_validate            │  structured output only — parsing the payload
+ │   ▲ after_output_validate             │
+ │   ▼ before_output_process             │  every output type
+ │   ▲ after_output_process              │
+ │   node returns End(FinalResult)       │
+ │   ▲ after_node_run   ← WALKED BACKWARDS, so the drain is LAST
+ │       …yours                          │
+ │       MailboxCapability               │  ← the only place to withdraw enqueued content
+ │       PendingMessageDrain             │  if the queue is non-empty it DISCARDS the End and
+ └───────────────────────────────────────┤    redirects into one more request (see below)
+                                         │
+   ▲ wrap_run — TAIL / finally           │  EventSourcing: closing sweep + system-prompt record
+   ▲ after_run                           │  LifetimeBudget: fold what the run burned into the
+ run ends                                │    lifetime total (in `finally`, so a FAILED run counts)
+
+ on the error path instead:              │
+   ▲ on_run_error  (innermost first)     │  Healing fires BEFORE LimitRecovery — it is later in
+                                         │    the list, and this chain walks backwards. So a
+                                         │    recovery policy reading the context sees a HEALED one
+```
+
+**Two consequences worth stating outright, because both have already cost a bug:**
+
+- **An `'asap'` enqueue is always one step late.** `PendingMessageDrainCapability` is
+  `outermost`, so its `before_model_request` has already run by the time an inner capability
+  enqueues during the same step. The content lands in the *next* request.
+- **A queued message at run end costs you the run's output.** When the graph returns
+  `End(FinalResult)` with the queue non-empty, the drain's `after_node_run` **throws the `End`
+  away** and returns a `ModelRequestNode` instead, so the run continues and produces a second,
+  different final result. `run()` returns only that second one; the first exists in durable
+  history and nowhere else. That is intended for content with no other delivery path — and wrong
+  for content that has one, which must therefore withdraw itself from `ctx.pending_messages` in
+  its own `after_node_run`, ahead of the drain's.
 
 ### Run-tier recovery
 
