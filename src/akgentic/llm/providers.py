@@ -47,7 +47,8 @@ from .config import ModelConfig, _supports_native_output
 if TYPE_CHECKING:
     from pydantic_ai.models.anthropic import AnthropicModel
     from pydantic_ai.models.mistral import MistralModel
-    from pydantic_ai.models.openai import OpenAIChatModel, OpenAIChatModelSettings
+    from pydantic_ai.models.openai import OpenAIChatModel, OpenAIChatModelSettings, OpenAIResponsesModelSettings, \
+    OpenAIResponsesModel
 
 logger = logging.getLogger(__name__)
 
@@ -280,7 +281,7 @@ def _build_core_settings(config: ModelConfig) -> ModelSettings | None:
     return cast(ModelSettings, kwargs) if kwargs else None
 
 
-def _build_openai_settings(config: ModelConfig) -> "OpenAIChatModelSettings | None":
+def _build_openai_settings(config: ModelConfig) -> "OpenAIResponsesModelSettings | None":
     """Build OpenAIChatModelSettings from ModelConfig, including reasoning_effort.
 
     Delegates shared parameters (temperature, max_tokens, seed) to
@@ -292,31 +293,31 @@ def _build_openai_settings(config: ModelConfig) -> "OpenAIChatModelSettings | No
     Returns:
         OpenAIChatModelSettings instance if any parameters are set, else None.
     """
-    from pydantic_ai.models.openai import OpenAIChatModelSettings  # noqa: PLC0415
+    from pydantic_ai.models.openai import OpenAIChatModelSettings,OpenAIResponsesModelSettings   # noqa: PLC0415
 
     kwargs: dict[str, Any] = dict(cast(dict[str, Any], _build_core_settings(config) or {}))
     if config.reasoning_effort is not None:
         kwargs["openai_reasoning_effort"] = config.reasoning_effort
-    return cast(OpenAIChatModelSettings, kwargs) if kwargs else None
+    return cast(OpenAIResponsesModelSettings, kwargs) if kwargs else None
 
 
 def _create_openai_model(
     config: ModelConfig,
     http_client: httpx2.AsyncClient,
-) -> "OpenAIChatModel":
-    """Create OpenAI chat model.
+) -> "OpenAIResponsesModel":
+    """Create OpenAI responses model.
 
     Args:
         config: LLM model configuration.
         http_client: Async HTTP client with retry logic.
 
     Returns:
-        Configured OpenAIChatModel instance.
+        Configured OpenAIResponsesModel instance.
     """
-    from pydantic_ai.models.openai import OpenAIChatModel  # noqa: PLC0415
+    from pydantic_ai.models.openai import OpenAIChatModel,OpenAIResponsesModel  # noqa: PLC0415
     from pydantic_ai.providers.openai import OpenAIProvider  # noqa: PLC0415
 
-    return OpenAIChatModel(
+    return OpenAIResponsesModel(
         model_name=config.model,
         provider=OpenAIProvider(http_client=http_client),
         settings=_build_openai_settings(config),
