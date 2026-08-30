@@ -56,6 +56,7 @@ from akgentic.llm import (
     LlmSystemPromptEvent,
     LlmUsageEvent,
     ModelConfig,
+    ModelSwitchError,
     PromptTemplate,
     ReactAgent,
     ReactAgentConfig,
@@ -72,6 +73,7 @@ from akgentic.llm import (
     current_datetime_prompt,
     get_output_type,
     json_output_reminder_prompt,
+    model_roster_key,
 )
 
 
@@ -364,11 +366,14 @@ def test_react_agent_config_composition_sample() -> None:
     configures nothing, which is exactly what the last assertion here catches.
     """
     config = ReactAgentConfig(
-        model_cfg=ModelConfig(
-            provider="anthropic",
-            model="claude-3-5-sonnet-20241022",
-            temperature=0.7,
-        ),
+        model_cfg=[
+            ModelConfig(
+                provider="anthropic",
+                model="claude-3-5-sonnet-20241022",
+                temperature=0.7,
+            ),
+            ModelConfig(provider="openai", model="gpt-4o-mini"),
+        ],
         run_usage_limits=RunUsageLimits(
             run_request_limit=10,
             total_tokens_limit=50_000,
@@ -382,8 +387,14 @@ def test_react_agent_config_composition_sample() -> None:
         ),
     )
 
+    # The list is an input convenience: element 0 is the stored active model, and the
+    # whole list — active entry included — is the roster. Neither is a list once stored.
     assert config.model_cfg.model == "claude-3-5-sonnet-20241022"
     assert config.model_cfg.temperature == 0.7
+    assert [model_roster_key(m) for m in config.model_roster] == [
+        "anthropic:claude-3-5-sonnet-20241022",
+        "openai:gpt-4o-mini",
+    ]
     assert config.run_usage_limits.run_request_limit == 10
     assert config.agent_usage_limits.agent_request_limit == 100
     assert config.runtime_cfg.end_strategy == "exhaustive"
@@ -402,6 +413,94 @@ def test_the_model_cfg_field_is_named_model_cfg() -> None:
 
     right = ReactAgentConfig(model_cfg=ModelConfig(provider="anthropic", model="claude-x"))
     assert right.model_cfg.provider == "anthropic"
+
+
+# ---------------------------------------------------------------------------
+# Configuration — model roster and runtime switching
+# ---------------------------------------------------------------------------
+
+
+def _roster_config() -> ReactAgentConfig:
+    """The roster the §Model roster block declares, shared by the two samples below."""
+    return ReactAgentConfig(
+        model_cfg=[
+            ModelConfig(provider="openai", model="gpt-4o", context_length=128_000),
+            ModelConfig(provider="anthropic", model="claude-sonnet-4-5"),
+            ModelConfig(provider="google-gla", model="gemini-2.0-flash"),
+        ],
+    )
+
+
+def test_model_roster_sample() -> None:
+    """§Model roster and runtime switching — the declaration block.
+
+    Values, not construction: the union lives in a ``mode="before"`` validator, so a
+    roster that silently failed to fold would still yield a perfectly valid config on
+    the default model — which is the failure this asserts against.
+    """
+    config = _roster_config()
+
+    assert config.model_cfg.model == "gpt-4o"  # element 0 is the active model
+    assert config.model_cfg.context_length == 128_000
+    assert len(config.model_roster) == 3  # the active entry is a member
+    assert [model_roster_key(m) for m in config.model_roster] == [
+        "openai:gpt-4o",
+        "anthropic:claude-sonnet-4-5",
+        "google-gla:gemini-2.0-flash",
+    ]
+
+    # A single ModelConfig leaves the roster empty — a one-model agent, which cannot switch.
+    single = ReactAgentConfig(model_cfg=ModelConfig(provider="openai", model="gpt-4o"))
+    assert single.model_roster == []
+
+
+def test_switching_at_runtime_sample(agents: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """§Switching at runtime — the two readers and the switch, actually executed.
+
+    ``create_model`` is replaced rather than ``pydantic_agent.override(model=...)``:
+    pydantic-ai resolves the override ahead of the per-run ``model=`` argument, so a
+    switch sample written inside an ``override`` block is green whether or not the
+    switch does anything. The stand-in also keeps the sample at zero egress and lets
+    the installed model be identified by object.
+    """
+    built: dict[str, TestModel] = {}
+
+    def fake_create_model(config: ModelConfig, http_client: Any = None) -> TestModel:
+        model = TestModel()
+        built[model_roster_key(config)] = model
+        return model
+
+    monkeypatch.setattr("akgentic.llm.agent.create_model", fake_create_model)
+
+    agent = agents(_roster_config())
+
+    assert model_roster_key(agent.active_model()) == "openai:gpt-4o"
+    roster = agent.model_roster()
+    assert [model_roster_key(m) for m in roster] == [
+        "openai:gpt-4o",
+        "anthropic:claude-sonnet-4-5",
+        "google-gla:gemini-2.0-flash",
+    ]
+    # Documented as a copy: mutating what the reader returns must not edit the roster.
+    roster.clear()
+    assert len(agent.model_roster()) == 3
+
+    entry = agent.switch_model("anthropic:claude-sonnet-4-5")
+
+    assert entry.model == "claude-sonnet-4-5"
+    assert model_roster_key(agent.active_model()) == "anthropic:claude-sonnet-4-5"
+    # The entry is installed by identity, and the model actually built for it is in force.
+    assert entry is agent._config.model_roster[1]
+    assert agent._model is built["anthropic:claude-sonnet-4-5"]
+
+    # An unknown key raises the one refusal class, naming every available key...
+    with pytest.raises(ModelSwitchError) as excinfo:
+        agent.switch_model("openai:o99")
+    assert "available keys" in str(excinfo.value)
+    assert "openai:gpt-4o" in str(excinfo.value)
+    # ...and a refusal changes nothing.
+    assert model_roster_key(agent.active_model()) == "anthropic:claude-sonnet-4-5"
+    assert agent._model is built["anthropic:claude-sonnet-4-5"]
 
 
 # ---------------------------------------------------------------------------
@@ -527,6 +626,9 @@ def test_react_agent_api_block_members_all_exist() -> None:
         "aclose",
         "close",
         "pydantic_agent",
+        "active_model",
+        "model_roster",
+        "switch_model",
     ):
         assert hasattr(ReactAgent, name), f"{name} documented but missing"
 
