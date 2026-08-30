@@ -38,6 +38,7 @@ from importlib import metadata as _metadata
 
 from .agent import (
     AgentUsageLimitError,
+    ModelSwitchError,
     ReactAgent,
     RunUsageLimitError,
     UsageLimitError,
@@ -116,6 +117,9 @@ __all__ = [
     "UsageLimitError",  # base of both tiers — catch it to handle either
     "RunUsageLimitError",
     "AgentUsageLimitError",
+    # The one refusal class of ReactAgent.switch_model — a ValueError subclass, so an
+    # existing `except ValueError` still catches it.
+    "ModelSwitchError",
     "UserPrompt",
     # Context
     "ContextManager",

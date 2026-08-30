@@ -17,6 +17,7 @@ from akgentic.llm.config import (
     TokenUsageLimits,
     model_roster_key,
     normalize_model_roster,
+    validate_compaction_bounds,
     validate_unique_roster_keys,
 )
 
@@ -1158,3 +1159,61 @@ class TestReactAgentConfigModelRoster:
         with pytest.raises(ValueError, match="openai:gpt-4o"):
             validate_unique_roster_keys(roster, "AcmeConfig")
         assert validate_unique_roster_keys(roster[:1], "AcmeConfig") is None
+
+
+class TestValidateCompactionBoundsIsCallableDirectly:
+    """The bounds rule is a module-level guard with one implementation (story 22-2, AC 11).
+
+    ``ReactAgentConfig``'s after-validator delegates to it, and ``ReactAgent.switch_model``
+    calls it against a CANDIDATE roster entry before committing anything — a switch moves
+    ``context_length``, and therefore the threshold. These tests drive the function itself,
+    with an owner no config would supply, so the shared entry point is pinned rather than
+    only its construction-time caller.
+    """
+
+    def test_the_owner_reaches_the_message(self):
+        """The caller names itself, ``validate_unique_roster_keys`` style."""
+        with pytest.raises(ValueError, match="switch_model compaction threshold 850"):
+            validate_compaction_bounds(
+                ModelConfig(context_length=1000),
+                CompactionConfig(auto_trigger=True, trigger_ratio=0.85),
+                RunUsageLimits(input_tokens_limit=850),
+                "switch_model",
+            )
+
+    def test_the_total_tokens_limit_is_checked_too(self):
+        """Both run-tier token limits arm the rule, and the message names which one."""
+        with pytest.raises(ValueError, match="run_usage_limits.total_tokens_limit"):
+            validate_compaction_bounds(
+                ModelConfig(context_length=1000),
+                CompactionConfig(auto_trigger=True, trigger_ratio=0.85),
+                RunUsageLimits(total_tokens_limit=800),
+                "switch_model",
+            )
+
+    def test_a_threshold_strictly_below_both_limits_returns_none(self):
+        """A guard, not a transform: it answers by not raising."""
+        assert (
+            validate_compaction_bounds(
+                ModelConfig(context_length=1000),
+                CompactionConfig(auto_trigger=True, trigger_ratio=0.85),
+                RunUsageLimits(input_tokens_limit=2000, total_tokens_limit=3000),
+                "switch_model",
+            )
+            is None
+        )
+
+    def test_auto_trigger_off_or_no_context_length_skips_the_rule(self):
+        """Both ways of having no live threshold short-circuit, exactly as at construction."""
+        validate_compaction_bounds(
+            ModelConfig(context_length=1000),
+            CompactionConfig(auto_trigger=False),
+            RunUsageLimits(input_tokens_limit=1),
+            "switch_model",
+        )
+        validate_compaction_bounds(
+            ModelConfig(),
+            CompactionConfig(auto_trigger=True),
+            RunUsageLimits(input_tokens_limit=1),
+            "switch_model",
+        )

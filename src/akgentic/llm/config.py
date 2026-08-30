@@ -663,6 +663,50 @@ class RuntimeConfig(BaseModel):
     )
 
 
+def validate_compaction_bounds(
+    model_cfg: ModelConfig,
+    compaction_cfg: CompactionConfig,
+    run_usage_limits: RunUsageLimits,
+    owner: str,
+) -> None:
+    """Keep the auto-compaction trigger reachable before the run tier's token limits bite.
+
+    When auto-compaction is live, the effective threshold must sit strictly below every set
+    token limit; otherwise pydantic-ai raises UsageLimitExceeded first and the auto-trigger
+    is dead code. Reads the RUN tier only, by choice: the agent tier's token limits are
+    enforced too, and one set below the threshold does leave the auto-trigger unreachable —
+    the agent refuses the run before compaction can fire. Rejecting that here would change
+    which configs are constructible, so it stays a documented consequence rather than a
+    validation error.
+
+    The single implementation of the rule, called from two places: ReactAgentConfig's
+    after-validator at construction, and ``ReactAgent.switch_model`` against the CANDIDATE
+    roster entry before anything is committed. A switch changes ``model_cfg.context_length``,
+    which moves the threshold — so a second spelling here would let a switch install a model
+    whose configuration the constructor would have refused.
+
+    Args:
+        model_cfg: The model whose ``context_length`` sets the threshold.
+        compaction_cfg: The compaction settings supplying the trigger and its ratio.
+        run_usage_limits: The run tier the threshold must stay strictly below.
+        owner: The caller reporting the fault, named in the message.
+
+    Raises:
+        ValueError: When the threshold reaches or exceeds a set run-tier token limit.
+    """
+    context_length = model_cfg.context_length
+    if not (compaction_cfg.auto_trigger and context_length is not None):
+        return
+    threshold = int(context_length * compaction_cfg.trigger_ratio)
+    for name in ("input_tokens_limit", "total_tokens_limit"):
+        limit = getattr(run_usage_limits, name)
+        if limit is not None and threshold >= limit:
+            raise ValueError(
+                f"{owner} compaction threshold {threshold} must be strictly below "
+                f"run_usage_limits.{name} ({limit})"
+            )
+
+
 class ReactAgentConfig(BaseModel):
     """Configuration for REACT (Reasoning + Acting) pattern agent.
 
@@ -848,25 +892,14 @@ class ReactAgentConfig(BaseModel):
     def _reject_threshold_above_run_usage_limits(self) -> "ReactAgentConfig":
         """Threshold-vs-usage-limit: keep the auto-trigger reachable before usage limits bite.
 
-        When auto-compaction is live, the effective threshold must sit strictly below every
-        set token limit; otherwise pydantic-ai raises UsageLimitExceeded first and the
-        auto-trigger is dead code. Reads the RUN tier only, by choice: the agent tier's
-        token limits are enforced too, and one set below the threshold does leave the
-        auto-trigger unreachable — the agent refuses the run before compaction can fire.
-        Rejecting that here would change which configs are constructible, so it stays a
-        documented consequence rather than a validation error.
+        The whole body lives in the module-level ``validate_compaction_bounds`` because
+        ``ReactAgent.switch_model`` must apply the same rule to a candidate roster entry
+        before committing it — a switch moves ``context_length``, and therefore the
+        threshold. Two spellings would let a switch install what construction refuses.
         """
-        context_length = self.model_cfg.context_length
-        if not (self.compaction_cfg.auto_trigger and context_length is not None):
-            return self
-        threshold = int(context_length * self.compaction_cfg.trigger_ratio)
-        for name in ("input_tokens_limit", "total_tokens_limit"):
-            limit = getattr(self.run_usage_limits, name)
-            if limit is not None and threshold >= limit:
-                raise ValueError(
-                    f"compaction threshold {threshold} must be strictly below "
-                    f"run_usage_limits.{name} ({limit})"
-                )
+        validate_compaction_bounds(
+            self.model_cfg, self.compaction_cfg, self.run_usage_limits, "ReactAgentConfig"
+        )
         return self
 
     @model_validator(mode="after")

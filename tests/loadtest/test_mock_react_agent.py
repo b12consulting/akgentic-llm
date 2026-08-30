@@ -18,7 +18,7 @@ import pytest
 from pydantic import BaseModel
 from pydantic_ai.messages import ModelRequest, ModelResponse, ToolCallPart, ToolReturnPart
 
-from akgentic.llm import ModelConfig, ReactAgent, ReactAgentConfig
+from akgentic.llm import ModelConfig, ModelSwitchError, ReactAgent, ReactAgentConfig
 from akgentic.llm.event import (
     LlmUsageEvent,
     ToolCallEvent,
@@ -762,11 +762,67 @@ def test_conclusion_signatures_match_the_real_agent() -> None:
     A mock whose conclusion took different parameters would let an
     ``akgentic-agent`` test go green on a call the real ``ReactAgent`` rejects —
     which is exactly what drop-in parity exists to prevent.
+
+    The model-roster trio is here for the same reason and for a sharper one: the mock is
+    a **standalone class**, not a ``ReactAgent`` subclass, so it inherits nothing. A
+    ``BaseAgent`` that delegates ``switch_model`` would ``AttributeError`` against a mock
+    under the load-test flag unless these three are written out here too.
     """
-    for name in ("conclude_without_tools", "conclude_without_tools_sync"):
+    for name in (
+        "conclude_without_tools",
+        "conclude_without_tools_sync",
+        "switch_model",
+        "active_model",
+        "model_roster",
+    ):
         assert inspect.signature(getattr(MockReactAgent, name)) == inspect.signature(
             getattr(ReactAgent, name)
         )
+
+
+def test_the_mock_refuses_to_switch_models() -> None:
+    """A mock cannot switch: the scenario is bound to ``model_cfg.model`` at construction.
+
+    Refusing is the honest answer — accepting would leave the config naming one scenario
+    while the state machine replays another, silently. And ``_model``/``_http_client`` are
+    ``None`` by the zero-token guarantee, so there is nothing to build.
+    """
+    agent = _make_agent("@Expert")
+    try:
+        with pytest.raises(ModelSwitchError) as exc:
+            agent.switch_model("openai:gpt-4o")
+        assert "openai:gpt-4o" in str(exc.value)
+        assert agent._model is None
+        assert agent._http_client is None
+    finally:
+        agent.close()
+
+
+def test_the_mock_raises_the_real_agents_switch_error_class() -> None:
+    """One class object, imported not redefined — cf. the usage-limit tier classes.
+
+    A second definition here would be a different class, so an ``except ModelSwitchError``
+    written against the real agent would silently not catch the mock's.
+    """
+    from akgentic.llm import agent as real_agent_module
+    from akgentic.llm.loadtest import mock_agent as mock_module
+
+    assert mock_module.ModelSwitchError is real_agent_module.ModelSwitchError
+    assert issubclass(ModelSwitchError, ValueError)
+
+
+def test_the_mock_readers_answer_truthfully() -> None:
+    """``active_model`` reports what ``config`` carries; a config with no roster reads empty.
+
+    ``model_roster`` uses ``getattr``: ``config`` is duck-typed here, and a load-test
+    caller's config need not carry a roster field at all.
+    """
+    agent = _make_agent("@Expert")
+    try:
+        assert agent.active_model() is agent._config.model_cfg
+        assert agent.model_roster() == []
+    finally:
+        agent.close()
 
 
 def test_mock_defines_no_usage_limit_exception_classes() -> None:

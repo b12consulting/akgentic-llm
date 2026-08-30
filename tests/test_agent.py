@@ -41,6 +41,7 @@ from akgentic.llm import (
     LifetimeBudgetCapability,
     LimitRecoveryCapability,
     ModelConfig,
+    ModelSwitchError,
     ReactAgent,
     ReactAgentConfig,
     RunUsageLimitError,
@@ -51,6 +52,7 @@ from akgentic.llm import (
 from akgentic.llm.agent import RUN_LIMIT_HEALING_MESSAGE
 from akgentic.llm.capabilities import DEFAULT_CONCLUSION_REASON
 from akgentic.llm.compaction import SummarizingCompaction
+from akgentic.llm.config import model_roster_key
 from akgentic.llm.event import (
     LlmContextClearedEvent,
     LlmContextCompactedEvent,
@@ -3426,3 +3428,724 @@ class TestReactAgentConfigValidatorsAtConstruction:
         )
         agent = ReactAgent(config=config)
         assert agent is not None
+
+
+# ---------------------------------------------------------------------------
+# Story 22-2 — switch_model(), the per-run model, and the three couplings
+# ---------------------------------------------------------------------------
+
+OPENAI_KEY = "openai:gpt-4o"
+GOOGLE_KEY = "google-gla:gemini-2.0-flash"
+ANTHROPIC_KEY = "anthropic:claude-sonnet-4-5"
+
+
+class _SwitchAnswer(BaseModel):
+    """A structured output type, so the effective output type is observable at all."""
+
+    answer: str
+
+
+def _echo_key_stub(key: str):
+    """A model function that answers with the roster key it was built for."""
+
+    def stub(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        return ModelResponse(parts=[TextPart(content=key)])
+
+    return stub
+
+
+class _ModelFactory:
+    """Stand-in for ``create_model``: records every call, returns a per-key FunctionModel.
+
+    Monkeypatched over ``akgentic.llm.agent.create_model``, so BOTH construction and
+    ``switch_model`` build through it and every model object is identifiable.
+
+    Deliberately NOT ``pydantic_agent.override(model=...)``: pydantic-ai resolves the
+    override context-var AHEAD of the per-run ``model=`` argument (``_pick_raw_model``,
+    ``pydantic_ai/agent/__init__.py``), so a switch test written inside an ``override``
+    block is green whether or not ``switch_model`` does anything at all. That is also why
+    the ~800 existing tests, which all use ``override``, are untouched by this story.
+    """
+
+    def __init__(self, stub_factory=_echo_key_stub, fail_on: tuple[str, ...] = ()) -> None:
+        self.configs: list[ModelConfig] = []
+        self.clients: list[Any] = []
+        self.built: list[FunctionModel] = []
+        self.by_key: dict[str, FunctionModel] = {}
+        self._stub_factory = stub_factory
+        self._fail_on = set(fail_on)
+
+    def __call__(self, config: ModelConfig, http_client: Any = None) -> FunctionModel:
+        self.configs.append(config)
+        self.clients.append(http_client)
+        key = model_roster_key(config)
+        if key in self._fail_on:
+            raise ValueError(f"{key} needs an endpoint this environment does not set")
+        model = FunctionModel(self._stub_factory(key))
+        self.built.append(model)
+        self.by_key[key] = model
+        return model
+
+
+@pytest.fixture
+def model_factory(monkeypatch):
+    """Install ``_ModelFactory`` over ``akgentic.llm.agent.create_model``."""
+    factory = _ModelFactory()
+    monkeypatch.setattr("akgentic.llm.agent.create_model", factory)
+    return factory
+
+
+def _two_model_config(**kwargs: Any) -> ReactAgentConfig:
+    """An openai-active agent with an anthropic entry to switch to."""
+    return ReactAgentConfig(
+        model_cfg=[
+            ModelConfig(provider="openai", model="gpt-4o"),
+            ModelConfig(provider="anthropic", model="claude-sonnet-4-5"),
+        ],
+        **kwargs,
+    )
+
+
+class TestReactAgentModelRosterReaders:
+    """``active_model()`` and ``model_roster()`` read the live config (AC #1)."""
+
+    def test_active_model_reads_the_config_at_the_moment_of_the_call(self, model_factory):
+        """Not a value cached at construction: a switch moves what the reader returns."""
+        agent = ReactAgent(config=_two_model_config())
+
+        assert agent.active_model() is agent._config.model_roster[0]
+        entry = agent.switch_model(ANTHROPIC_KEY)
+        assert agent.active_model() is entry
+        assert agent.active_model() is agent._config.model_roster[1]
+
+    def test_model_roster_returns_a_fresh_list(self, model_factory):
+        """The copy is the contract: a tool that sorts the result must not edit the agent.
+
+        The entries themselves are shared on purpose — nothing mutates a ModelConfig in
+        place, and ``switch_model`` installs one of them by identity.
+        """
+        agent = ReactAgent(config=_two_model_config())
+
+        roster = agent.model_roster()
+        roster.clear()
+        roster.append(ModelConfig(provider="mistral", model="mistral-large-latest"))
+
+        assert len(agent._config.model_roster) == 2
+        assert [model_roster_key(e) for e in agent.model_roster()] == [OPENAI_KEY, ANTHROPIC_KEY]
+        assert agent.model_roster()[0] is agent._config.model_roster[0]
+
+    def test_both_readers_answer_on_a_single_model_agent(self, model_factory):
+        """No roster is not an error for a reader — only for a switch (AC #3)."""
+        agent = ReactAgent(
+            config=ReactAgentConfig(model_cfg=ModelConfig(provider="openai", model="gpt-4o"))
+        )
+
+        assert agent.model_roster() == []
+        assert agent.active_model() is agent._config.model_cfg
+
+
+class TestReactAgentSwitchModelRefusals:
+    """Every refusal is one class, and none of them writes anything (AC #2, #3, #4)."""
+
+    def test_model_switch_error_is_a_value_error(self):
+        """``except ValueError`` written before this story still catches a refusal.
+
+        The subclassing is the whole reason ``validate_compaction_bounds`` can go on
+        raising a plain ``ValueError`` for Pydantic while ``switch_model`` raises this.
+        """
+        assert issubclass(ModelSwitchError, ValueError)
+
+    def _assert_untouched(self, agent, before) -> None:
+        """The three-way identity check: a refusal changed no object (AC #4)."""
+        config, model, strategy = before
+        assert agent._config is config
+        assert agent._model is model
+        assert agent._compactor.strategy is strategy
+
+    @staticmethod
+    def _snapshot(agent):
+        return (agent._config, agent._model, agent._compactor.strategy)
+
+    def test_an_unknown_key_names_every_available_key(self, model_factory):
+        """The message is the only diagnosis a tool-driven caller gets, so it lists them."""
+        agent = ReactAgent(config=_two_model_config())
+        before = self._snapshot(agent)
+
+        with pytest.raises(ModelSwitchError) as exc:
+            agent.switch_model("openai:gpt-5")
+
+        message = str(exc.value)
+        assert "openai:gpt-5" in message
+        assert OPENAI_KEY in message
+        assert ANTHROPIC_KEY in message
+        self._assert_untouched(agent, before)
+
+    def test_an_agent_with_no_roster_gets_its_own_message(self, model_factory):
+        """Distinct from the unknown-key message — never 'available keys: ' with none."""
+        agent = ReactAgent(
+            config=ReactAgentConfig(model_cfg=ModelConfig(provider="openai", model="gpt-4o"))
+        )
+        before = self._snapshot(agent)
+
+        with pytest.raises(ModelSwitchError) as exc:
+            agent.switch_model(OPENAI_KEY)
+
+        message = str(exc.value)
+        assert "no model roster" in message
+        assert "available keys" not in message
+        self._assert_untouched(agent, before)
+
+    def test_an_unbuildable_entry_is_wrapped_with_its_cause(self, monkeypatch):
+        """ADR-018 Trap 2: a roster entry can fail at SWITCH time, not at construction.
+
+        The provider's own wording is the only diagnosis available, so it is preserved in
+        the message and the original exception is kept as ``__cause__``.
+        """
+        factory = _ModelFactory(fail_on=(ANTHROPIC_KEY,))
+        monkeypatch.setattr("akgentic.llm.agent.create_model", factory)
+        agent = ReactAgent(config=_two_model_config())
+        before = self._snapshot(agent)
+
+        with pytest.raises(ModelSwitchError) as exc:
+            agent.switch_model(ANTHROPIC_KEY)
+
+        assert "needs an endpoint this environment does not set" in str(exc.value)
+        assert isinstance(exc.value.__cause__, ValueError)
+        assert not isinstance(exc.value.__cause__, ModelSwitchError)
+        self._assert_untouched(agent, before)
+
+    def test_a_switch_that_would_strand_auto_compaction_is_refused(self, model_factory):
+        """FR5 at switch time: the candidate entry's threshold is checked before commit.
+
+        The 100k-token entry pushes the trigger to exactly 85_000, which is the run tier's
+        cap — the configuration the constructor would have refused outright. Sitting **on**
+        the boundary rather than far past it is deliberate: it is what makes this test
+        sensitive to the ``>=``/``>`` mutation, and therefore what proves it shares one
+        implementation with the construction-time rejection rather than a second copy.
+        """
+        agent = ReactAgent(
+            config=ReactAgentConfig(
+                model_cfg=[
+                    ModelConfig(provider="openai", model="gpt-4o", context_length=1000),
+                    ModelConfig(
+                        provider="anthropic", model="claude-sonnet-4-5", context_length=100_000
+                    ),
+                ],
+                compaction_cfg=CompactionConfig(auto_trigger=True, trigger_ratio=0.85),
+                run_usage_limits=RunUsageLimits(input_tokens_limit=85_000),
+            )
+        )
+        before = self._snapshot(agent)
+
+        with pytest.raises(ModelSwitchError) as exc:
+            agent.switch_model(ANTHROPIC_KEY)
+
+        message = str(exc.value)
+        assert "85000" in message
+        assert "input_tokens_limit" in message
+        self._assert_untouched(agent, before)
+
+
+class _ReactAgentConfigWithExtraField(ReactAgentConfig):
+    """A config carrying a field ``switch_model``'s write path has never heard of."""
+
+    extra_field: str = "sentinel"
+
+
+class TestReactAgentSwitchModelCommit:
+    """F1 and F2 — what the commit installs, and what it does not (AC #5, #6)."""
+
+    def test_the_commit_keeps_a_field_the_write_path_never_heard_of(self, model_factory):
+        """Golden Rule 12's guard, in the only formulation that works.
+
+        The obvious guard — populate every field, switch, compare whole models — is
+        insufficient, and provably so: a hand-enumerated ``ReactAgentConfig(...)`` naming
+        EVERY field that exists today passes it green. A whole-model comparison can only
+        compare fields that exist *now*; a field added later sits at its default on both
+        sides, so dropping it is invisible.
+
+        A field the rebuild has never heard of is what makes the defect visible. An
+        enumerated reconstruction returns a plain ``ReactAgentConfig`` and fails the
+        isinstance outright; ``model_copy(update=...)`` returns the subclass with the
+        field intact.
+        """
+        agent = ReactAgent(
+            config=_ReactAgentConfigWithExtraField(
+                model_cfg=[
+                    ModelConfig(provider="openai", model="gpt-4o"),
+                    ModelConfig(provider="anthropic", model="claude-sonnet-4-5"),
+                ]
+            )
+        )
+
+        agent.switch_model(ANTHROPIC_KEY)
+
+        assert isinstance(agent._config, _ReactAgentConfigWithExtraField)
+        assert agent._config.extra_field == "sentinel"
+
+    def test_the_switch_installs_the_roster_element_itself_from_instances(self, model_factory):
+        """F1: ``model_cfg is model_roster[i]`` — the entry, never a copy of it."""
+        agent = ReactAgent(config=_two_model_config())
+
+        entry = agent.switch_model(ANTHROPIC_KEY)
+
+        assert entry is agent._config.model_roster[1]
+        assert agent._config.model_cfg is agent._config.model_roster[1]
+
+    def test_the_switch_installs_the_roster_element_itself_from_dicts(self, model_factory):
+        """F1's other input path: dict entries through ``model_validate``.
+
+        The path where the divergence was filed — Pydantic validates the ``model_cfg``
+        dict and the roster dicts into *different* objects, so before any switch
+        ``model_cfg is not model_roster[0]``. After a switch the two paths are identical,
+        which is what closes F1.
+        """
+        config = ReactAgentConfig.model_validate(
+            {
+                "model_cfg": [
+                    {"provider": "openai", "model": "gpt-4o"},
+                    {"provider": "anthropic", "model": "claude-sonnet-4-5"},
+                ]
+            }
+        )
+        assert config.model_cfg is not config.model_roster[0]
+        agent = ReactAgent(config=config)
+
+        entry = agent.switch_model(ANTHROPIC_KEY)
+
+        assert entry is agent._config.model_roster[1]
+        assert agent._config.model_cfg is agent._config.model_roster[1]
+
+    def test_the_roster_entrys_non_key_fields_replace_the_active_ones(self, model_factory):
+        """F2: ``provider:model`` is the identity; the roster entry is the definition.
+
+        A hand-set ``model_cfg`` differing from its roster entry on ``temperature`` loses
+        that difference on the first switch back to its key. Merging would mean
+        enumerating which fields to keep — the Golden Rule 12 defect — and refusing would
+        reject a config that legitimately validated.
+        """
+        active = ModelConfig(provider="openai", model="gpt-4o", temperature=0.9)
+        rostered = ModelConfig(provider="openai", model="gpt-4o", temperature=0.1)
+        agent = ReactAgent(
+            config=ReactAgentConfig(
+                model_cfg=active,
+                model_roster=[
+                    rostered,
+                    ModelConfig(provider="anthropic", model="claude-sonnet-4-5"),
+                ],
+            )
+        )
+        assert agent.active_model().temperature == 0.9
+
+        entry = agent.switch_model(OPENAI_KEY)
+
+        assert entry is rostered
+        assert agent.active_model() is rostered
+        assert agent.active_model().temperature == 0.1
+
+    def test_switching_to_the_already_active_key_is_not_short_circuited(self, model_factory):
+        """The F2 rule has no exception, so the no-op case runs resolve/validate/commit.
+
+        A short-circuit would make "the roster entry wins" true except when the key
+        happens to already be active — one rule with a hidden branch.
+        """
+        agent = ReactAgent(config=_two_model_config())
+        built_before = len(model_factory.built)
+        first_model = agent._model
+
+        entry = agent.switch_model(OPENAI_KEY)
+
+        assert entry is agent._config.model_roster[0]
+        assert len(model_factory.built) == built_before + 1
+        assert agent._model is not first_model
+        assert agent._model is model_factory.built[-1]
+
+
+class TestReactAgentSwitchModelCouplings:
+    """FR4 / NFR1 / NFR2 — a switch replaces the model and nothing else (AC #7, #9, #10)."""
+
+    async def test_the_run_is_served_the_post_switch_model(self, model_factory):
+        """The per-run ``model=`` argument, asserted through what the model answers."""
+        agent = ReactAgent(config=_two_model_config())
+
+        assert await agent.run("first") == OPENAI_KEY
+        agent.switch_model(ANTHROPIC_KEY)
+        assert await agent.run("second") == ANTHROPIC_KEY
+
+    async def test_the_pydantic_agent_is_never_rebuilt(self, model_factory):
+        """AC #7: the ``Agent`` object survives N switches; only ``_model`` moves."""
+        agent = ReactAgent(config=_two_model_config())
+        pydantic_agent = agent._pydantic_agent
+
+        for key in (ANTHROPIC_KEY, OPENAI_KEY, ANTHROPIC_KEY, OPENAI_KEY):
+            agent.switch_model(key)
+            assert agent._pydantic_agent is pydantic_agent
+
+        assert await agent.run("still one agent") == OPENAI_KEY
+
+    def test_every_switch_reuses_the_one_connection_pool(self, model_factory):
+        """NFR1: one httpx client for the agent's life, handed to every model built."""
+        agent = ReactAgent(config=_two_model_config())
+        client = agent._http_client
+
+        for key in (ANTHROPIC_KEY, OPENAI_KEY, ANTHROPIC_KEY):
+            agent.switch_model(key)
+
+        assert agent._http_client is client
+        assert model_factory.clients == [client] * len(model_factory.clients)
+        assert len(model_factory.clients) == 4  # construction + three switches
+
+        agent.close()
+        assert client.is_closed
+
+    async def test_a_switch_between_two_runs_loses_nothing(self, model_factory):
+        """NFR2: history, run counter and lifetime usage all survive; run 2 sees run 1."""
+        seen: list[list[ModelMessage]] = []
+
+        def recording_stub(key: str):
+            def stub(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+                seen.append(list(messages))
+                return ModelResponse(
+                    parts=[TextPart(content=key)],
+                    usage=RequestUsage(input_tokens=7, output_tokens=3),
+                )
+
+            return stub
+
+        model_factory._stub_factory = recording_stub
+        agent = ReactAgent(config=_two_model_config())
+        await agent.run("first")
+
+        messages = list(agent.context.messages)
+        run_count = agent._agent_run_count
+        usage = (agent._agent_usage.input_tokens, agent._agent_usage.output_tokens)
+
+        agent.switch_model(ANTHROPIC_KEY)
+
+        assert agent.context.messages == messages
+        assert agent._agent_run_count == run_count
+        assert (agent._agent_usage.input_tokens, agent._agent_usage.output_tokens) == usage
+
+        assert await agent.run("second") == ANTHROPIC_KEY
+        assert seen[-1][: len(messages)] == messages
+        assert agent._agent_run_count == run_count + 1
+
+    async def test_tools_and_system_prompts_survive_a_switch(self, model_factory):
+        """They survive because the ``Agent`` does — nothing re-registers them (AC #7)."""
+        offered: list[list[str]] = []
+        prompts: list[list[str]] = []
+
+        def inspecting_stub(key: str):
+            def stub(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+                offered.append([t.name for t in info.function_tools])
+                prompts.append(
+                    [
+                        p.content
+                        for m in messages
+                        if isinstance(m, ModelRequest)
+                        for p in m.parts
+                        if isinstance(p, SystemPromptPart)
+                    ]
+                )
+                return ModelResponse(parts=[TextPart(content=key)])
+
+            return stub
+
+        model_factory._stub_factory = inspecting_stub
+        agent = ReactAgent(config=_two_model_config(), tools=[weather_lookup])
+
+        @agent.system_prompt
+        def _backstory(ctx: RunContext[None]) -> str:
+            return "you are a switchable agent"
+
+        await agent.run("first")
+        agent.switch_model(ANTHROPIC_KEY)
+        await agent.run("second")
+
+        assert offered == [["weather_lookup"], ["weather_lookup"]]
+        assert prompts[-1] == ["you are a switchable agent"]
+
+
+def _output_mode_stub(key: str):
+    """Answers ``_SwitchAnswer`` however the run's effective output mode asks for it.
+
+    ``info.model_request_parameters.output_mode`` is the direct observable of the type
+    pydantic-ai was handed: ``'native'`` for the constructor's ``NativeOutput`` wrapper,
+    ``'tool'`` for a raw Pydantic model on a provider without native structured output.
+    """
+
+    def stub(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        params = info.model_request_parameters
+        if params.output_tools:
+            return ModelResponse(
+                parts=[ToolCallPart(tool_name=params.output_tools[0].name, args={"answer": key})]
+            )
+        return ModelResponse(parts=[TextPart(content=f'{{"answer": "{key}"}}')])
+
+    return stub
+
+
+class TestReactAgentOutputTypeFollowsTheActiveModel:
+    """FR6 — the effective output type is resolved per run from the live config (AC #14, #15)."""
+
+    async def test_a_switch_to_a_non_native_provider_unwraps_the_output_type(self, monkeypatch):
+        """The latent bug, forbidden form A: a type bound at construction (AC #15).
+
+        Constructed on ``openai``, so the ``Agent``'s constructor ``output_type`` is
+        ``NativeOutput(_SwitchAnswer)``. After switching to ``google-gla`` — which has no
+        native structured output — a ``run(output_type=None)`` must use the UNWRAPPED
+        type. Before this story ``_run_with_limits`` passed ``output_type=None`` on this
+        path, pydantic-ai fell back to the constructor's wrapper, and the run went out in
+        ``'native'`` mode against a provider that does not support it.
+        """
+        modes: list[str] = []
+
+        def mode_recording_stub(key: str):
+            inner = _output_mode_stub(key)
+
+            def stub(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+                modes.append(info.model_request_parameters.output_mode)
+                return inner(messages, info)
+
+            return stub
+
+        monkeypatch.setattr(
+            "akgentic.llm.agent.create_model", _ModelFactory(stub_factory=mode_recording_stub)
+        )
+        agent = ReactAgent(
+            config=ReactAgentConfig(
+                model_cfg=[
+                    ModelConfig(provider="openai", model="gpt-4o"),
+                    ModelConfig(provider="google-gla", model="gemini-2.0-flash"),
+                ]
+            ),
+            result_type=_SwitchAnswer,
+        )
+
+        first = await agent.run("before")
+        assert modes == ["native"]
+        assert first.answer == OPENAI_KEY
+
+        agent.switch_model(GOOGLE_KEY)
+        second = await agent.run("after")
+
+        assert modes == ["native", "tool"]
+        assert second.answer == GOOGLE_KEY
+
+    async def test_the_constructor_wrapper_is_never_again_the_effective_type(self, monkeypatch):
+        """AC #14: even with no switch, the type is resolved per run from the live config.
+
+        Same wrapper, same mode — the point is that it now comes from
+        ``get_output_type(self._config.model_cfg, ...)`` at the call rather than from the
+        ``Agent``'s constructor argument, which stays an unused default.
+        """
+        monkeypatch.setattr(
+            "akgentic.llm.agent.create_model", _ModelFactory(stub_factory=_output_mode_stub)
+        )
+        agent = ReactAgent(config=_two_model_config(), result_type=_SwitchAnswer)
+
+        result = await agent.run("no switch here")
+
+        assert result.answer == OPENAI_KEY
+
+
+class TestReactAgentMidRunSwitchBoundary:
+    """AC #16 — forbidden form B: a value re-read per call but hoisted before the call."""
+
+    @staticmethod
+    def _flipping_agent(monkeypatch, target: str, stub_factory, result_type=str, **config_kwargs):
+        """An agent whose ``flip_model`` tool switches to ``target`` mid-run."""
+        factory = _ModelFactory(stub_factory=stub_factory)
+        monkeypatch.setattr("akgentic.llm.agent.create_model", factory)
+        agent = ReactAgent(
+            config=ReactAgentConfig(
+                model_cfg=[
+                    ModelConfig(provider="openai", model="gpt-4o", context_length=1000),
+                    ModelConfig(
+                        provider="google-gla", model="gemini-2.0-flash", context_length=8000
+                    ),
+                ],
+                **config_kwargs,
+            ),
+            result_type=result_type,
+        )
+
+        @agent.tool
+        def flip_model(ctx: RunContext[None]) -> str:
+            """Switch the agent's model from inside the run."""
+            return model_roster_key(agent.switch_model(target))
+
+        return agent, factory
+
+    async def test_a_mid_run_switch_does_not_change_the_run_in_flight(self, monkeypatch):
+        """pydantic-ai binds the model once per ``run()``; the switch lands on the next one.
+
+        The auto-compaction gate is the documented exception: ``_compaction_threshold``
+        reads ``context_length`` live, so it moves for the remainder of the run even
+        though the model does not. That is invariant 3 working as designed, not a defect
+        to cache away.
+        """
+        answered: list[str] = []
+
+        def tool_then_key_stub(key: str):
+            def stub(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+                already_flipped = any(
+                    isinstance(m, ModelRequest)
+                    and any(isinstance(p, ToolReturnPart) for p in m.parts)
+                    for m in messages
+                )
+                if not already_flipped:
+                    return ModelResponse(parts=[ToolCallPart(tool_name="flip_model", args={})])
+                answered.append(key)
+                return ModelResponse(parts=[TextPart(content=key)])
+
+            return stub
+
+        agent, _ = self._flipping_agent(monkeypatch, GOOGLE_KEY, tool_then_key_stub)
+        assert agent._compaction_threshold() == 850
+
+        first = await agent.run("flip mid-run")
+
+        assert first == OPENAI_KEY
+        assert answered == [OPENAI_KEY]
+        assert agent.active_model() is agent._config.model_roster[1]
+        assert agent._compaction_threshold() == 6800
+
+        assert await agent.run("and now") == GOOGLE_KEY
+
+    async def test_a_conclusion_after_a_breach_is_served_the_post_switch_model(
+        self, monkeypatch
+    ):
+        """A conclusion IS a next run, so it must not be served a hoisted model or type.
+
+        The tool switches to ``google-gla`` on the first request; the second request
+        breaches ``tool_calls_limit`` and the recovery seam concludes. The conclusion runs
+        with the tools overridden away, so the stub answers — and both what it answers
+        with and the mode it was asked for come from the POST-switch config.
+
+        A ``run()`` that hoisted the model and the output type into locals and threaded
+        them into both ``_run_with_limits`` and the conclusion would serve the conclusion
+        the pre-switch pair, and this test is what catches it.
+        """
+        seen: list[tuple[str, str]] = []
+
+        def breaching_stub(key: str):
+            answer = _output_mode_stub(key)
+
+            def stub(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+                seen.append((key, info.model_request_parameters.output_mode))
+                if info.function_tools:
+                    return ModelResponse(parts=[ToolCallPart(tool_name="flip_model", args={})])
+                return answer(messages, info)
+
+            return stub
+
+        agent, _ = self._flipping_agent(
+            monkeypatch,
+            GOOGLE_KEY,
+            breaching_stub,
+            result_type=_SwitchAnswer,
+            run_usage_limits=RunUsageLimits(tool_calls_limit=1),
+        )
+
+        result = await agent.run("flip then breach")
+
+        assert isinstance(result, _SwitchAnswer)
+        assert result.answer == GOOGLE_KEY
+        assert seen[-1] == (GOOGLE_KEY, "tool")
+        assert seen[0][0] == OPENAI_KEY
+
+
+class TestReactAgentSwitchModelSummarizer:
+    """FR7 — the summarizer follows the active model, unless it was chosen (AC #17)."""
+
+    def test_the_summarizer_is_rebuilt_on_the_new_entry(self, model_factory):
+        """``summary_model_cfg is None`` means "follow the active model", so it follows.
+
+        A new strategy object, built on the switched-to entry and on the agent's own
+        client — never a second connection pool.
+        """
+        agent = ReactAgent(config=_two_model_config())
+        before = agent._compactor.strategy
+
+        entry = agent.switch_model(ANTHROPIC_KEY)
+
+        strategy = agent._compactor.strategy
+        assert strategy is not before
+        assert isinstance(strategy, SummarizingCompaction)
+        assert strategy._model_cfg is entry
+        assert strategy._http_client is agent._http_client
+
+    def test_a_chosen_summarizer_is_left_alone(self, model_factory):
+        """An escalation must not drag a cheap dedicated summarizer up with it."""
+        agent = ReactAgent(
+            config=_two_model_config(
+                compaction_cfg=CompactionConfig(
+                    summary_model_cfg=ModelConfig(provider="openai", model="gpt-4o-mini")
+                )
+            )
+        )
+        before = agent._compactor.strategy
+
+        agent.switch_model(ANTHROPIC_KEY)
+
+        assert agent._compactor.strategy is before
+        assert before._model_cfg.model == "gpt-4o-mini"
+
+    def test_the_compaction_property_stays_read_only(self, model_factory):
+        """FR7 assigns ``_compactor.strategy``; ``_compaction`` is deliberately a reader."""
+        agent = ReactAgent(config=_two_model_config())
+        agent.switch_model(ANTHROPIC_KEY)
+
+        assert agent._compaction is agent._compactor.strategy
+        with pytest.raises(AttributeError):
+            agent._compaction = _RecordingCompaction(
+                CompactionResult(summary="s", replaced_message_count=1, tokens_after=None)
+            )
+
+
+class TestReactAgentSwitchDoesNotSanitizeHistory:
+    """Trap 1 — a switch hands the next provider the previous one's messages (AC #18)."""
+
+    async def test_the_accumulated_history_crosses_a_provider_switch_unchanged(
+        self, model_factory
+    ):
+        """What this proves, and what it does not.
+
+        It proves *akgentic* performs no sanitization: the same message objects, in the
+        same order, in the same number, reach the run after the switch — nothing is
+        rewritten, dropped or re-tagged by ``switch_model``.
+
+        It does NOT prove that a real provider accepts another provider's parts. Whether
+        Google tolerates an OpenAI tool-call part is the provider's business, and it stays
+        best-effort; story 22-3 documents that. A test cannot settle it against
+        ``FunctionModel``.
+        """
+        seen: list[list[ModelMessage]] = []
+
+        def recording_stub(key: str):
+            def stub(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+                seen.append(list(messages))
+                return ModelResponse(parts=[TextPart(content=key)])
+
+            return stub
+
+        model_factory._stub_factory = recording_stub
+        agent = ReactAgent(
+            config=ReactAgentConfig(
+                model_cfg=[
+                    ModelConfig(provider="openai", model="gpt-4o"),
+                    ModelConfig(provider="google-gla", model="gemini-2.0-flash"),
+                ]
+            )
+        )
+
+        await agent.run("on openai")
+        carried = list(agent.context.messages)
+
+        agent.switch_model(GOOGLE_KEY)
+        await agent.run("on google")
+
+        handed = seen[-1][: len(carried)]
+        assert len(handed) == len(carried)
+        assert all(a is b for a, b in zip(handed, carried, strict=True))
