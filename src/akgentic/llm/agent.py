@@ -388,11 +388,27 @@ class ReactAgent:
         Raises:
             ModelSwitchError: On an unknown key, on an agent with no roster, or when the
                 entry cannot be built or would leave auto-compaction unreachable. The
+                ONLY class this raises — a provider's own exception class for a missing
+                API key or an unsupported provider is translated, never propagated, so a
+                caller needs one ``except`` and never ``except Exception``. The
                 originating exception is preserved as ``__cause__``.
         """
         entry = self._resolve_roster_entry(key)
+        # Broad on purpose, and only around this call: `create_model` reaches third-party
+        # provider constructors, whose failures are NOT a ValueError hierarchy —
+        # pydantic-ai raises `UserError` (a RuntimeError) for a missing OPENAI_API_KEY or
+        # ANTHROPIC_API_KEY, and that is the commonest way a roster entry fails at switch
+        # time rather than at construction. However it says so, it means one thing here:
+        # this entry cannot be built. The caller catches ModelSwitchError and must not
+        # catch Exception, so the translation has to happen here or not at all. Nothing is
+        # swallowed — the text is preserved and the original stays as __cause__.
         try:
             model = create_model(entry, self._http_client)
+        except Exception as e:
+            raise ModelSwitchError(f"cannot switch to '{key}': {e}") from e
+
+        # Narrow, because this one is our own code and ValueError is its whole contract.
+        try:
             validate_compaction_bounds(
                 entry, self._config.compaction_cfg, self._config.run_usage_limits, "switch_model"
             )

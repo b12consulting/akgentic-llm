@@ -1182,12 +1182,18 @@ class TestValidateCompactionBoundsIsCallableDirectly:
             )
 
     def test_the_total_tokens_limit_is_checked_too(self):
-        """Both run-tier token limits arm the rule, and the message names which one."""
+        """Both run-tier token limits arm the rule, and the message names which one.
+
+        The limit sits EXACTLY on the threshold, not comfortably under it: "strictly
+        below" is the rule, so a case 50 tokens past the limit would still pass with the
+        boundary written as ``>``. Both branches are pinned on the boundary or neither is
+        really pinned.
+        """
         with pytest.raises(ValueError, match="run_usage_limits.total_tokens_limit"):
             validate_compaction_bounds(
                 ModelConfig(context_length=1000),
                 CompactionConfig(auto_trigger=True, trigger_ratio=0.85),
-                RunUsageLimits(total_tokens_limit=800),
+                RunUsageLimits(total_tokens_limit=850),
                 "switch_model",
             )
 

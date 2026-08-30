@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from pydantic import BaseModel
 from pydantic_ai import BinaryContent
-from pydantic_ai.exceptions import UsageLimitExceeded
+from pydantic_ai.exceptions import UsageLimitExceeded, UserError
 from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
@@ -3612,6 +3612,40 @@ class TestReactAgentSwitchModelRefusals:
         assert "needs an endpoint this environment does not set" in str(exc.value)
         assert isinstance(exc.value.__cause__, ValueError)
         assert not isinstance(exc.value.__cause__, ModelSwitchError)
+        self._assert_untouched(agent, before)
+
+    def test_a_provider_exception_is_wrapped_too(self, monkeypatch):
+        """AC #2 has no exception clause — a provider's own class is translated as well.
+
+        ``create_model`` reaches third-party provider constructors, and their failures are
+        NOT a ``ValueError`` hierarchy: pydantic-ai raises ``UserError``, a
+        ``RuntimeError``, for a missing ``OPENAI_API_KEY`` or ``ANTHROPIC_API_KEY``. That
+        is the commonest way an entry fails at SWITCH time rather than at construction —
+        an agent built on the one provider whose key is set, switching to one whose is
+        not — and the two ``ValueError`` cases akgentic pre-checks itself (azure's
+        endpoint, google's key) hide it.
+
+        It matters across the package boundary: ``akgentic-agent`` catches this one class
+        and must not catch ``Exception``, so an untranslated provider error reaches the
+        tool layer as a crash instead of a message the model can correct itself from.
+        """
+        built = _ModelFactory()
+
+        def failing(config: ModelConfig, http_client: Any = None) -> FunctionModel:
+            if model_roster_key(config) == ANTHROPIC_KEY:
+                raise UserError("Set the `ANTHROPIC_API_KEY` environment variable")
+            return built(config, http_client)
+
+        monkeypatch.setattr("akgentic.llm.agent.create_model", failing)
+        agent = ReactAgent(config=_two_model_config())
+        before = self._snapshot(agent)
+
+        with pytest.raises(ModelSwitchError) as exc:
+            agent.switch_model(ANTHROPIC_KEY)
+
+        assert "ANTHROPIC_API_KEY" in str(exc.value)
+        assert isinstance(exc.value.__cause__, UserError)
+        assert not isinstance(exc.value.__cause__, ValueError)
         self._assert_untouched(agent, before)
 
     def test_a_switch_that_would_strand_auto_compaction_is_refused(self, model_factory):
