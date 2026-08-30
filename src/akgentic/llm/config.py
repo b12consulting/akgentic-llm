@@ -112,7 +112,7 @@ class ModelConfig(BaseModel):
         ... )
     """
 
-    provider: Literal["openai", "openai-chat", "azure", "nvidia", "google-gla", "mistral", "anthropic"] = Field(
+    provider: Literal["openai", "openai-chat", "azure", "azure-chat", "nvidia", "google-gla", "mistral", "anthropic"] = Field(
         default="openai", description="Model provider"
     )
 
@@ -195,8 +195,10 @@ def _supports_native_output(config: ModelConfig) -> bool:
     """Check if provider supports native structured output via NativeOutput wrapper.
 
     Providers with native support (via function calling or tool use APIs):
-    - openai: GPT-4o, o1 series, etc.
-    - azure: Azure OpenAI Service
+    - openai: GPT-4o, o1 series, etc. (Responses API)
+    - openai-chat: OpenAI models via the legacy Chat Completions API
+    - azure: Azure OpenAI Service (Responses API)
+    - azure-chat: Azure OpenAI Service via the legacy Chat Completions API
     - anthropic: Claude 3.5 Sonnet, etc.
     - nvidia: Only for models with "openai" prefix (e.g., "openai/gpt-oss-120b")
 
@@ -226,7 +228,7 @@ def _supports_native_output(config: ModelConfig) -> bool:
         >>> _supports_native_output(config)
         True
     """
-    if config.provider in ("openai", "azure", "anthropic"):
+    if config.provider in ("openai", "openai-chat", "azure", "azure-chat", "anthropic"):
         return True
     if config.provider == "nvidia":
         return config.model.startswith("openai")

@@ -370,8 +370,43 @@ def _create_openai_chat_model(
 def _create_azure_model(
     config: ModelConfig,
     http_client: httpx2.AsyncClient,
+) -> "OpenAIResponsesModel":
+    """Create Azure OpenAI responses model.
+
+    Uses the Azure OpenAI endpoint from ``AZURE_OPENAI_ENDPOINT`` env var,
+    the API key from ``AZURE_OPENAI_API_KEY``, and the API version from
+    ``OPENAI_API_VERSION``.
+
+    Args:
+        config: LLM model configuration.
+        http_client: Async HTTP client with retry logic.
+
+    Returns:
+        Configured OpenAIResponsesModel instance pointing at Azure endpoint.
+
+    Raises:
+        ValueError: If ``AZURE_OPENAI_ENDPOINT`` environment variable is not set.
+    """
+    from pydantic_ai.models.openai import OpenAIResponsesModel  # noqa: PLC0415
+    from pydantic_ai.providers.azure import AzureProvider  # noqa: PLC0415
+
+    base_url = os.getenv("AZURE_OPENAI_ENDPOINT")
+    if not base_url:
+        raise ValueError(
+            "AZURE_OPENAI_ENDPOINT environment variable is required for Azure provider"
+        )
+    return OpenAIResponsesModel(
+        model_name=config.model,
+        provider=AzureProvider(azure_endpoint=base_url, http_client=http_client),
+        settings=_build_openai_settings(config),
+    )
+
+
+def _create_azure_chat_model(
+    config: ModelConfig,
+    http_client: httpx2.AsyncClient,
 ) -> "OpenAIChatModel":
-    """Create Azure OpenAI model.
+    """Create Azure OpenAI chat model.
 
     Uses the Azure OpenAI endpoint from ``AZURE_OPENAI_ENDPOINT`` env var,
     the API key from ``AZURE_OPENAI_API_KEY``, and the API version from
@@ -398,7 +433,7 @@ def _create_azure_model(
     return OpenAIChatModel(
         model_name=config.model,
         provider=AzureProvider(azure_endpoint=base_url, http_client=http_client),
-        settings=_build_openai_settings(config),
+        settings=_build_openai_chat_settings(config),
     )
 
 
@@ -522,6 +557,7 @@ _PROVIDER_FACTORIES = {
     "openai": _create_openai_model,
     "openai-chat": _create_openai_chat_model,
     "azure": _create_azure_model,
+    "azure-chat": _create_azure_chat_model,
     "anthropic": _create_anthropic_model,
     "google-gla": _create_google_model,
     "mistral": _create_mistral_model,
@@ -571,8 +607,10 @@ def create_model(
     for maximum flexibility.
 
     Supported Providers:
-        - openai: OpenAI models (GPT-4, GPT-4o, o1, etc.)
-        - azure: Azure OpenAI Service
+        - openai: OpenAI models via the Responses API (GPT-4, GPT-4o, o1, etc.)
+        - openai-chat: OpenAI models via the legacy Chat Completions API
+        - azure: Azure OpenAI Service via the Responses API
+        - azure-chat: Azure OpenAI Service via the legacy Chat Completions API
         - anthropic: Anthropic models (Claude 3.5 Sonnet, etc.)
         - google-gla: Google Gemini models
         - mistral: Mistral AI models
