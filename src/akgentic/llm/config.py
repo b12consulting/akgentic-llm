@@ -225,6 +225,111 @@ def _supports_native_output(config: ModelConfig) -> bool:
     return False
 
 
+def model_roster_key(cfg: ModelConfig) -> str:
+    """Return the roster identity of a model config: ``"{provider}:{model}"``.
+
+    The key grammar, defined exactly once. Other packages project a roster onto their
+    own row types and must key those rows the same way — a re-spelled grammar is a
+    model switch that silently matches nothing. Import this rather than reformatting it.
+
+    Args:
+        cfg: The model configuration to key.
+
+    Returns:
+        The ``provider:model`` key.
+
+    Example:
+        >>> model_roster_key(ModelConfig(provider="azure", model="gpt-4o-mini"))
+        'azure:gpt-4o-mini'
+    """
+    return f"{cfg.provider}:{cfg.model}"
+
+
+def validate_unique_roster_keys(roster: list[ModelConfig], owner: str) -> None:
+    """Reject a roster that names the same ``provider:model`` twice.
+
+    A guard, not a transform: it returns nothing and never rewrites the roster. Two
+    entries with one key make a switch request ambiguous, and the ambiguity would only
+    surface at switch time, on whichever entry happened to be found first.
+
+    MUST be called from a ``mode="after"`` validator. Before field validation, entries
+    may still be raw dicts whose ``provider`` is absent, so ``{"model": "m"}`` and
+    ``{"provider": "openai", "model": "m"}`` look distinct although ModelConfig's
+    ``"openai"`` default is about to make them identical.
+
+    Args:
+        roster: Validated roster entries, in declaration order.
+        owner: The model reporting the fault, named in the message.
+
+    Raises:
+        ValueError: on the first repeated key.
+    """
+    seen: set[str] = set()
+    for entry in roster:
+        key = model_roster_key(entry)
+        if key in seen:
+            raise ValueError(
+                f"{owner} model_roster has a duplicate entry for '{key}'; "
+                "every roster entry must name a distinct provider:model"
+            )
+        seen.add(key)
+
+
+def normalize_model_roster(data: Any, owner: str) -> Any:
+    """Fold a list of model configs into one active model plus a declared roster.
+
+    The single place in the package where a model config may be tested against ``list``.
+    A list is an input convenience at the boundary: element 0 becomes ``model_cfg`` and
+    the whole list — the active entry included, in declaration order — becomes
+    ``model_roster``. Every storage and read path downstream sees one ModelConfig.
+
+    Shared with the packages that build a ReactAgentConfig-shaped model of their own, so
+    the roster grammar has one implementation rather than a second copy; mirrors
+    ``_fold_pre_split_request_limit``'s owner-carries-the-message convention.
+
+    TRAP: anything other than a list returns ``data`` **unchanged**. It must never fall
+    through to an ``else`` that clears ``model_roster``: on the
+    ``model_validate(cfg.model_dump())`` round trip, ``model_cfg`` arrives as a single
+    dict while ``model_roster`` is already populated, and clearing it there destroys the
+    roster on a path no construction test exercises. ``default_factory=list`` supplies
+    the empty default when the key is genuinely absent.
+
+    A pure dict transform that copies rather than mutates and removes no key it does not
+    own, so it composes with the usage-limits shim in either evaluation order.
+
+    Args:
+        data: Raw input handed to a ``mode="before"`` model validator.
+        owner: The model reporting the fault, named in the messages.
+
+    Returns:
+        The input untouched, or a shallow copy carrying the folded roster.
+
+    Raises:
+        ValueError: if the list is empty, or if a list arrives with an explicit
+            ``model_roster``.
+    """
+    if not isinstance(data, dict):
+        return data
+    if "model_cfg" not in data:
+        return data
+    value = data["model_cfg"]
+    if not isinstance(value, list):
+        return data
+    if not value:
+        raise ValueError(
+            f"{owner} received an empty model_cfg list; an agent needs at least one model"
+        )
+    if "model_roster" in data:
+        raise ValueError(
+            f"{owner} received both a model_cfg list and an explicit model_roster; "
+            "the roster is derived from the list — pass only one"
+        )
+    mapped = dict(data)
+    mapped["model_roster"] = list(value)
+    mapped["model_cfg"] = value[0]
+    return mapped
+
+
 class CompactionConfig(BaseModel):
     """Configuration for pluggable LLM context compaction.
 
@@ -572,7 +677,15 @@ class ReactAgentConfig(BaseModel):
     4. Repeat until task completion
 
     Attributes:
-        model_cfg: LLM provider and model settings.
+        model_cfg: LLM provider and model settings — always a single ModelConfig once
+            stored. At the input boundary it also accepts a **list** of ModelConfig
+            (or of dicts, on the catalog path), of which element 0 becomes the active
+            model and the whole list becomes ``model_roster``. The list is a
+            convenience for declaring a roster, never a stored shape.
+        model_roster: The full declared roster, in declaration order, including the
+            active entry. Empty means a single-model agent, for which switching is
+            unavailable. Entry keys (``provider:model``) must be unique, and the active
+            model must be one of them.
         runtime_cfg: Execution behavior and HTTP retry strategy.
         run_usage_limits: Per-run resource limits; the tier pydantic-ai enforces.
         agent_usage_limits: Agent-lifetime resource limits — runs and tokens, both
@@ -607,9 +720,30 @@ class ReactAgentConfig(BaseModel):
         ...         http_client_config=HttpClientConfig(timeout=180.0)
         ...     )
         ... )
+        >>>
+        >>> # A roster: gpt-4o is active, all three are declared and switchable.
+        >>> config = ReactAgentConfig(
+        ...     model_cfg=[
+        ...         ModelConfig(provider="openai", model="gpt-4o"),
+        ...         ModelConfig(provider="anthropic", model="claude-sonnet-4-5"),
+        ...         ModelConfig(provider="google-gla", model="gemini-2.0-flash"),
+        ...     ]
+        ... )
+        >>> config.model_cfg.model
+        'gpt-4o'
+        >>> len(config.model_roster)
+        3
     """
 
     model_cfg: ModelConfig = Field(default_factory=ModelConfig, description="Model configuration")
+
+    model_roster: list[ModelConfig] = Field(
+        default_factory=list,
+        description=(
+            "Full declared roster in declaration order, including the active entry. "
+            "Empty = single-model agent, switching unavailable."
+        ),
+    )
 
     runtime_cfg: RuntimeConfig = Field(
         default_factory=RuntimeConfig, description="Runtime behavior configuration"
@@ -633,6 +767,19 @@ class ReactAgentConfig(BaseModel):
         ge=0,
         description="Sliding-window size handed to ContextManager; None = unlimited",
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_model_roster(cls, data: Any) -> Any:
+        """Fold a ``model_cfg`` list into the active model plus ``model_roster``.
+
+        The whole body lives in the module-level ``normalize_model_roster`` so other
+        packages can call it from their own before-validator instead of re-spelling the
+        roster grammar. Deliberately separate from ``_map_pre_split_usage_limits``:
+        each before-validator owns one concern and returns its input unchanged when its
+        own key is absent, so their evaluation order cannot matter.
+        """
+        return normalize_model_roster(data, "ReactAgentConfig")
 
     @model_validator(mode="before")
     @classmethod
@@ -720,4 +867,37 @@ class ReactAgentConfig(BaseModel):
                     f"compaction threshold {threshold} must be strictly below "
                     f"run_usage_limits.{name} ({limit})"
                 )
+        return self
+
+    @model_validator(mode="after")
+    def _reject_duplicate_roster_keys(self) -> "ReactAgentConfig":
+        """Unique-keys: no two roster entries may name the same ``provider:model``.
+
+        Runs after field validation by necessity — before it, an entry's ``provider``
+        may still be absent from a raw dict and ModelConfig's ``"openai"`` default has
+        not applied, so two spellings of one model look distinct.
+        """
+        if not self.model_roster:
+            return self
+        validate_unique_roster_keys(self.model_roster, "ReactAgentConfig")
+        return self
+
+    @model_validator(mode="after")
+    def _require_active_model_in_roster(self) -> "ReactAgentConfig":
+        """Membership: a non-empty roster must contain the active model.
+
+        Normalization satisfies this by construction; it is reachable only when a caller
+        hand-sets ``model_roster``. Defined AFTER the uniqueness rule on purpose, so a
+        roster that is both duplicated and non-covering reports the duplicate — the
+        fault that explains the other.
+        """
+        if not self.model_roster:
+            return self
+        active = model_roster_key(self.model_cfg)
+        keys = [model_roster_key(entry) for entry in self.model_roster]
+        if active not in keys:
+            raise ValueError(
+                f"model_cfg '{active}' is not in model_roster ({', '.join(keys)}); "
+                "the active model must be one of the declared roster entries"
+            )
         return self

@@ -1,8 +1,11 @@
 """Tests for configuration models."""
 
+import copy
+
 import pytest
 from pydantic import ValidationError
 
+import akgentic.llm
 from akgentic.llm import config as config_module
 from akgentic.llm.config import (
     AgentUsageLimits,
@@ -12,6 +15,9 @@ from akgentic.llm.config import (
     RuntimeConfig,
     RunUsageLimits,
     TokenUsageLimits,
+    model_roster_key,
+    normalize_model_roster,
+    validate_unique_roster_keys,
 )
 
 
@@ -820,3 +826,335 @@ class TestCompactionBudgetIsPrimaryOnly:
         )
         assert config.model_cfg.context_length == 1000
         assert config.model_cfg.fallback_models[0].context_length == 2_000_000
+
+
+class TestReactAgentConfigModelRoster:
+    """Test ReactAgentConfig.model_roster and the input-boundary normalization.
+
+    AC 1, 2: field shape, and the stored shape staying singular. AC 3, 4: single-config
+    passthrough and list normalization. AC 5, 6, 8, 9: the four refusals. AC 7: lossless
+    round-trip. AC 10, 11: heterogeneous rosters and per-entry fallback rules.
+    AC 12: coexistence with the usage-limits shim. AC 13: the reuse surface.
+    """
+
+    # --- AC 1, 2: the field is ordinary and the stored shape stays singular ---
+
+    def test_model_roster_is_a_public_pydantic_field(self):
+        """model_roster is a declared field, not a PrivateAttr — AC 1."""
+        assert "model_roster" in ReactAgentConfig.model_fields
+        assert "model_roster" not in ReactAgentConfig.__private_attributes__
+
+    def test_no_arbitrary_types_allowed(self):
+        """ReactAgentConfig declares no arbitrary_types_allowed — AC 1."""
+        assert not ReactAgentConfig.model_config.get("arbitrary_types_allowed")
+
+    def test_model_cfg_annotation_stays_singular(self):
+        """The list is an input convenience; no field is annotated with the union — AC 2."""
+        assert ReactAgentConfig.model_fields["model_cfg"].annotation is ModelConfig
+        assert ReactAgentConfig.model_fields["model_roster"].annotation == list[ModelConfig]
+
+    # --- AC 3: a single ModelConfig changes nothing ---
+
+    def test_single_model_cfg_leaves_the_roster_empty(self):
+        """One ModelConfig in, the same one out, with no roster — AC 3."""
+        one = ModelConfig(provider="openai", model="gpt-4o")
+        config = ReactAgentConfig(model_cfg=one)
+        assert config.model_cfg == one
+        assert config.model_roster == []
+
+    def test_default_construction_leaves_the_roster_empty(self):
+        """The default_factory path is untouched by the normalizer — AC 3."""
+        assert ReactAgentConfig().model_roster == []
+
+    # --- AC 4: a list makes element 0 active and the whole list the roster ---
+
+    def test_list_of_instances_normalizes(self):
+        """Element 0 is active, the roster is the whole list in order — AC 4."""
+        a = ModelConfig(provider="openai", model="gpt-4o")
+        b = ModelConfig(provider="anthropic", model="claude-sonnet-4-5")
+        c = ModelConfig(provider="azure", model="gpt-4o-mini")
+        config = ReactAgentConfig(model_cfg=[a, b, c])
+        assert config.model_cfg == a
+        assert config.model_roster == [a, b, c]
+
+    def test_list_of_dicts_normalizes_through_model_validate(self):
+        """The catalog path — plain dicts — normalizes identically — AC 4."""
+        config = ReactAgentConfig.model_validate(
+            {
+                "model_cfg": [
+                    {"provider": "openai", "model": "gpt-4o"},
+                    {"provider": "anthropic", "model": "claude-sonnet-4-5"},
+                ]
+            }
+        )
+        assert config.model_cfg == ModelConfig(provider="openai", model="gpt-4o")
+        assert [model_roster_key(entry) for entry in config.model_roster] == [
+            "openai:gpt-4o",
+            "anthropic:claude-sonnet-4-5",
+        ]
+
+    def test_list_of_dicts_normalizes_through_model_validate_json(self):
+        """The same holds for JSON input — AC 4."""
+        config = ReactAgentConfig.model_validate_json(
+            '{"model_cfg": [{"provider": "openai", "model": "gpt-4o"},'
+            ' {"provider": "azure", "model": "gpt-4o-mini"}]}'
+        )
+        assert config.model_cfg.model == "gpt-4o"
+        assert [entry.model for entry in config.model_roster] == ["gpt-4o", "gpt-4o-mini"]
+
+    # --- AC 5: an empty list is refused ---
+
+    def test_empty_list_rejected(self):
+        """model_cfg=[] cannot yield an active model — AC 5."""
+        with pytest.raises(ValidationError, match="at least one model"):
+            ReactAgentConfig(model_cfg=[])
+
+    # --- AC 6: roster keys are unique, checked after ModelConfig defaults apply ---
+
+    def test_duplicate_roster_keys_rejected(self):
+        """Two entries with the same provider:model are refused — AC 6."""
+        a = ModelConfig(provider="openai", model="gpt-4o")
+        with pytest.raises(ValidationError, match="openai:gpt-4o"):
+            ReactAgentConfig(model_cfg=[a, ModelConfig(provider="openai", model="gpt-4o")])
+
+    def test_duplicate_survives_the_defaulted_provider_spelling(self):
+        """A defaulted provider and an explicit one collide — the check runs after
+        ModelConfig validation, not on the raw dicts — AC 6."""
+        with pytest.raises(ValidationError, match="openai:gpt-4o"):
+            ReactAgentConfig.model_validate(
+                {"model_cfg": [{"model": "gpt-4o"}, {"provider": "openai", "model": "gpt-4o"}]}
+            )
+
+    def test_distinct_keys_accepted(self):
+        """Same model name on different providers is not a duplicate — AC 6."""
+        config = ReactAgentConfig(
+            model_cfg=[
+                ModelConfig(provider="openai", model="gpt-4o"),
+                ModelConfig(provider="azure", model="gpt-4o"),
+            ]
+        )
+        assert len(config.model_roster) == 2
+
+    # --- AC 7: the round-trip is lossless and never clears the roster ---
+
+    def test_round_trip_through_model_dump_preserves_the_roster(self):
+        """model_cfg arrives single alongside a populated roster; both survive — AC 7."""
+        a = ModelConfig(provider="openai", model="gpt-4o")
+        b = ModelConfig(provider="anthropic", model="claude-sonnet-4-5")
+        config = ReactAgentConfig(model_cfg=[a, b])
+        restored = ReactAgentConfig.model_validate(config.model_dump())
+        assert restored.model_cfg == a
+        assert restored.model_roster == [a, b]
+        assert restored == config
+
+    def test_round_trip_through_json_preserves_the_roster(self):
+        """The JSON round-trip is equally lossless — AC 7."""
+        a = ModelConfig(provider="openai", model="gpt-4o")
+        b = ModelConfig(provider="azure", model="gpt-4o-mini")
+        config = ReactAgentConfig(model_cfg=[a, b])
+        assert ReactAgentConfig.model_validate_json(config.model_dump_json()) == config
+
+    def test_single_model_round_trip_still_leaves_the_roster_empty(self):
+        """A single-model config dumps an empty roster and reloads with one — AC 3, 7."""
+        config = ReactAgentConfig(model_cfg=ModelConfig(provider="openai", model="gpt-4o"))
+        assert config.model_dump()["model_roster"] == []
+        assert ReactAgentConfig.model_validate(config.model_dump()) == config
+
+    # --- AC 8: a list plus an explicit roster is refused ---
+
+    def test_list_with_explicit_roster_rejected(self):
+        """The roster is derived from the list; supplying both is ambiguous — AC 8."""
+        a = ModelConfig(provider="openai", model="gpt-4o")
+        b = ModelConfig(provider="azure", model="gpt-4o-mini")
+        c = ModelConfig(provider="anthropic", model="claude-sonnet-4-5")
+        with pytest.raises(ValidationError, match="model_roster"):
+            ReactAgentConfig(model_cfg=[a, b], model_roster=[c])
+
+    # --- AC 9: the active entry belongs to a non-empty roster ---
+
+    def test_active_model_outside_the_roster_rejected(self):
+        """A hand-set roster that omits the active model is refused — AC 9."""
+        a = ModelConfig(provider="openai", model="gpt-4o")
+        b = ModelConfig(provider="azure", model="gpt-4o-mini")
+        with pytest.raises(ValidationError, match="openai:gpt-4o"):
+            ReactAgentConfig(model_cfg=a, model_roster=[b])
+
+    def test_hand_set_roster_containing_the_active_model_accepted(self):
+        """The same hand-set shape normalization produces is valid — AC 9."""
+        a = ModelConfig(provider="openai", model="gpt-4o")
+        b = ModelConfig(provider="azure", model="gpt-4o-mini")
+        config = ReactAgentConfig(model_cfg=a, model_roster=[a, b])
+        assert config.model_cfg == a
+        assert config.model_roster == [a, b]
+
+    def test_duplicate_is_reported_before_non_membership(self):
+        """Both faults at once report the uniqueness rule — definition order — AC 6, 9."""
+        a = ModelConfig(provider="openai", model="gpt-4o")
+        b = ModelConfig(provider="azure", model="gpt-4o-mini")
+        with pytest.raises(ValidationError, match="duplicate"):
+            ReactAgentConfig(model_cfg=a, model_roster=[b, b])
+
+    # --- AC 10: roster entries need not agree on native-output support ---
+
+    def test_heterogeneous_roster_accepted(self):
+        """Unlike a fallback chain, roster entries may disagree on native output — AC 10."""
+        config = ReactAgentConfig(
+            model_cfg=[
+                ModelConfig(provider="openai", model="gpt-4o"),
+                ModelConfig(provider="google-gla", model="gemini-2.0-flash"),
+            ]
+        )
+        assert len(config.model_roster) == 2
+
+    # --- AC 11: each entry keeps its own fallback chain, under the existing rules ---
+
+    def test_roster_entry_with_a_valid_chain_accepted(self):
+        """A roster entry may carry its own homogeneous, flat chain — AC 11."""
+        config = ReactAgentConfig(
+            model_cfg=[
+                ModelConfig(
+                    provider="openai",
+                    model="gpt-4o",
+                    fallback_models=[ModelConfig(provider="azure", model="gpt-4o-mini")],
+                ),
+                ModelConfig(provider="anthropic", model="claude-sonnet-4-5"),
+            ]
+        )
+        assert config.model_cfg.fallback_models[0].model == "gpt-4o-mini"
+        assert len(config.model_roster) == 2
+
+    def test_roster_entry_with_a_nested_chain_still_rejected(self):
+        """ModelConfig's flat-chain rule still bites per entry — AC 11."""
+        with pytest.raises(ValidationError, match="cannot themselves declare fallback_models"):
+            ReactAgentConfig.model_validate(
+                {
+                    "model_cfg": [
+                        {"provider": "openai", "model": "gpt-4o"},
+                        {
+                            "provider": "openai",
+                            "model": "gpt-4o-mini",
+                            "fallback_models": [
+                                {
+                                    "provider": "azure",
+                                    "model": "gpt-4o",
+                                    "fallback_models": [
+                                        {"provider": "anthropic", "model": "claude-sonnet-4-5"}
+                                    ],
+                                }
+                            ],
+                        },
+                    ]
+                }
+            )
+
+    def test_roster_entry_with_a_heterogeneous_chain_still_rejected(self):
+        """ModelConfig's homogeneity rule still bites per entry — AC 11."""
+        with pytest.raises(ValidationError, match="supports_native_output=True"):
+            ReactAgentConfig.model_validate(
+                {
+                    "model_cfg": [
+                        {"provider": "openai", "model": "gpt-4o"},
+                        {
+                            "provider": "anthropic",
+                            "model": "claude-sonnet-4-5",
+                            "fallback_models": [
+                                {"provider": "mistral", "model": "mistral-large-latest"}
+                            ],
+                        },
+                    ]
+                }
+            )
+
+    # --- AC 12: the two before-validators coexist, in either order ---
+
+    def test_roster_and_deprecated_usage_limits_in_one_call(self):
+        """Neither before-validator drops the other's keys — AC 12."""
+        a = ModelConfig(provider="openai", model="gpt-4o")
+        b = ModelConfig(provider="anthropic", model="claude-sonnet-4-5")
+        with pytest.warns(DeprecationWarning):
+            config = ReactAgentConfig(
+                model_cfg=[a, b],
+                usage_limits=RunUsageLimits(run_request_limit=7),
+            )
+        assert config.model_cfg == a
+        assert config.model_roster == [a, b]
+        assert config.run_usage_limits.run_request_limit == 7
+
+    def test_neither_before_validator_mutates_the_caller_dict(self):
+        """A dict handed to model_validate comes back unchanged, twice over — AC 12."""
+        raw = {
+            "model_cfg": [
+                {"provider": "openai", "model": "gpt-4o"},
+                {"provider": "anthropic", "model": "claude-sonnet-4-5"},
+            ],
+            "usage_limits": {"request_limit": 7},
+        }
+        snapshot = copy.deepcopy(raw)
+        with pytest.warns(DeprecationWarning):
+            first = ReactAgentConfig.model_validate(raw)
+        assert raw == snapshot
+        with pytest.warns(DeprecationWarning):
+            second = ReactAgentConfig.model_validate(raw)
+        assert first == second
+        assert first.run_usage_limits.run_request_limit == 7
+        assert len(first.model_roster) == 2
+
+    # --- AC 13: the reuse surface akgentic-agent imports ---
+
+    def test_the_three_names_are_exported_from_the_package(self):
+        """The key grammar and both guards are public — AC 13."""
+        for name in (
+            "model_roster_key",
+            "normalize_model_roster",
+            "validate_unique_roster_keys",
+        ):
+            assert name in akgentic.llm.__all__
+            assert hasattr(akgentic.llm, name)
+
+    def test_model_roster_key_grammar(self):
+        """The key is provider:model, defined once — AC 13."""
+        assert model_roster_key(ModelConfig(provider="azure", model="gpt-4o-mini")) == (
+            "azure:gpt-4o-mini"
+        )
+
+    def test_normalize_model_roster_serves_another_owner(self):
+        """The normalizer is reusable, and the owner reaches the messages — AC 13."""
+        raw = {
+            "model_cfg": [
+                {"provider": "openai", "model": "gpt-4o"},
+                {"provider": "azure", "model": "gpt-4o-mini"},
+            ]
+        }
+        snapshot = copy.deepcopy(raw)
+        mapped = normalize_model_roster(raw, "AcmeConfig")
+        assert mapped["model_cfg"] == {"provider": "openai", "model": "gpt-4o"}
+        assert mapped["model_roster"] == raw["model_cfg"]
+        assert raw == snapshot
+
+        with pytest.raises(ValueError, match="AcmeConfig"):
+            normalize_model_roster({"model_cfg": []}, "AcmeConfig")
+        with pytest.raises(ValueError, match="AcmeConfig"):
+            normalize_model_roster(
+                {"model_cfg": [{"model": "gpt-4o"}], "model_roster": []}, "AcmeConfig"
+            )
+
+    def test_normalize_model_roster_passes_non_dict_and_absent_keys_through(self):
+        """Instances and rosterless dicts are returned untouched — AC 7, 13."""
+        instance = ReactAgentConfig()
+        assert normalize_model_roster(instance, "AcmeConfig") is instance
+        rosterless = {"max_messages": 4}
+        assert normalize_model_roster(rosterless, "AcmeConfig") is rosterless
+        single = {"model_cfg": {"provider": "openai", "model": "gpt-4o"}, "model_roster": [{}]}
+        assert normalize_model_roster(single, "AcmeConfig") is single
+
+    def test_validate_unique_roster_keys_serves_another_owner(self):
+        """The uniqueness guard is reusable, and names the owner and the key — AC 13."""
+        roster = [
+            ModelConfig(provider="openai", model="gpt-4o"),
+            ModelConfig(provider="openai", model="gpt-4o"),
+        ]
+        with pytest.raises(ValueError, match="AcmeConfig"):
+            validate_unique_roster_keys(roster, "AcmeConfig")
+        with pytest.raises(ValueError, match="openai:gpt-4o"):
+            validate_unique_roster_keys(roster, "AcmeConfig")
+        assert validate_unique_roster_keys(roster[:1], "AcmeConfig") is None

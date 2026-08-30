@@ -67,6 +67,9 @@ from .config import (
     RuntimeConfig,
     RunUsageLimits,
     UsageLimits,
+    model_roster_key,
+    normalize_model_roster,
+    validate_unique_roster_keys,
 )
 from .context import ContextManager
 from .event import (
@@ -103,6 +106,11 @@ __all__ = [
     "HttpClientConfig",
     "ReactAgentConfig",
     "CompactionConfig",
+    # The model-roster grammar and its guards — imported by sibling packages that
+    # project a roster onto their own row types, so the key is spelled exactly once.
+    "model_roster_key",
+    "normalize_model_roster",
+    "validate_unique_roster_keys",
     # Agent
     "ReactAgent",
     "UsageLimitError",  # base of both tiers — catch it to handle either
