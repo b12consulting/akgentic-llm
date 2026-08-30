@@ -71,6 +71,14 @@ class ModelConfig(BaseModel):
     Example:
         >>> # OpenAI GPT-4o with moderate creativity
         >>> config = ModelConfig(
+        ...     provider="openai-chat",
+        ...     model="gpt-4o",
+        ...     temperature=0.7,
+        ...     max_tokens=1000
+        ... )
+        >>>
+        >>> # OpenAI GPT-5.6-luna with responses api
+        >>> config = ModelConfig(
         ...     provider="openai",
         ...     model="gpt-4o",
         ...     temperature=0.7,
@@ -95,7 +103,7 @@ class ModelConfig(BaseModel):
         >>> # A fallback chain: gpt-4o first, then Claude, then Azure. All three
         >>> # support native structured output, so the chain is homogeneous.
         >>> config = ModelConfig(
-        ...     provider="openai",
+        ...     provider="openai-chat",
         ...     model="gpt-4o",
         ...     fallback_models=[
         ...         ModelConfig(provider="anthropic", model="claude-sonnet-4-5"),
@@ -104,7 +112,7 @@ class ModelConfig(BaseModel):
         ... )
     """
 
-    provider: Literal["openai", "azure", "nvidia", "google-gla", "mistral", "anthropic"] = Field(
+    provider: Literal["openai", "openai-chat", "azure", "nvidia", "google-gla", "mistral", "anthropic"] = Field(
         default="openai", description="Model provider"
     )
 

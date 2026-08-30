@@ -282,6 +282,26 @@ def _build_core_settings(config: ModelConfig) -> ModelSettings | None:
 
 
 def _build_openai_settings(config: ModelConfig) -> "OpenAIResponsesModelSettings | None":
+    """Build OpenAIResponsesModelSettings from ModelConfig, including reasoning_effort.
+
+    Delegates shared parameters (temperature, max_tokens, seed) to
+    ``_build_core_settings`` and extends with OpenAI-specific fields.
+
+    Args:
+        config: LLM model configuration.
+
+    Returns:
+        OpenAIResponsesModelSettings instance if any parameters are set, else None.
+    """
+    from pydantic_ai.models.openai import OpenAIResponsesModelSettings   # noqa: PLC0415
+
+    kwargs: dict[str, Any] = dict(cast(dict[str, Any], _build_core_settings(config) or {}))
+    if config.reasoning_effort is not None:
+        kwargs["openai_reasoning_effort"] = config.reasoning_effort
+    return cast(OpenAIResponsesModelSettings, kwargs) if kwargs else None
+
+
+def _build_openai_chat_settings(config: ModelConfig) -> "OpenAIChatModelSettings | None":
     """Build OpenAIChatModelSettings from ModelConfig, including reasoning_effort.
 
     Delegates shared parameters (temperature, max_tokens, seed) to
@@ -293,12 +313,12 @@ def _build_openai_settings(config: ModelConfig) -> "OpenAIResponsesModelSettings
     Returns:
         OpenAIChatModelSettings instance if any parameters are set, else None.
     """
-    from pydantic_ai.models.openai import OpenAIChatModelSettings,OpenAIResponsesModelSettings   # noqa: PLC0415
+    from pydantic_ai.models.openai import OpenAIChatModelSettings   # noqa: PLC0415
 
     kwargs: dict[str, Any] = dict(cast(dict[str, Any], _build_core_settings(config) or {}))
     if config.reasoning_effort is not None:
         kwargs["openai_reasoning_effort"] = config.reasoning_effort
-    return cast(OpenAIResponsesModelSettings, kwargs) if kwargs else None
+    return cast(OpenAIChatModelSettings, kwargs) if kwargs else None
 
 
 def _create_openai_model(
@@ -314,13 +334,36 @@ def _create_openai_model(
     Returns:
         Configured OpenAIResponsesModel instance.
     """
-    from pydantic_ai.models.openai import OpenAIChatModel,OpenAIResponsesModel  # noqa: PLC0415
+    from pydantic_ai.models.openai import OpenAIResponsesModel  # noqa: PLC0415
     from pydantic_ai.providers.openai import OpenAIProvider  # noqa: PLC0415
 
     return OpenAIResponsesModel(
         model_name=config.model,
         provider=OpenAIProvider(http_client=http_client),
         settings=_build_openai_settings(config),
+    )
+
+
+def _create_openai_chat_model(
+    config: ModelConfig,
+    http_client: httpx2.AsyncClient,
+) -> "OpenAIChatModel":
+    """Create OpenAI chat model.
+
+    Args:
+        config: LLM model configuration.
+        http_client: Async HTTP client with retry logic.
+
+    Returns:
+        Configured OpenAIChatModel instance.
+    """
+    from pydantic_ai.models.openai import OpenAIChatModel  # noqa: PLC0415
+    from pydantic_ai.providers.openai import OpenAIProvider  # noqa: PLC0415
+
+    return OpenAIChatModel(
+        model_name=config.model,
+        provider=OpenAIProvider(http_client=http_client),
+        settings=_build_openai_chat_settings(config),
     )
 
 
@@ -477,6 +520,7 @@ def _create_nvidia_model(
 
 _PROVIDER_FACTORIES = {
     "openai": _create_openai_model,
+    "openai-chat": _create_openai_chat_model,
     "azure": _create_azure_model,
     "anthropic": _create_anthropic_model,
     "google-gla": _create_google_model,

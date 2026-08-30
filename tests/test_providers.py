@@ -462,11 +462,79 @@ class TestCreateModel:
     # ------------------------------------------------------------------
 
     @patch("pydantic_ai.providers.openai.OpenAIProvider")
-    @patch("pydantic_ai.models.openai.OpenAIChatModel")
+    @patch("pydantic_ai.models.openai.OpenAIResponsesModel")
     def test_create_openai_model(self, mock_model_cls, mock_provider_cls) -> None:
+        """create_model returns an OpenAIResponsesModel for provider='openai'."""
+        mock_client = MagicMock(spec=httpx.AsyncClient)
+        config = ModelConfig(provider="openai", model="gpt-5.6-luna", temperature=0.7, max_tokens=1000)
+
+        result = create_model(config, http_client=mock_client)
+
+        mock_model_cls.assert_called_once()
+        call_kwargs = mock_model_cls.call_args.kwargs
+        assert call_kwargs["model_name"] == "gpt-5.6-luna"
+        assert result is mock_model_cls.return_value
+
+    @patch("pydantic_ai.providers.openai.OpenAIProvider")
+    @patch("pydantic_ai.models.openai.OpenAIResponsesModel")
+    def test_openai_model_settings_temperature(self, mock_model_cls, mock_provider_cls) -> None:
+        """Temperature is passed via OpenAIResponsesModelSettings for OpenAI."""
+        mock_client = MagicMock(spec=httpx.AsyncClient)
+        config = ModelConfig(provider="openai", model="gpt-5.6-luna", temperature=0.5)
+
+        create_model(config, http_client=mock_client)
+
+        settings = mock_model_cls.call_args.kwargs["settings"]
+        assert settings is not None
+        assert settings["temperature"] == 0.5
+
+    @patch("pydantic_ai.providers.openai.OpenAIProvider")
+    @patch("pydantic_ai.models.openai.OpenAIResponsesModel")
+    def test_openai_reasoning_effort(self, mock_model_cls, mock_provider_cls) -> None:
+        """reasoning_effort maps to openai_reasoning_effort in settings."""
+        mock_client = MagicMock(spec=httpx.AsyncClient)
+        config = ModelConfig(provider="openai", model="gpt-5.6-sol", reasoning_effort="high")
+
+        create_model(config, http_client=mock_client)
+
+        settings = mock_model_cls.call_args.kwargs["settings"]
+        assert settings is not None
+        assert settings["openai_reasoning_effort"] == "high"
+
+    @patch("pydantic_ai.providers.openai.OpenAIProvider")
+    @patch("pydantic_ai.models.openai.OpenAIResponsesModel")
+    def test_openai_seed_passed_in_settings(self, mock_model_cls, mock_provider_cls) -> None:
+        """seed is included in OpenAIChatModelSettings when set."""
+        mock_client = MagicMock(spec=httpx.AsyncClient)
+        config = ModelConfig(provider="openai", model="gpt-5.6-luna", seed=42)
+
+        create_model(config, http_client=mock_client)
+
+        settings = mock_model_cls.call_args.kwargs["settings"]
+        assert settings is not None
+        assert settings["seed"] == 42
+
+    @patch("pydantic_ai.providers.openai.OpenAIProvider")
+    @patch("pydantic_ai.models.openai.OpenAIResponsesModel")
+    def test_openai_http_client_passed_to_provider(self, mock_model_cls, mock_provider_cls) -> None:
+        """http_client is passed to OpenAIProvider."""
+        mock_client = MagicMock(spec=httpx.AsyncClient)
+        config = ModelConfig(provider="openai", model="gpt-5.6-luna")
+
+        create_model(config, http_client=mock_client)
+
+        mock_provider_cls.assert_called_once_with(http_client=mock_client)
+
+    # ------------------------------------------------------------------
+    # OpenAI Chat
+    # ------------------------------------------------------------------
+
+    @patch("pydantic_ai.providers.openai.OpenAIProvider")
+    @patch("pydantic_ai.models.openai.OpenAIChatModel")
+    def test_create_openai_chat_model(self, mock_model_cls, mock_provider_cls) -> None:
         """create_model returns an OpenAIChatModel for provider='openai'."""
         mock_client = MagicMock(spec=httpx2.AsyncClient)
-        config = ModelConfig(provider="openai", model="gpt-4o", temperature=0.7, max_tokens=1000)
+        config = ModelConfig(provider="openai-chat", model="gpt-4o", temperature=0.7, max_tokens=1000)
 
         result = create_model(config, http_client=mock_client)
 
@@ -477,10 +545,10 @@ class TestCreateModel:
 
     @patch("pydantic_ai.providers.openai.OpenAIProvider")
     @patch("pydantic_ai.models.openai.OpenAIChatModel")
-    def test_openai_model_settings_temperature(self, mock_model_cls, mock_provider_cls) -> None:
+    def test_openai_chat_model_settings_temperature(self, mock_model_cls, mock_provider_cls) -> None:
         """Temperature is passed via OpenAIChatModelSettings for OpenAI."""
         mock_client = MagicMock(spec=httpx2.AsyncClient)
-        config = ModelConfig(provider="openai", model="gpt-4o", temperature=0.5)
+        config = ModelConfig(provider="openai-chat", model="gpt-4o", temperature=0.5)
 
         create_model(config, http_client=mock_client)
 
@@ -490,10 +558,10 @@ class TestCreateModel:
 
     @patch("pydantic_ai.providers.openai.OpenAIProvider")
     @patch("pydantic_ai.models.openai.OpenAIChatModel")
-    def test_openai_reasoning_effort(self, mock_model_cls, mock_provider_cls) -> None:
+    def test_openai_chat_reasoning_effort(self, mock_model_cls, mock_provider_cls) -> None:
         """reasoning_effort maps to openai_reasoning_effort in settings."""
         mock_client = MagicMock(spec=httpx2.AsyncClient)
-        config = ModelConfig(provider="openai", model="o1", reasoning_effort="high")
+        config = ModelConfig(provider="openai-chat", model="o1", reasoning_effort="high")
 
         create_model(config, http_client=mock_client)
 
@@ -503,10 +571,10 @@ class TestCreateModel:
 
     @patch("pydantic_ai.providers.openai.OpenAIProvider")
     @patch("pydantic_ai.models.openai.OpenAIChatModel")
-    def test_openai_seed_passed_in_settings(self, mock_model_cls, mock_provider_cls) -> None:
+    def test_openai_chat_seed_passed_in_settings(self, mock_model_cls, mock_provider_cls) -> None:
         """seed is included in OpenAIChatModelSettings when set."""
         mock_client = MagicMock(spec=httpx2.AsyncClient)
-        config = ModelConfig(provider="openai", model="gpt-4o", seed=42)
+        config = ModelConfig(provider="openai-chat", model="gpt-4o", seed=42)
 
         create_model(config, http_client=mock_client)
 
@@ -516,10 +584,10 @@ class TestCreateModel:
 
     @patch("pydantic_ai.providers.openai.OpenAIProvider")
     @patch("pydantic_ai.models.openai.OpenAIChatModel")
-    def test_openai_http_client_passed_to_provider(self, mock_model_cls, mock_provider_cls) -> None:
+    def test_openai_chat_http_client_passed_to_provider(self, mock_model_cls, mock_provider_cls) -> None:
         """http_client is passed to OpenAIProvider."""
         mock_client = MagicMock(spec=httpx2.AsyncClient)
-        config = ModelConfig(provider="openai", model="gpt-4o")
+        config = ModelConfig(provider="openai-chat", model="gpt-4o")
 
         create_model(config, http_client=mock_client)
 
@@ -771,7 +839,7 @@ class TestCreateModel:
 
     @patch("akgentic.llm.providers.create_http_client")
     @patch("pydantic_ai.providers.openai.OpenAIProvider")
-    @patch("pydantic_ai.models.openai.OpenAIChatModel")
+    @patch("pydantic_ai.models.openai.OpenAIResponsesModel")
     def test_http_client_created_when_none(
         self, mock_model_cls, mock_provider_cls, mock_create_client
     ) -> None:
@@ -785,7 +853,7 @@ class TestCreateModel:
         mock_provider_cls.assert_called_once_with(http_client=mock_create_client.return_value)
 
     @patch("pydantic_ai.providers.openai.OpenAIProvider")
-    @patch("pydantic_ai.models.openai.OpenAIChatModel")
+    @patch("pydantic_ai.models.openai.OpenAIResponsesModel")
     def test_provided_http_client_not_replaced(self, mock_model_cls, mock_provider_cls) -> None:
         """Provided http_client is passed through without creating a new one."""
         mock_client = MagicMock(spec=httpx2.AsyncClient)
@@ -802,7 +870,7 @@ class TestCreateModel:
     # ------------------------------------------------------------------
 
     @patch("pydantic_ai.providers.openai.OpenAIProvider")
-    @patch("pydantic_ai.models.openai.OpenAIChatModel")
+    @patch("pydantic_ai.models.openai.OpenAIResponsesModel")
     def test_none_optional_params_produce_no_settings(
         self, mock_model_cls, mock_provider_cls
     ) -> None:
@@ -885,7 +953,7 @@ class TestCreateModelFallbackChain:
         )
 
     @patch("pydantic_ai.providers.openai.OpenAIProvider")
-    @patch("pydantic_ai.models.openai.OpenAIChatModel")
+    @patch("pydantic_ai.models.openai.OpenAIResponsesModel")
     def test_empty_chain_returns_primary_unwrapped(self, mock_model_cls, mock_provider_cls) -> None:
         """The default empty chain returns the primary model itself, not a FallbackModel."""
         mock_client = MagicMock(spec=httpx2.AsyncClient)
@@ -901,7 +969,7 @@ class TestCreateModelFallbackChain:
     @patch("pydantic_ai.providers.anthropic.AnthropicProvider")
     @patch("pydantic_ai.providers.openai.OpenAIProvider")
     @patch("pydantic_ai.models.anthropic.AnthropicModel")
-    @patch("pydantic_ai.models.openai.OpenAIChatModel")
+    @patch("pydantic_ai.models.openai.OpenAIResponsesModel")
     def test_non_empty_chain_returns_fallback_model(
         self,
         mock_openai_cls,
@@ -925,7 +993,7 @@ class TestCreateModelFallbackChain:
     @patch("pydantic_ai.providers.anthropic.AnthropicProvider")
     @patch("pydantic_ai.providers.openai.OpenAIProvider")
     @patch("pydantic_ai.models.anthropic.AnthropicModel")
-    @patch("pydantic_ai.models.openai.OpenAIChatModel")
+    @patch("pydantic_ai.models.openai.OpenAIResponsesModel")
     def test_chain_wrapped_in_declaration_order(
         self,
         mock_openai_cls,
@@ -955,7 +1023,7 @@ class TestCreateModelFallbackChain:
     @patch("pydantic_ai.providers.anthropic.AnthropicProvider")
     @patch("pydantic_ai.providers.openai.OpenAIProvider")
     @patch("pydantic_ai.models.anthropic.AnthropicModel")
-    @patch("pydantic_ai.models.openai.OpenAIChatModel")
+    @patch("pydantic_ai.models.openai.OpenAIResponsesModel")
     def test_single_entry_chain_wraps_in_order(
         self,
         mock_openai_cls,
@@ -984,7 +1052,7 @@ class TestCreateModelFallbackChain:
     @patch("pydantic_ai.providers.anthropic.AnthropicProvider")
     @patch("pydantic_ai.providers.openai.OpenAIProvider")
     @patch("pydantic_ai.models.anthropic.AnthropicModel")
-    @patch("pydantic_ai.models.openai.OpenAIChatModel")
+    @patch("pydantic_ai.models.openai.OpenAIResponsesModel")
     def test_every_entry_built_with_the_same_http_client(
         self,
         mock_openai_cls,
@@ -1012,7 +1080,7 @@ class TestCreateModelFallbackChain:
     @patch("pydantic_ai.providers.anthropic.AnthropicProvider")
     @patch("pydantic_ai.providers.openai.OpenAIProvider")
     @patch("pydantic_ai.models.anthropic.AnthropicModel")
-    @patch("pydantic_ai.models.openai.OpenAIChatModel")
+    @patch("pydantic_ai.models.openai.OpenAIResponsesModel")
     def test_third_entry_also_gets_the_caller_http_client(
         self,
         mock_openai_cls,
@@ -1044,7 +1112,7 @@ class TestCreateModelFallbackChain:
     @patch("pydantic_ai.providers.anthropic.AnthropicProvider")
     @patch("pydantic_ai.providers.openai.OpenAIProvider")
     @patch("pydantic_ai.models.anthropic.AnthropicModel")
-    @patch("pydantic_ai.models.openai.OpenAIChatModel")
+    @patch("pydantic_ai.models.openai.OpenAIResponsesModel")
     def test_auto_created_client_shared_across_the_chain(
         self,
         mock_openai_cls,
@@ -1070,7 +1138,7 @@ class TestCreateModelFallbackChain:
         mock_anthropic_provider.assert_called_once_with(http_client=mock_create_client.return_value)
 
     @patch("pydantic_ai.providers.openai.OpenAIProvider")
-    @patch("pydantic_ai.models.openai.OpenAIChatModel")
+    @patch("pydantic_ai.models.openai.OpenAIResponsesModel")
     def test_unsupported_provider_in_fallback_entry_raises(
         self, mock_model_cls, mock_provider_cls
     ) -> None:
@@ -1108,7 +1176,7 @@ class TestCreateModelFallbackChain:
         object.__setattr__(with_fallback.fallback_models[0], "provider", "unknown-provider")
         with (
             patch("pydantic_ai.providers.openai.OpenAIProvider"),
-            patch("pydantic_ai.models.openai.OpenAIChatModel"),
+            patch("pydantic_ai.models.openai.OpenAIResponsesModel"),
         ):
             with pytest.raises(ValueError) as fallback_exc:
                 create_model(with_fallback, http_client=mock_client)
