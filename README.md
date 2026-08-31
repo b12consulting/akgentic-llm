@@ -18,6 +18,9 @@ call any LLM without coupling to a specific vendor or framework primitive.
   - [Usage limits](#usage-limits)
   - [RuntimeConfig](#runtimeconfig)
   - [ReactAgentConfig](#reactagentconfig)
+  - [Model roster and runtime switching](#model-roster-and-runtime-switching)
+    - [Roster vs. fallback chain](#roster-vs-fallback-chain)
+    - [Switching at runtime](#switching-at-runtime)
 - [Providers](#providers)
 - [ReactAgent API](#reactagent-api)
 - [Capabilities](#capabilities)
@@ -73,10 +76,13 @@ ReactAgent
   ├── run(user_prompt: UserPrompt)           # str | list[str | BinaryContent]
   │     │
   │     ├── await pydantic_agent.run(        # pydantic-ai REACT loop, one awaited call
-  │     │       user_prompt,
+  │     │       user_prompt=…,
+  │     │       deps=…,
   │     │       usage_limits=…,              # RUN tier only; no usage= is ever passed
   │     │       message_history=context.messages,
-  │     │       output_type=get_output_type(model_cfg, output_type),
+  │     │       model=self._model,           # the ACTIVE model, read here — a switch lands next run
+  │     │       output_type=get_output_type( # re-resolved per run from the LIVE model_cfg
+  │     │           self._config.model_cfg, output_type or self._result_type),
   │     │   )
   │     │     │
   │     │     ├── LifetimeBudgetCapability  # refuses a spent agent; folds what a run burned
@@ -326,6 +332,22 @@ the agent tier, so an `agent_usage_limits` token limit below the compaction thre
 constructs — but it does make the auto-trigger unreachable at runtime, because the agent
 refuses the run before compaction can fire.
 
+That check is **one rule with one implementation, applied at two moments**. The rule lives in
+`validate_compaction_bounds()` in `config.py`, and it is called both by `ReactAgentConfig`'s
+after-validator at construction and by `ReactAgent.switch_model()` against the *candidate* roster
+entry, before anything is committed. A switch changes `model_cfg.context_length`, and therefore
+moves the threshold — so switching to a longer-context model whose threshold would reach a set
+`input_tokens_limit` or `total_tokens_limit` is **refused**, with the produced threshold and the
+limit both named in the message (see
+[Model roster and runtime switching](#model-roster-and-runtime-switching)). Past that point
+pydantic-ai raises before compaction can ever fire and the auto-trigger is dead code with no error
+anywhere, which is exactly what the construction-time check exists to prevent — a second spelling
+would have let a switch install what the constructor refuses.
+
+`validate_compaction_bounds` is **not** exported from `akgentic.llm`; it is an intra-package
+invariant. A consumer that genuinely needs it imports it as
+`from akgentic.llm.config import validate_compaction_bounds`.
+
 #### Telling the two tiers apart
 
 A breach raises **one of two classes**, both subclassing `UsageLimitError` — except that a
@@ -510,11 +532,16 @@ from akgentic.llm import (
 )
 
 config = ReactAgentConfig(
-    model_cfg=ModelConfig(
-        provider="anthropic",
-        model="claude-3-5-sonnet-20241022",
-        temperature=0.7,
-    ),
+    # A list is a roster: element 0 is active, all of them are declared and switchable.
+    # Pass a single ModelConfig instead for a one-model agent (model_roster stays []).
+    model_cfg=[
+        ModelConfig(
+            provider="anthropic",
+            model="claude-3-5-sonnet-20241022",
+            temperature=0.7,
+        ),
+        ModelConfig(provider="openai", model="gpt-4o-mini"),
+    ],
     run_usage_limits=RunUsageLimits(
         run_request_limit=10,
         total_tokens_limit=50_000,
@@ -528,6 +555,188 @@ config = ReactAgentConfig(
     ),
 )
 ```
+
+### Model roster and runtime switching
+
+An agent may declare a **roster** of models and change which one answers, at runtime, without
+being rebuilt. **The pydantic-ai `Agent` is never rebuilt and never mutated by a switch** — the
+new model reaches it as a per-run `model=` argument. A switch changes *who answers the next turn*,
+not *what the agent remembers*.
+
+`ReactAgentConfig` carries the roster in two fields:
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `model_cfg` | `ModelConfig` | `ModelConfig()` | The **active** model. Always a single config once stored |
+| `model_roster` | `list[ModelConfig]` | `[]` | The full declared roster, in declaration order, active entry included. `[]` = single-model agent, switching unavailable |
+
+`model_cfg` additionally accepts a `list[ModelConfig]` **at the input boundary only**. A
+`mode="before"` validator folds that list into element 0 as the active model plus the whole list —
+declaration order preserved — as `model_roster`. The union is an input convenience, never a stored
+shape: every read path downstream sees one `ModelConfig`, and both fields are real Pydantic fields
+that round-trip through `model_dump()` / `model_validate()` unchanged.
+
+```python
+from akgentic.llm import ModelConfig, ReactAgentConfig, model_roster_key
+
+config = ReactAgentConfig(
+    model_cfg=[
+        ModelConfig(provider="openai", model="gpt-4o", context_length=128_000),
+        ModelConfig(provider="anthropic", model="claude-sonnet-4-5"),
+        ModelConfig(provider="google-gla", model="gemini-2.0-flash"),
+    ],
+)
+
+config.model_cfg.model                                    # 'gpt-4o' — element 0 is active
+len(config.model_roster)                                  # 3 — the active entry is a member
+[model_roster_key(m) for m in config.model_roster]
+# ['openai:gpt-4o', 'anthropic:claude-sonnet-4-5', 'google-gla:gemini-2.0-flash']
+
+# A single ModelConfig leaves the roster empty — a one-model agent, which cannot switch.
+ReactAgentConfig(model_cfg=ModelConfig(provider="openai", model="gpt-4o")).model_roster  # []
+```
+
+**The key grammar is `f"{provider}:{model}"`**, spelled once, by `model_roster_key()`. That key is
+the roster's identity and the argument `switch_model()` takes. Four rules are enforced when the
+config is constructed, each with its own message:
+
+- an **empty list** is rejected — an agent needs at least one model;
+- passing **both** a `model_cfg` list and an explicit `model_roster` is rejected — the roster is
+  derived from the list, so pass only one;
+- **duplicate keys** are rejected, naming the repeated key: two entries with one key would make a
+  switch request ambiguous, and the ambiguity would only surface at switch time on whichever entry
+  happened to be found first;
+- the **active model must be a member** of a non-empty roster. Normalization satisfies this by
+  construction; it is reachable only when a caller hand-sets `model_roster`.
+
+`model_roster_key()`, `normalize_model_roster()` and `validate_unique_roster_keys()` are all
+exported from `akgentic.llm`, deliberately. Sibling packages project a roster onto their own row
+types and **import** these rather than re-spelling the grammar — one implementation, not a second
+copy. A re-spelled key grammar is a model switch that silently matches nothing.
+
+#### Roster vs. fallback chain
+
+A roster is not a [fallback chain](#fallback-chain), and the two compose: a roster entry keeps its
+own `fallback_models`, and switching to it swaps the entry *together with* its chain. Four
+differences matter in practice:
+
+| | Roster (`model_roster`) | Fallback chain (`fallback_models`) |
+|---|---|---|
+| **Trigger** | **Deliberate** — a human or the model asks for a named entry | **Automatic** — fires on API failure with nobody asking |
+| **Visibility** | **Observable** — `switch_model()` returns the entry now active | **Invisible** — a chain entry firing is not surfaced |
+| **Build time** | **Lazy** — an entry is built only when it is switched to | **Eager** — every entry is built at construction |
+| **Homogeneity** | **Heterogeneous allowed** — entries need not agree on native structured-output support | **Forbidden** — every entry must agree with the primary |
+
+The last two are the ones that bite.
+
+**Lazy means a roster entry can fail at switch time.** A chain's eager construction is what makes a
+bad entry fail loudly and early (the paragraph under [Fallback chain](#fallback-chain) still
+holds). A roster entry is built only on the switching turn, so an entry whose environment is not
+satisfied — a missing `ANTHROPIC_API_KEY`, an unset `AZURE_OPENAI_ENDPOINT` — fails *then*, in
+front of whoever asked for it, as a `ModelSwitchError`.
+
+**Heterogeneous rosters are safe precisely because the output wrapper is now resolved per run.** A
+fallback entry is selected *inside* one request, after the structured-output wrapper for that
+request has already been chosen — so a mismatched entry would be served by the wrong wrapper. A
+roster entry is selected *before* a request, and the wrapper is re-derived from the newly active
+model on the next `run()`. That is why the chain enforces homogeneity and the roster does not.
+
+#### Switching at runtime
+
+`ReactAgent` exposes two readers and one switch:
+
+```python
+from akgentic.llm import ModelSwitchError, ReactAgent
+
+agent = ReactAgent(config=config)
+
+agent.active_model()      # the live ModelConfig — after a switch, the roster entry itself
+agent.model_roster()      # a fresh list of the declared entries, in declaration order
+
+entry = agent.switch_model("anthropic:claude-sonnet-4-5")
+entry.model               # 'claude-sonnet-4-5' — the roster entry now active
+
+try:
+    agent.switch_model("openai:o99")
+except ModelSwitchError as e:
+    str(e)  # "cannot switch to 'openai:o99': available keys: openai:gpt-4o, ..."
+```
+
+`model_roster()` returns a **copy** by contract — the list is routinely handed to a tool that
+renders or sorts it, and mutating it must not edit the agent's roster. The entries themselves are
+shared, and `switch_model()` installs one of them by identity.
+
+**A roster entry is installed wholesale.** `provider:model` is the identity; the entry is the
+definition. Its `temperature`, `max_tokens`, `context_length` and `fallback_models` *replace* the
+active model's — they are not merged with them. Switching to the already-active key is not
+short-circuited, so that rule holds with no exception.
+
+**What a switch preserves.** The pydantic-ai `Agent` is neither rebuilt nor mutated, so tools,
+toolsets, registered system prompts, the `ContextManager` message history, the lifetime usage
+counters and the one HTTP connection pool all survive it untouched. The summarizer, when it is
+rebuilt (below), is rebuilt over that same client — a switch opens no second pool.
+
+**`ModelSwitchError` is the one class every refusal raises.** It is exported from `akgentic.llm`
+and subclasses `ValueError`, so an existing `except ValueError` keeps catching it. A consumer needs
+exactly **one** `except ModelSwitchError` and must never fall back to `except Exception`. It is
+raised in four conditions:
+
+1. **The agent declares no roster** — a distinct message ("this agent declares no model roster, so
+   switching is unavailable"), not an empty list of available keys.
+2. **The key is unknown** — the message names the requested key *and* every available key. That
+   text is what a tool-driven caller gets as its whole diagnosis, and it is the difference between
+   a self-correcting failure and a stuck agent.
+3. **The entry cannot be built.** Anything `create_model()` raises is translated, with the original
+   text preserved and the original kept as `__cause__`. **This covers a provider's own exception
+   class**: pydantic-ai raises `UserError` — a `RuntimeError`, *not* a `ValueError` — for a missing
+   `OPENAI_API_KEY` or `ANTHROPIC_API_KEY`, and that is the commonest form of a switch-time build
+   failure. Translating it here is what lets the caller keep the single `except`.
+4. **The entry would make auto-compaction unreachable** — its compaction threshold would reach or
+   pass a set run-tier token limit (see [Usage limits](#usage-limits)).
+
+**A refusal changes nothing.** Every fallible step — resolving the key, building the model,
+re-checking the compaction bounds, building the summarizer — runs *before* the first assignment.
+There is deliberately no snapshot and no rollback path, because nothing is written until everything
+has passed: `_config`, `_model` and the summarizer strategy are left as exactly the objects they
+were.
+
+**The summarizer follows the active model, unless it was pinned.** When
+`CompactionConfig.summary_model_cfg is None`, the compaction strategy is **rebuilt on every
+switch** against the newly active entry, over the same HTTP client. When `summary_model_cfg` is set
+explicitly it stays **pinned** across every switch — a dedicated cheap summarizer is the operator's
+choice, and an escalation must not drag it along.
+
+**A switch made mid-run takes effect from the next run.** `switch_model()` is reachable from inside
+a tool, so this boundary is a real one:
+
+- **the run in flight is unaffected.** pydantic-ai binds the model and the output type once per
+  `run()` call, so the turn that made the switch is still answered by the pre-switch model;
+- **a conclusion driven after a run-tier breach is a next run** (see
+  [Run-tier recovery](#run-tier-recovery)) and *is* served the post-switch model and output type;
+- **the one thing that does move mid-run is the auto-compaction gate.** The threshold is computed
+  from `model_cfg.context_length` read *live*, so a switch to a larger-context model moves the
+  threshold while the run still answers on the pre-switch model. This is deliberate, not an
+  oversight: caching the threshold to keep the two in step would break the live-config invariant
+  for a consistency nobody asked for, the divergence lasts exactly one run, and it errs toward
+  compacting sooner.
+
+> **Trap: a switch does not sanitize the message history.** Provider-specific parts already in the
+> history are handed to the next provider exactly as pydantic-ai maps them. Heterogeneous switching
+> is therefore **best-effort**. What this package guarantees is narrow and worth stating precisely:
+> akgentic performs **no** sanitization — that absence is characterized by test. What a real
+> provider does when it is handed another provider's parts is **not** proven by those tests and is
+> **not** guaranteed. `/compact` (or `ReactAgent.compact()`) before switching is the mitigation
+> available today.
+
+**Under the `loadtest` extra**, `MockReactAgent` answers both readers truthfully — `active_model()`
+off its config, `model_roster()` as a fresh list — and **refuses every switch** with the same
+`ModelSwitchError` class, imported rather than redefined, so one `except` catches both. It replays
+a scenario bound to `model_cfg.model` at construction and builds no model at all.
+
+> **This package calls `switch_model()` nowhere.** `akgentic-llm` provides the mechanism; the
+> wiring that makes a switch reachable from a conversation — the tool surface and the agent-side
+> configuration — lives in `akgentic-tool` and `akgentic-agent`. Adding a roster changes no agent
+> behaviour on its own.
 
 ## Providers
 
@@ -591,8 +800,13 @@ ModelConfig(
 ```
 
 A chain declared on `ReactAgentConfig.model_cfg` also reaches the compaction summarizer, which
-builds its model through the same `create_model()` and falls back to `model_cfg` when
-`CompactionConfig.summary_model_cfg` is unset.
+builds its model through the same `create_model()`. When `CompactionConfig.summary_model_cfg` is
+unset the summarizer **follows the active model**: it is built from `model_cfg` at construction and
+rebuilt from the new entry on every `switch_model()`, over the same HTTP client. Setting
+`summary_model_cfg` explicitly pins the summarizer, and a switch leaves it alone.
+
+A chain is not a roster, and the two compose — see
+[Roster vs. fallback chain](#roster-vs-fallback-chain) for the four differences that matter.
 
 ## ReactAgent API
 
@@ -626,6 +840,11 @@ class ReactAgent:
     def compact(self) -> str: ...         # force a fold now, bypassing the budget gate
     def clear_context(self) -> str: ...   # drop history; system prompt regenerates next run
 
+    # Model roster (see Model roster and runtime switching)
+    def active_model(self) -> ModelConfig: ...        # the live config, read at call time
+    def model_roster(self) -> list[ModelConfig]: ...  # a fresh list, declaration order
+    def switch_model(self, key: str) -> ModelConfig: ...  # raises ModelSwitchError; next run on
+
     # Dynamic prompts and tools (decorator API)
     def system_prompt(self, func: F) -> F: ...  # wraps @agent.system_prompt(dynamic=True)
     def tool(self, func: F) -> F: ...            # wraps @agent.tool()
@@ -639,8 +858,17 @@ class ReactAgent:
     def pydantic_agent(self) -> Agent[Any, Any]: ...  # access underlying pydantic-ai Agent
 ```
 
-`output_type` in `run()` overrides the construction-time `result_type` for that call only.
-Both are wrapped with `get_output_type()` to apply the provider-aware `NativeOutput` strategy.
+`output_type` in `run()` overrides the construction-time `result_type` for that call only. **The
+effective type is resolved per run, from the model that is live at that moment** —
+`get_output_type(self._config.model_cfg, output_type or self._result_type)`, evaluated at the
+`pydantic_agent.run()` call itself. The wrapper baked at construction stays on the `Agent` as an
+unused default and is **never again the effective type for any run**.
+
+That is not a detail. Before it, an agent built with `result_type=<a Pydantic model>` kept the
+wrapper chosen from its *original* provider: switch it across the native-output boundary — an
+OpenAI agent moving to Gemini, say — and the run would still be wrapped in `NativeOutput` for a
+provider that has none. Re-resolving per run is what makes a
+[heterogeneous roster](#roster-vs-fallback-chain) safe.
 
 **`conclude_without_tools()` turns an interrupted turn into an answer — and it is still a
 mechanism, not a policy.** The distinction holds; what moved is *where the policy lives*. It is
@@ -1611,8 +1839,8 @@ blocked from merging until all steps are green.
 ```
 src/akgentic/llm/
     __init__.py     # Public API exports
-    agent.py        # ReactAgent, UserPrompt type alias; re-exports UsageLimitError,
-                    #   RunUsageLimitError, AgentUsageLimitError and
+    agent.py        # ReactAgent, ModelSwitchError, UserPrompt type alias; re-exports
+                    #   UsageLimitError, RunUsageLimitError, AgentUsageLimitError and
                     #   RUN_LIMIT_HEALING_MESSAGE from capabilities/errors.py, so imports
                     #   written against their old home keep working
     capabilities/   # The run-loop capabilities, one module each
@@ -1629,7 +1857,9 @@ src/akgentic/llm/
                     #   CompactionResult, create_compaction()
     config.py       # ModelConfig, CompactionConfig, TokenUsageLimits, RunUsageLimits,
                     #   AgentUsageLimits, UsageLimits (deprecated), HttpClientConfig,
-                    #   RuntimeConfig, ReactAgentConfig, _supports_native_output()
+                    #   RuntimeConfig, ReactAgentConfig, _supports_native_output(),
+                    #   model_roster_key(), normalize_model_roster(),
+                    #   validate_unique_roster_keys(), validate_compaction_bounds()
     context.py      # ContextManager
     event.py        # LlmMessageEvent, LlmUsageEvent, LlmSystemPromptEvent,
                     #   SystemPromptPartSnapshot, LlmContextCompactedEvent,

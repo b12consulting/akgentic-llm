@@ -25,7 +25,9 @@ from pydantic_ai.messages import (
 )
 from pydantic_ai.usage import RequestUsage
 
+from akgentic.llm.agent import ModelSwitchError
 from akgentic.llm.capabilities import LimitRecoveryCapability
+from akgentic.llm.config import ModelConfig
 from akgentic.llm.context import ContextManager
 from akgentic.llm.event import ContextObserver, LlmMessageEvent
 from akgentic.llm.loadtest.scenario import (
@@ -376,6 +378,39 @@ class MockReactAgent:
     def _tool_call_id(stub: ToolStub) -> str:
         """Deterministic-per-instance tool call id matching call and return."""
         return f"mock-{stub.name}-{id(stub)}"
+
+    # --- model roster: both readers answer, the switch refuses ---------------
+
+    def active_model(self) -> ModelConfig:
+        """The mock's configured model, read off ``config`` (drop-in parity)."""
+        return self._config.model_cfg  # type: ignore[no-any-return]
+
+    def model_roster(self) -> list[ModelConfig]:
+        """The declared roster as a fresh list; empty when ``config`` declares none.
+
+        ``getattr`` rather than an attribute read: ``config`` is duck-typed here, and a
+        load-test caller's config need not carry a roster field at all.
+        """
+        return list(getattr(self._config, "model_roster", []))
+
+    def switch_model(self, key: str) -> ModelConfig:
+        """Always refuses — a mock cannot switch models (drop-in parity).
+
+        Two independent reasons, both structural. The mock smuggles its **scenario path**
+        through ``model_cfg.model`` and loads that scenario once, at construction, so a
+        switch would leave the config naming one scenario while the state machine replays
+        another — silently. And ``_model`` / ``_http_client`` are ``None`` by the
+        zero-token guarantee, so there is no model to build and no client to build it on.
+
+        Raises:
+            ModelSwitchError: Always. The same class ``ReactAgent`` raises, imported
+                rather than redefined, so one ``except`` catches both.
+        """
+        raise ModelSwitchError(
+            f"cannot switch to '{key}': MockReactAgent replays a scenario bound to "
+            "model_cfg.model at construction and builds no model, so switching is "
+            "unavailable under the load-test flag"
+        )
 
     # --- drop-in surface delegating to ContextManager ------------------------
 

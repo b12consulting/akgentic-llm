@@ -35,7 +35,13 @@ from .capabilities import (
     UsageLimitError as UsageLimitError,
 )
 from .compaction import CompactionResult, CompactionStrategy, create_compaction
-from .config import ReactAgentConfig, RunUsageLimits
+from .config import (
+    ModelConfig,
+    ReactAgentConfig,
+    RunUsageLimits,
+    model_roster_key,
+    validate_compaction_bounds,
+)
 from .context import ContextManager
 from .event import (
     ContextObserver,
@@ -52,6 +58,16 @@ from .providers import create_http_client, create_model, get_output_type
 logger = logging.getLogger(__name__)
 
 UserPrompt = str | list[str | BinaryContent]
+
+
+class ModelSwitchError(ValueError):
+    """A model switch was refused; the active model is unchanged.
+
+    The one class every ``ReactAgent.switch_model`` refusal raises — unknown key, no
+    declared roster, or a roster entry that cannot be built. Subclasses ``ValueError``
+    so an existing ``except ValueError`` keeps catching it, and so the compaction-bounds
+    rule can go on raising a plain ``ValueError`` for Pydantic.
+    """
 
 
 def _evict_anyio_run_vars(loop: asyncio.AbstractEventLoop) -> None:
@@ -288,6 +304,131 @@ class ReactAgent:
             capabilities=capability_stack,
         )
 
+    def active_model(self) -> ModelConfig:
+        """The model config in force right now, read at the moment of the call.
+
+        Returns:
+            The live ``config.model_cfg`` — after a switch, the roster entry itself.
+        """
+        return self._config.model_cfg
+
+    def model_roster(self) -> list[ModelConfig]:
+        """The declared roster, as a fresh list the caller may keep or reorder.
+
+        A copy by contract, not as an optimisation: the returned list is routinely handed
+        to a tool that renders or sorts it, and mutating it must not edit the agent's own
+        roster. The entries themselves are shared — they are immutable in practice, and
+        ``switch_model`` installs one of them by identity.
+
+        Returns:
+            A new list of the declared entries in declaration order; empty for a
+            single-model agent, for which switching is unavailable.
+        """
+        return list(self._config.model_roster)
+
+    def _resolve_roster_entry(self, key: str) -> ModelConfig:
+        """Find the roster entry named by ``provider:model``, or refuse.
+
+        Args:
+            key: The roster key to resolve, spelled as ``model_roster_key`` spells it.
+
+        Returns:
+            The roster element itself — never a copy, so the caller can install it by
+            identity.
+
+        Raises:
+            ModelSwitchError: When the agent declares no roster, or no entry carries
+                ``key``. The second message names every available key, because the
+                message is the only diagnosis a tool-driven caller gets.
+        """
+        roster = self._config.model_roster
+        if not roster:
+            raise ModelSwitchError(
+                f"cannot switch to '{key}': this agent declares no model roster, "
+                "so switching is unavailable"
+            )
+        for entry in roster:
+            if model_roster_key(entry) == key:
+                return entry
+        available = ", ".join(model_roster_key(e) for e in roster)
+        raise ModelSwitchError(f"cannot switch to '{key}': available keys: {available}")
+
+    def switch_model(self, key: str) -> ModelConfig:
+        """Make the roster entry named by ``key`` the active model, from the next run on.
+
+        Every fallible step — resolving the key, building the model, re-checking the
+        compaction bounds, building the summarizer — runs BEFORE the first assignment, so
+        a refusal leaves ``_config``, ``_model`` and the summarizer strategy exactly the
+        objects they were. There is deliberately no snapshot and no rollback path: nothing
+        is written until everything has passed.
+
+        The roster entry is installed **wholesale**. ``provider:model`` is the identity;
+        the entry is the definition, so its ``temperature``, ``max_tokens``,
+        ``context_length`` and fallback chain replace the active model's — they are not
+        merged with them. A switch to the already-active key is not short-circuited, so
+        that rule holds with no exception.
+
+        The pydantic-ai ``Agent`` is neither rebuilt nor mutated: the new model reaches it
+        as a per-run argument. Tools, toolsets, registered system prompts, the conversation
+        history, the lifetime usage counters and the HTTP connection pool therefore all
+        survive a switch untouched.
+
+        A switch made from inside a tool takes effect from the **next** run: pydantic-ai
+        binds the model and the output type once per ``run()`` call. The conclusion driven
+        after a run-tier breach is a next run and does see the new model. The
+        auto-compaction gate is the one thing that does move mid-run — it reads
+        ``context_length`` live, by design.
+
+        Args:
+            key: The roster key to activate, as ``model_roster_key`` spells it.
+
+        Returns:
+            The roster entry now active — the same object the roster holds.
+
+        Raises:
+            ModelSwitchError: On an unknown key, on an agent with no roster, or when the
+                entry cannot be built or would leave auto-compaction unreachable. The
+                ONLY class this raises — a provider's own exception class for a missing
+                API key or an unsupported provider is translated, never propagated, so a
+                caller needs one ``except`` and never ``except Exception``. The
+                originating exception is preserved as ``__cause__``.
+        """
+        entry = self._resolve_roster_entry(key)
+        # Broad on purpose, and only around this call: `create_model` reaches third-party
+        # provider constructors, whose failures are NOT a ValueError hierarchy —
+        # pydantic-ai raises `UserError` (a RuntimeError) for a missing OPENAI_API_KEY or
+        # ANTHROPIC_API_KEY, and that is the commonest way a roster entry fails at switch
+        # time rather than at construction. However it says so, it means one thing here:
+        # this entry cannot be built. The caller catches ModelSwitchError and must not
+        # catch Exception, so the translation has to happen here or not at all. Nothing is
+        # swallowed — the text is preserved and the original stays as __cause__.
+        try:
+            model = create_model(entry, self._http_client)
+        except Exception as e:
+            raise ModelSwitchError(f"cannot switch to '{key}': {e}") from e
+
+        # Narrow, because this one is our own code and ValueError is its whole contract.
+        try:
+            validate_compaction_bounds(
+                entry, self._config.compaction_cfg, self._config.run_usage_limits, "switch_model"
+            )
+        except ValueError as e:
+            raise ModelSwitchError(f"cannot switch to '{key}': {e}") from e
+
+        # A dedicated summarizer is the operator's explicit choice of a cheap model; an
+        # escalation must not drag it along. Only the follow-the-active-model case rebuilds.
+        strategy = (
+            create_compaction(self._config.compaction_cfg, entry, self._http_client)
+            if self._config.compaction_cfg.summary_model_cfg is None
+            else None
+        )
+
+        self._config = self._config.model_copy(update={"model_cfg": entry})
+        self._model = model
+        if strategy is not None:
+            self._compactor.strategy = strategy
+        return entry
+
     async def run(
         self, user_prompt: UserPrompt, deps: Any = None, output_type: type[Any] | None = None
     ) -> Any:
@@ -310,10 +451,12 @@ class ReactAgent:
         Args:
             user_prompt: User message to process
             deps: Optional dependency object (must match deps_type)
-            output_type: Optional per-call output type override. When provided,
-                wraps with get_output_type() for provider-aware structured output
-                (NativeOutput for OpenAI/Anthropic, raw type for others).
-                When None, uses result_type set at construction (default: str).
+            output_type: Optional per-call output type override. Wrapped with
+                get_output_type() against the model **active for this run**, so a
+                switched-to provider gets its own strategy (NativeOutput for
+                OpenAI/Azure/Anthropic, the raw type for others). When None, the
+                result_type set at construction is wrapped the same way — through the
+                active model, not through the wrapper the constructor computed.
 
         Returns:
             Agent result output (type matches output_type if given, else result_type)
@@ -370,7 +513,10 @@ class ReactAgent:
                 ``ToolReturnPart`` written by ``HealingCapability`` is already there
                 as the tool result the model reasons from.
             deps: Optional dependency object (must match deps_type).
-            output_type: Optional per-call output type override (see ``run()``).
+            output_type: Optional per-call output type override (see ``run()``). A
+                conclusion is a next run, so it is served the model and the output
+                strategy active when it starts — including one a tool switched to
+                during the run that breached.
 
         Returns:
             Agent result output, exactly as ``run()`` returns it.
@@ -476,13 +622,20 @@ class ReactAgent:
         # and LifetimeBudgetCapability folds it from `wrap_run`'s ctx. Handing in the
         # lifetime accumulator instead would check the per-run cap against lifetime
         # totals — silently, with no error.
+        # `model` and the effective output type are read HERE, at the call, and never
+        # threaded in from `run()`: a tool may call `switch_model` mid-run, so a value
+        # hoisted one frame up is already stale by the time the conclusion runs. The
+        # `Agent`'s constructor arguments stay as unused defaults — it is never rebuilt.
         try:
             result = await self._pydantic_agent.run(
                 user_prompt=user_prompt,
                 deps=deps,
                 usage_limits=pydantic_limits,
                 message_history=self._context.messages,
-                output_type=get_output_type(self._config.model_cfg, output_type),
+                model=self._model,
+                output_type=get_output_type(
+                    self._config.model_cfg, output_type or self._result_type
+                ),
             )
             return result.output
         except UsageLimitExceeded as e:
