@@ -60,7 +60,7 @@ call any LLM without coupling to a specific vendor or framework primitive.
   `FallbackModel` when `ModelConfig.fallback_models` is non-empty; `get_output_type()` wraps
   output types with `NativeOutput` for providers that support structured output, falls back to
   prompt-based extraction for those that don't
-- **HTTP retry** — `create_http_client()` configures `AsyncTenacityTransport` with exponential
+- **HTTP retry** — `create_http_client()` configures `AsyncHTTPX2TenacityTransport` with exponential
   backoff, jitter, and `Retry-After` header support; fast-fails on 4xx (except 429)
 - **Context management** — `ContextManager` tracks message history across multiple `run()` calls,
   folds it into a summary on compaction or drops it outright on clear, and applies a sliding
