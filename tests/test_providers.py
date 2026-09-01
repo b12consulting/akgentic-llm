@@ -292,8 +292,12 @@ class TestCreateHttpClient:
         client = create_http_client()
         assert isinstance(client, httpx2.AsyncClient)
 
-    def test_transport_is_async_tenacity_transport(self) -> None:
-        """Client uses pydantic-ai's AsyncHTTPX2TenacityTransport."""
+    def test_transport_is_httpx2_tenacity_transport(self) -> None:
+        """Client uses pydantic-ai's AsyncHTTPX2TenacityTransport, not the deprecated one.
+
+        The name matters: ``AsyncTenacityTransport`` still exists upstream and still
+        imports cleanly, so the wrong one type-checks here and fails at runtime.
+        """
         client = create_http_client()
         assert isinstance(client._transport, AsyncHTTPX2TenacityTransport)
 
