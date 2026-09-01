@@ -536,7 +536,7 @@ async def test_google_provider_requires_an_api_key(monkeypatch: pytest.MonkeyPat
     The table used to offer ``GOOGLE_APPLICATION_CREDENTIALS``, which reads as
     "an ADC-only deployment works". It does not: the factory raises.
     """
-    import httpx
+    import httpx2
 
     from akgentic.llm.providers import create_model
 
@@ -545,14 +545,14 @@ async def test_google_provider_requires_an_api_key(monkeypatch: pytest.MonkeyPat
     monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", "/tmp/creds.json")
 
     config = ModelConfig(provider="google-gla", model="gemini-2.0-flash")
-    async with httpx.AsyncClient() as client:
+    async with httpx2.AsyncClient() as client:
         with pytest.raises(ValueError, match="GOOGLE_API_KEY or GEMINI_API_KEY"):
             create_model(config, client)
 
 
 async def test_google_provider_accepts_either_key(monkeypatch: pytest.MonkeyPatch) -> None:
     """§Providers — ``GEMINI_API_KEY`` alone satisfies the requirement."""
-    import httpx
+    import httpx2
 
     from akgentic.llm.providers import create_model
 
@@ -560,7 +560,7 @@ async def test_google_provider_accepts_either_key(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setenv("GEMINI_API_KEY", "test-key-not-a-real-credential")
 
     config = ModelConfig(provider="google-gla", model="gemini-2.0-flash")
-    async with httpx.AsyncClient() as client:
+    async with httpx2.AsyncClient() as client:
         assert create_model(config, client) is not None
 
 

@@ -10,7 +10,7 @@ passing vacuously.
 
 Scope: **per-run MCP mode ONLY**. Story 11-2 (persistent ``AsyncExitStack``) was
 deferred -- there is no ``self._stack``/``AsyncExitStack``/"entered once at
-construction" path in ``ReactAgent``; ``aclose()`` is httpx-only and ``run()``
+construction" path in ``ReactAgent``; ``aclose()`` is httpx2-only and ``run()``
 enters/exits MCP toolsets per call. This module references none of that.
 
 Offline & deterministic: no model/provider is ever contacted (``run`` is patched
@@ -47,7 +47,7 @@ _WARMUP_CYCLES = 5
 # 1500 absolutes. Chosen with wide margin from measured separation: the no-leak
 # path closes-and-drops each cycle's agent, so its post-warmup object growth is 0
 # and heap growth is a few KB of sampling noise; the control retains ~25 whole
-# agent graphs (each an event loop + httpx client + pydantic-ai Agent + context),
+# agent graphs (each an event loop + httpx2 client + pydantic-ai Agent + context),
 # growing the live-object census by ~2.4k objects and the traced heap by ~390 KB.
 # 500 objects / 96 KiB sits cleanly between the two so the no-leak path passes
 # with margin and the control clearly trips at least one signal.
@@ -122,7 +122,7 @@ async def _stub_run(self: ReactAgent, *_: Any, **__: Any) -> str:
 # memory_diagnostics.py (and being promoted to akgentic.core.diagnostics).
 # Replicated here (the minimal tracemalloc-heap + gc-object-count subset, with a
 # gc.collect() before each sample) rather than imported because akgentic-llm
-# depends only on pydantic-ai/httpx/tenacity and MUST NOT import a sibling
+# depends only on pydantic-ai/httpx2/tenacity and MUST NOT import a sibling
 # deployment/core package (module boundary, NFR4 / NFR1). This comment is a
 # navigation aid only -- no test asserts on it (Golden Rule #8).
 
