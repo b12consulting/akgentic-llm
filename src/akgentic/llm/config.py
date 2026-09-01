@@ -112,9 +112,16 @@ class ModelConfig(BaseModel):
         ... )
     """
 
-    provider: Literal["openai", "openai-chat", "azure", "azure-chat", "nvidia", "google-gla", "mistral", "anthropic"] = Field(
-        default="openai", description="Model provider"
-    )
+    provider: Literal[
+        "openai",
+        "openai-chat",
+        "azure",
+        "azure-chat",
+        "nvidia",
+        "google-gla",
+        "mistral",
+        "anthropic",
+    ] = Field(default="openai", description="Model provider")
 
     model: str = Field(
         default="gpt-5.2",

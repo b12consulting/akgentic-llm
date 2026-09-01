@@ -47,8 +47,12 @@ from .config import ModelConfig, _supports_native_output
 if TYPE_CHECKING:
     from pydantic_ai.models.anthropic import AnthropicModel
     from pydantic_ai.models.mistral import MistralModel
-    from pydantic_ai.models.openai import OpenAIChatModel, OpenAIChatModelSettings, OpenAIResponsesModelSettings, \
-    OpenAIResponsesModel
+    from pydantic_ai.models.openai import (
+        OpenAIChatModel,
+        OpenAIChatModelSettings,
+        OpenAIResponsesModel,
+        OpenAIResponsesModelSettings,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -293,7 +297,7 @@ def _build_openai_settings(config: ModelConfig) -> "OpenAIResponsesModelSettings
     Returns:
         OpenAIResponsesModelSettings instance if any parameters are set, else None.
     """
-    from pydantic_ai.models.openai import OpenAIResponsesModelSettings   # noqa: PLC0415
+    from pydantic_ai.models.openai import OpenAIResponsesModelSettings  # noqa: PLC0415
 
     kwargs: dict[str, Any] = dict(cast(dict[str, Any], _build_core_settings(config) or {}))
     if config.reasoning_effort is not None:
@@ -313,8 +317,7 @@ def _build_openai_chat_settings(config: ModelConfig) -> "OpenAIChatModelSettings
     Returns:
         OpenAIChatModelSettings instance if any parameters are set, else None.
     """
-    from pydantic_ai.models.openai import OpenAIChatModelSettings   # noqa: PLC0415
-
+    from pydantic_ai.models.openai import OpenAIChatModelSettings  # noqa: PLC0415
     kwargs: dict[str, Any] = dict(cast(dict[str, Any], _build_core_settings(config) or {}))
     if config.reasoning_effort is not None:
         kwargs["openai_reasoning_effort"] = config.reasoning_effort
