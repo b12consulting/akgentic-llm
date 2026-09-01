@@ -20,26 +20,33 @@ authors = [
 keywords = ["llm", "agents", "ai", "pydantic-ai", "react"]
 
 dependencies = [
-    # Ceilings pinned to a reproduced upstream break, NOT precautionary caps. The LLM SDK ecosystem
-    # is migrating from encode's httpx to httpx2 (github.com/pydantic/httpx2), and a client of the
-    # wrong stack is rejected at RUNTIME, not just by a type checker:
-    #   TypeError: Invalid `http_client` argument; Expected an instance of `httpx2.AsyncClient`
-    # Boundaries verified against PyPI: pydantic-ai 2.32.0, anthropic 1.0.0, openai 3.0.
-    # anthropic and openai must be bounded HERE even though they arrive transitively, because
-    # pydantic-ai declares them without ceilings (anthropic>=0.108.0), so capping pydantic-ai alone
-    # still resolves the migrated majors.
-    # mistralai and google-genai have NOT migrated yet; they will need the same treatment when they
-    # do. See decisions/adr-020 — this is a holding action, not a resting state.
-    "pydantic-ai[mistral]>=2,<2.32",
-    "anthropic<1",
-    "openai<3",
+    # The LLM tier runs on httpx2 (github.com/pydantic/httpx2). create_http_client() builds an
+    # httpx2.AsyncClient on pydantic-ai's AsyncHTTPX2TenacityTransport, and that single client is
+    # handed to all six provider builders. A client of the wrong stack is rejected at RUNTIME by
+    # the migrated SDKs, not merely by a type checker, so the two stacks must not be mixed here.
+    # The web/catalog tier (akgentic-catalog, -infra, -enterprise, -department, and akgentic-tool's
+    # MCP OAuth handler) stays on encode's httpx by decision — that is not a leftover.
+    # google-genai and mistralai are still on encode's httpx internally and accept an httpx2 client
+    # through duck typing, which is why pydantic-ai's AsyncHTTPClient union covers both.
+    # See decisions/adr-020. No ceiling on pydantic-ai, anthropic or openai: the ceilings that once
+    # blocked the migrated majors were removed with the migration itself. The floor is 2.32 because
+    # AsyncHTTPX2TenacityTransport first exists there — below it, providers.py cannot import.
+    # This is pydantic-ai-SLIM, not the pydantic-ai metapackage, with exactly the extras this
+    # package imports. The metapackage is a convenience bundle for application authors: it adds
+    # cli, evals, logfire and web on top of slim, so a library that depends on it drags a CLI, an
+    # eval harness and a web framework into every consumer's dependency cone — and web is what
+    # pulled starlette in. The extras below are derived from the lazy provider imports in
+    # providers.py; openai covers OpenAI, Azure AND NVIDIA, since all three ride the OpenAI SDK,
+    # and retries is what makes pydantic_ai.retries importable (that is not the tenacity line
+    # below, which is a direct import of ours).
+    "pydantic-ai-slim[anthropic,google,mistral,openai,retries]>=2.32,<3",
     # NEVER cap this: genai-prices ships the price table itself, so an upper bound
     # freezes prices and the framework reports stale costs. The floor is the v2
     # pricing-data line; a ceiling here also transitively caps pydantic-ai, since
     # pydantic-ai-slim>=2.22.0 requires genai-prices>=0.1.0.
     "genai-prices>=0.1.0",
     "pydantic>=2.0.0",
-    "httpx>=0.27.0",
+    "httpx2>=2.7",
     "tenacity>=8.0.0",
     "pyyaml>=6.0",
 ]

@@ -2,13 +2,13 @@
 
 from unittest.mock import MagicMock, patch
 
-import httpx
+import httpx2
 import pytest
 from pydantic import BaseModel
 from pydantic_ai import NativeOutput
 from pydantic_ai.models import Model
 from pydantic_ai.models.fallback import FallbackModel
-from pydantic_ai.retries import AsyncTenacityTransport
+from pydantic_ai.retries import AsyncHTTPX2TenacityTransport
 
 from akgentic.llm import config as config_module
 from akgentic.llm import providers
@@ -29,12 +29,12 @@ from akgentic.llm.providers import (
 
 def _make_status_error(
     status_code: int, headers: dict[str, str] | None = None
-) -> httpx.HTTPStatusError:
-    """Build an httpx.HTTPStatusError for a given status code."""
+) -> httpx2.HTTPStatusError:
+    """Build an httpx2.HTTPStatusError for a given status code."""
     headers = headers or {}
-    request = httpx.Request("GET", "https://api.example.com/test")
-    response = httpx.Response(status_code=status_code, headers=headers, request=request)
-    return httpx.HTTPStatusError(f"HTTP {status_code}", request=request, response=response)
+    request = httpx2.Request("GET", "https://api.example.com/test")
+    response = httpx2.Response(status_code=status_code, headers=headers, request=request)
+    return httpx2.HTTPStatusError(f"HTTP {status_code}", request=request, response=response)
 
 
 class _TestModel(BaseModel):
@@ -264,19 +264,19 @@ class TestIsRetryableHttpError:
         assert _is_retryable_http_error(ValueError("boom")) is False
 
     def test_connect_error_is_retryable(self) -> None:
-        assert _is_retryable_http_error(httpx.ConnectError("refused")) is True
+        assert _is_retryable_http_error(httpx2.ConnectError("refused")) is True
 
     def test_remote_protocol_error_is_retryable(self) -> None:
-        assert _is_retryable_http_error(httpx.RemoteProtocolError("peer closed")) is True
+        assert _is_retryable_http_error(httpx2.RemoteProtocolError("peer closed")) is True
 
     def test_read_error_is_retryable(self) -> None:
-        assert _is_retryable_http_error(httpx.ReadError("read failed")) is True
+        assert _is_retryable_http_error(httpx2.ReadError("read failed")) is True
 
     def test_write_error_is_retryable(self) -> None:
-        assert _is_retryable_http_error(httpx.WriteError("write failed")) is True
+        assert _is_retryable_http_error(httpx2.WriteError("write failed")) is True
 
     def test_timeout_not_retryable(self) -> None:
-        assert _is_retryable_http_error(httpx.TimeoutException("timeout")) is False
+        assert _is_retryable_http_error(httpx2.TimeoutException("timeout")) is False
 
 
 # ---------------------------------------------------------------------------
@@ -288,14 +288,18 @@ class TestCreateHttpClient:
     """Tests for create_http_client factory function."""
 
     def test_returns_async_client(self) -> None:
-        """create_http_client returns an httpx.AsyncClient."""
+        """create_http_client returns an httpx2.AsyncClient."""
         client = create_http_client()
-        assert isinstance(client, httpx.AsyncClient)
+        assert isinstance(client, httpx2.AsyncClient)
 
-    def test_transport_is_async_tenacity_transport(self) -> None:
-        """Client uses pydantic-ai's AsyncTenacityTransport."""
+    def test_transport_is_httpx2_tenacity_transport(self) -> None:
+        """Client uses pydantic-ai's AsyncHTTPX2TenacityTransport, not the deprecated one.
+
+        The name matters: ``AsyncTenacityTransport`` still exists upstream and still
+        imports cleanly, so the wrong one type-checks here and fails at runtime.
+        """
         client = create_http_client()
-        assert isinstance(client._transport, AsyncTenacityTransport)
+        assert isinstance(client._transport, AsyncHTTPX2TenacityTransport)
 
     def test_custom_timeout(self) -> None:
         """Client timeout reflects timeout_s parameter."""
@@ -311,27 +315,27 @@ class TestCreateHttpClient:
     async def test_client_usable_as_context_manager(self) -> None:
         """Client works as an async context manager."""
         async with create_http_client() as client:
-            assert isinstance(client, httpx.AsyncClient)
+            assert isinstance(client, httpx2.AsyncClient)
 
     @pytest.mark.asyncio
     async def test_retry_on_429_then_success(self) -> None:
         """Client retries on 429, succeeds on third attempt."""
-        request = httpx.Request("GET", "https://api.example.com/test")
+        request = httpx2.Request("GET", "https://api.example.com/test")
         responses = [
-            httpx.Response(429, request=request),
-            httpx.Response(429, request=request),
-            httpx.Response(200, request=request),
+            httpx2.Response(429, request=request),
+            httpx2.Response(429, request=request),
+            httpx2.Response(200, request=request),
         ]
         call_count = 0
 
-        async def fake_handle(req: httpx.Request) -> httpx.Response:
+        async def fake_handle(req: httpx2.Request) -> httpx2.Response:
             nonlocal call_count
             resp = responses[call_count]
             call_count += 1
             return resp
 
         client = create_http_client(max_attempts=5, exp_multiplier=0.01, exp_max_s=0.05)
-        assert isinstance(client._transport, AsyncTenacityTransport)
+        assert isinstance(client._transport, AsyncHTTPX2TenacityTransport)
         with patch.object(
             client._transport.wrapped, "handle_async_request", side_effect=fake_handle
         ):
@@ -343,21 +347,21 @@ class TestCreateHttpClient:
     @pytest.mark.asyncio
     async def test_retry_on_500_then_success(self) -> None:
         """Client retries on 500, succeeds on second attempt."""
-        request = httpx.Request("GET", "https://api.example.com/test")
+        request = httpx2.Request("GET", "https://api.example.com/test")
         responses = [
-            httpx.Response(500, request=request),
-            httpx.Response(200, request=request),
+            httpx2.Response(500, request=request),
+            httpx2.Response(200, request=request),
         ]
         call_count = 0
 
-        async def fake_handle(req: httpx.Request) -> httpx.Response:
+        async def fake_handle(req: httpx2.Request) -> httpx2.Response:
             nonlocal call_count
             resp = responses[call_count]
             call_count += 1
             return resp
 
         client = create_http_client(max_attempts=3, exp_multiplier=0.01, exp_max_s=0.05)
-        assert isinstance(client._transport, AsyncTenacityTransport)
+        assert isinstance(client._transport, AsyncHTTPX2TenacityTransport)
         with patch.object(
             client._transport.wrapped, "handle_async_request", side_effect=fake_handle
         ):
@@ -371,17 +375,17 @@ class TestCreateHttpClient:
         """Client raises after max_attempts exhausted."""
         call_count = 0
 
-        async def always_500(req: httpx.Request) -> httpx.Response:
+        async def always_500(req: httpx2.Request) -> httpx2.Response:
             nonlocal call_count
             call_count += 1
-            return httpx.Response(500, request=req)
+            return httpx2.Response(500, request=req)
 
         client = create_http_client(max_attempts=3, exp_multiplier=0.01, exp_max_s=0.05)
-        assert isinstance(client._transport, AsyncTenacityTransport)
+        assert isinstance(client._transport, AsyncHTTPX2TenacityTransport)
         with patch.object(
             client._transport.wrapped, "handle_async_request", side_effect=always_500
         ):
-            with pytest.raises(httpx.HTTPStatusError):
+            with pytest.raises(httpx2.HTTPStatusError):
                 await client.get("https://api.example.com/test")
 
         assert call_count == 3
@@ -391,17 +395,17 @@ class TestCreateHttpClient:
         """Client raises immediately on 400 (no retry)."""
         call_count = 0
 
-        async def always_400(req: httpx.Request) -> httpx.Response:
+        async def always_400(req: httpx2.Request) -> httpx2.Response:
             nonlocal call_count
             call_count += 1
-            return httpx.Response(400, request=req)
+            return httpx2.Response(400, request=req)
 
         client = create_http_client(max_attempts=5, exp_multiplier=0.01, exp_max_s=0.05)
-        assert isinstance(client._transport, AsyncTenacityTransport)
+        assert isinstance(client._transport, AsyncHTTPX2TenacityTransport)
         with patch.object(
             client._transport.wrapped, "handle_async_request", side_effect=always_400
         ):
-            with pytest.raises(httpx.HTTPStatusError):
+            with pytest.raises(httpx2.HTTPStatusError):
                 await client.get("https://api.example.com/test")
 
         assert call_count == 1
@@ -411,17 +415,17 @@ class TestCreateHttpClient:
         """Client raises immediately on 404 (no retry)."""
         call_count = 0
 
-        async def always_404(req: httpx.Request) -> httpx.Response:
+        async def always_404(req: httpx2.Request) -> httpx2.Response:
             nonlocal call_count
             call_count += 1
-            return httpx.Response(404, request=req)
+            return httpx2.Response(404, request=req)
 
         client = create_http_client(max_attempts=5, exp_multiplier=0.01, exp_max_s=0.05)
-        assert isinstance(client._transport, AsyncTenacityTransport)
+        assert isinstance(client._transport, AsyncHTTPX2TenacityTransport)
         with patch.object(
             client._transport.wrapped, "handle_async_request", side_effect=always_404
         ):
-            with pytest.raises(httpx.HTTPStatusError):
+            with pytest.raises(httpx2.HTTPStatusError):
                 await client.get("https://api.example.com/test")
 
         assert call_count == 1
@@ -431,13 +435,13 @@ class TestCreateHttpClient:
         """Client returns 200 immediately with no retries."""
         call_count = 0
 
-        async def success(req: httpx.Request) -> httpx.Response:
+        async def success(req: httpx2.Request) -> httpx2.Response:
             nonlocal call_count
             call_count += 1
-            return httpx.Response(200, request=req)
+            return httpx2.Response(200, request=req)
 
         client = create_http_client(max_attempts=5)
-        assert isinstance(client._transport, AsyncTenacityTransport)
+        assert isinstance(client._transport, AsyncHTTPX2TenacityTransport)
         with patch.object(client._transport.wrapped, "handle_async_request", side_effect=success):
             response = await client.get("https://api.example.com/test")
 
@@ -461,7 +465,7 @@ class TestCreateModel:
     @patch("pydantic_ai.models.openai.OpenAIChatModel")
     def test_create_openai_model(self, mock_model_cls, mock_provider_cls) -> None:
         """create_model returns an OpenAIChatModel for provider='openai'."""
-        mock_client = MagicMock(spec=httpx.AsyncClient)
+        mock_client = MagicMock(spec=httpx2.AsyncClient)
         config = ModelConfig(provider="openai", model="gpt-4o", temperature=0.7, max_tokens=1000)
 
         result = create_model(config, http_client=mock_client)
@@ -475,7 +479,7 @@ class TestCreateModel:
     @patch("pydantic_ai.models.openai.OpenAIChatModel")
     def test_openai_model_settings_temperature(self, mock_model_cls, mock_provider_cls) -> None:
         """Temperature is passed via OpenAIChatModelSettings for OpenAI."""
-        mock_client = MagicMock(spec=httpx.AsyncClient)
+        mock_client = MagicMock(spec=httpx2.AsyncClient)
         config = ModelConfig(provider="openai", model="gpt-4o", temperature=0.5)
 
         create_model(config, http_client=mock_client)
@@ -488,7 +492,7 @@ class TestCreateModel:
     @patch("pydantic_ai.models.openai.OpenAIChatModel")
     def test_openai_reasoning_effort(self, mock_model_cls, mock_provider_cls) -> None:
         """reasoning_effort maps to openai_reasoning_effort in settings."""
-        mock_client = MagicMock(spec=httpx.AsyncClient)
+        mock_client = MagicMock(spec=httpx2.AsyncClient)
         config = ModelConfig(provider="openai", model="o1", reasoning_effort="high")
 
         create_model(config, http_client=mock_client)
@@ -501,7 +505,7 @@ class TestCreateModel:
     @patch("pydantic_ai.models.openai.OpenAIChatModel")
     def test_openai_seed_passed_in_settings(self, mock_model_cls, mock_provider_cls) -> None:
         """seed is included in OpenAIChatModelSettings when set."""
-        mock_client = MagicMock(spec=httpx.AsyncClient)
+        mock_client = MagicMock(spec=httpx2.AsyncClient)
         config = ModelConfig(provider="openai", model="gpt-4o", seed=42)
 
         create_model(config, http_client=mock_client)
@@ -514,7 +518,7 @@ class TestCreateModel:
     @patch("pydantic_ai.models.openai.OpenAIChatModel")
     def test_openai_http_client_passed_to_provider(self, mock_model_cls, mock_provider_cls) -> None:
         """http_client is passed to OpenAIProvider."""
-        mock_client = MagicMock(spec=httpx.AsyncClient)
+        mock_client = MagicMock(spec=httpx2.AsyncClient)
         config = ModelConfig(provider="openai", model="gpt-4o")
 
         create_model(config, http_client=mock_client)
@@ -530,7 +534,7 @@ class TestCreateModel:
     @patch("pydantic_ai.models.openai.OpenAIChatModel")
     def test_create_azure_model(self, mock_model_cls, mock_provider_cls) -> None:
         """create_model returns an OpenAIChatModel for provider='azure'."""
-        mock_client = MagicMock(spec=httpx.AsyncClient)
+        mock_client = MagicMock(spec=httpx2.AsyncClient)
         config = ModelConfig(provider="azure", model="gpt-4o")
 
         result = create_model(config, http_client=mock_client)
@@ -544,7 +548,7 @@ class TestCreateModel:
     @patch("pydantic_ai.models.openai.OpenAIChatModel")
     def test_azure_uses_endpoint_from_env(self, mock_model_cls, mock_provider_cls) -> None:
         """Azure provider uses AZURE_OPENAI_ENDPOINT environment variable."""
-        mock_client = MagicMock(spec=httpx.AsyncClient)
+        mock_client = MagicMock(spec=httpx2.AsyncClient)
         config = ModelConfig(provider="azure", model="gpt-4o")
 
         create_model(config, http_client=mock_client)
@@ -560,7 +564,7 @@ class TestCreateModel:
         import os
 
         os.environ.pop("AZURE_OPENAI_ENDPOINT", None)
-        mock_client = MagicMock(spec=httpx.AsyncClient)
+        mock_client = MagicMock(spec=httpx2.AsyncClient)
         config = ModelConfig(provider="azure", model="gpt-4o")
 
         with pytest.raises(ValueError, match="AZURE_OPENAI_ENDPOINT"):
@@ -574,7 +578,7 @@ class TestCreateModel:
     @patch("pydantic_ai.models.anthropic.AnthropicModel")
     def test_create_anthropic_model(self, mock_model_cls, mock_provider_cls) -> None:
         """create_model returns an AnthropicModel for provider='anthropic'."""
-        mock_client = MagicMock(spec=httpx.AsyncClient)
+        mock_client = MagicMock(spec=httpx2.AsyncClient)
         config = ModelConfig(
             provider="anthropic",
             model="claude-3-5-sonnet-20241022",
@@ -593,7 +597,7 @@ class TestCreateModel:
         self, mock_model_cls, mock_provider_cls
     ) -> None:
         """http_client is passed to AnthropicProvider."""
-        mock_client = MagicMock(spec=httpx.AsyncClient)
+        mock_client = MagicMock(spec=httpx2.AsyncClient)
         config = ModelConfig(provider="anthropic", model="claude-3-5-sonnet-20241022")
 
         create_model(config, http_client=mock_client)
@@ -621,7 +625,7 @@ class TestCreateModel:
                 "pydantic_ai.providers.google": mock_providers_google,
             },
         ):
-            mock_client = MagicMock(spec=httpx.AsyncClient)
+            mock_client = MagicMock(spec=httpx2.AsyncClient)
             config = ModelConfig(provider="google-gla", model="gemini-2.0-flash")
 
             result = create_model(config, http_client=mock_client)
@@ -647,7 +651,7 @@ class TestCreateModel:
                 "pydantic_ai.providers.google": mock_providers_google,
             },
         ):
-            mock_client = MagicMock(spec=httpx.AsyncClient)
+            mock_client = MagicMock(spec=httpx2.AsyncClient)
             config = ModelConfig(provider="google-gla", model="gemini-2.0-flash")
 
             create_model(config, http_client=mock_client)
@@ -660,7 +664,7 @@ class TestCreateModel:
         """create_model raises ValueError when neither Google env var is set."""
         monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
         monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-        mock_client = MagicMock(spec=httpx.AsyncClient)
+        mock_client = MagicMock(spec=httpx2.AsyncClient)
         config = ModelConfig(provider="google-gla", model="gemini-2.0-flash")
 
         with pytest.raises(ValueError, match="GOOGLE_API_KEY"):
@@ -674,7 +678,7 @@ class TestCreateModel:
     @patch("pydantic_ai.models.mistral.MistralModel")
     def test_create_mistral_model(self, mock_model_cls, mock_provider_cls) -> None:
         """create_model returns a MistralModel for provider='mistral'."""
-        mock_client = MagicMock(spec=httpx.AsyncClient)
+        mock_client = MagicMock(spec=httpx2.AsyncClient)
         config = ModelConfig(provider="mistral", model="mistral-large-latest")
 
         result = create_model(config, http_client=mock_client)
@@ -689,7 +693,7 @@ class TestCreateModel:
         self, mock_model_cls, mock_provider_cls
     ) -> None:
         """http_client is passed to MistralProvider."""
-        mock_client = MagicMock(spec=httpx.AsyncClient)
+        mock_client = MagicMock(spec=httpx2.AsyncClient)
         config = ModelConfig(provider="mistral", model="mistral-large-latest")
 
         create_model(config, http_client=mock_client)
@@ -704,7 +708,7 @@ class TestCreateModel:
     @patch("pydantic_ai.models.openai.OpenAIChatModel")
     def test_create_nvidia_model(self, mock_model_cls, mock_provider_cls) -> None:
         """create_model returns an OpenAIChatModel for provider='nvidia'."""
-        mock_client = MagicMock(spec=httpx.AsyncClient)
+        mock_client = MagicMock(spec=httpx2.AsyncClient)
         config = ModelConfig(provider="nvidia", model="meta/llama-3.1-70b-instruct")
 
         result = create_model(config, http_client=mock_client)
@@ -718,7 +722,7 @@ class TestCreateModel:
     @patch("pydantic_ai.models.openai.OpenAIChatModel")
     def test_nvidia_uses_base_url_from_env(self, mock_model_cls, mock_provider_cls) -> None:
         """NVIDIA provider uses NVIDIA_BASE_URL environment variable."""
-        mock_client = MagicMock(spec=httpx.AsyncClient)
+        mock_client = MagicMock(spec=httpx2.AsyncClient)
         config = ModelConfig(provider="nvidia", model="meta/llama-3.1-70b-instruct")
 
         create_model(config, http_client=mock_client)
@@ -736,7 +740,7 @@ class TestCreateModel:
         import os
 
         os.environ.pop("NVIDIA_BASE_URL", None)
-        mock_client = MagicMock(spec=httpx.AsyncClient)
+        mock_client = MagicMock(spec=httpx2.AsyncClient)
         config = ModelConfig(provider="nvidia", model="meta/llama-3.1-70b-instruct")
 
         create_model(config, http_client=mock_client)
@@ -750,7 +754,7 @@ class TestCreateModel:
 
     def test_unknown_provider_raises_value_error(self) -> None:
         """Unknown provider raises ValueError with helpful message."""
-        mock_client = MagicMock(spec=httpx.AsyncClient)
+        mock_client = MagicMock(spec=httpx2.AsyncClient)
         # ModelConfig validates provider via Literal; bypass with object
         config = ModelConfig(provider="openai", model="gpt-4o")
         object.__setattr__(config, "provider", "unknown-provider")
@@ -772,7 +776,7 @@ class TestCreateModel:
         self, mock_model_cls, mock_provider_cls, mock_create_client
     ) -> None:
         """create_http_client() is called when http_client=None and passed to provider."""
-        mock_create_client.return_value = MagicMock(spec=httpx.AsyncClient)
+        mock_create_client.return_value = MagicMock(spec=httpx2.AsyncClient)
         config = ModelConfig(provider="openai", model="gpt-4o")
 
         create_model(config)  # no http_client argument
@@ -784,7 +788,7 @@ class TestCreateModel:
     @patch("pydantic_ai.models.openai.OpenAIChatModel")
     def test_provided_http_client_not_replaced(self, mock_model_cls, mock_provider_cls) -> None:
         """Provided http_client is passed through without creating a new one."""
-        mock_client = MagicMock(spec=httpx.AsyncClient)
+        mock_client = MagicMock(spec=httpx2.AsyncClient)
         config = ModelConfig(provider="openai", model="gpt-4o")
 
         with patch("akgentic.llm.providers.create_http_client") as mock_create_client:
@@ -803,7 +807,7 @@ class TestCreateModel:
         self, mock_model_cls, mock_provider_cls
     ) -> None:
         """When temperature/max_tokens/seed are all None, settings=None is passed."""
-        mock_client = MagicMock(spec=httpx.AsyncClient)
+        mock_client = MagicMock(spec=httpx2.AsyncClient)
         config = ModelConfig(provider="openai", model="gpt-4o")
         # Defaults are all None for optional params
 
@@ -816,7 +820,7 @@ class TestCreateModel:
     @patch("pydantic_ai.models.anthropic.AnthropicModel")
     def test_max_tokens_passed_in_settings(self, mock_model_cls, mock_provider_cls) -> None:
         """max_tokens is included in ModelSettings when set."""
-        mock_client = MagicMock(spec=httpx.AsyncClient)
+        mock_client = MagicMock(spec=httpx2.AsyncClient)
         config = ModelConfig(
             provider="anthropic", model="claude-3-5-sonnet-20241022", max_tokens=512
         )
@@ -831,7 +835,7 @@ class TestCreateModel:
     @patch("pydantic_ai.models.mistral.MistralModel")
     def test_seed_passed_in_settings(self, mock_model_cls, mock_provider_cls) -> None:
         """seed is included in ModelSettings when set."""
-        mock_client = MagicMock(spec=httpx.AsyncClient)
+        mock_client = MagicMock(spec=httpx2.AsyncClient)
         config = ModelConfig(provider="mistral", model="mistral-large-latest", seed=42)
 
         create_model(config, http_client=mock_client)
@@ -884,7 +888,7 @@ class TestCreateModelFallbackChain:
     @patch("pydantic_ai.models.openai.OpenAIChatModel")
     def test_empty_chain_returns_primary_unwrapped(self, mock_model_cls, mock_provider_cls) -> None:
         """The default empty chain returns the primary model itself, not a FallbackModel."""
-        mock_client = MagicMock(spec=httpx.AsyncClient)
+        mock_client = MagicMock(spec=httpx2.AsyncClient)
         config = ModelConfig(provider="openai", model="acme-primary")
 
         result = create_model(config, http_client=mock_client)
@@ -909,7 +913,7 @@ class TestCreateModelFallbackChain:
         """A non-empty chain returns a FallbackModel wrapping primary + every entry."""
         mock_openai_cls.side_effect = lambda **kwargs: _named_model(**kwargs)
         mock_anthropic_cls.side_effect = lambda **kwargs: _named_model(**kwargs)
-        mock_client = MagicMock(spec=httpx.AsyncClient)
+        mock_client = MagicMock(spec=httpx2.AsyncClient)
 
         result = create_model(self._acme_chain(), http_client=mock_client)
 
@@ -937,7 +941,7 @@ class TestCreateModelFallbackChain:
         """
         mock_openai_cls.side_effect = lambda **kwargs: _named_model(**kwargs)
         mock_anthropic_cls.side_effect = lambda **kwargs: _named_model(**kwargs)
-        mock_client = MagicMock(spec=httpx.AsyncClient)
+        mock_client = MagicMock(spec=httpx2.AsyncClient)
 
         result = create_model(self._acme_chain(), http_client=mock_client)
 
@@ -962,7 +966,7 @@ class TestCreateModelFallbackChain:
         """A one-entry chain still wraps, primary first."""
         mock_openai_cls.side_effect = lambda **kwargs: _named_model(**kwargs)
         mock_anthropic_cls.side_effect = lambda **kwargs: _named_model(**kwargs)
-        mock_client = MagicMock(spec=httpx.AsyncClient)
+        mock_client = MagicMock(spec=httpx2.AsyncClient)
         config = ModelConfig(
             provider="openai",
             model="acme-primary",
@@ -991,7 +995,7 @@ class TestCreateModelFallbackChain:
         """The caller's http_client reaches the primary's provider and the fallback's."""
         mock_openai_cls.side_effect = lambda **kwargs: _named_model(**kwargs)
         mock_anthropic_cls.side_effect = lambda **kwargs: _named_model(**kwargs)
-        mock_client = MagicMock(spec=httpx.AsyncClient)
+        mock_client = MagicMock(spec=httpx2.AsyncClient)
         config = ModelConfig(
             provider="openai",
             model="acme-primary",
@@ -1025,7 +1029,7 @@ class TestCreateModelFallbackChain:
         """
         mock_openai_cls.side_effect = lambda **kwargs: _named_model(**kwargs)
         mock_anthropic_cls.side_effect = lambda **kwargs: _named_model(**kwargs)
-        mock_client = MagicMock(spec=httpx.AsyncClient)
+        mock_client = MagicMock(spec=httpx2.AsyncClient)
 
         create_model(self._acme_chain(), http_client=mock_client)
 
@@ -1052,7 +1056,7 @@ class TestCreateModelFallbackChain:
         """With http_client=None, one client is created and reused by every entry."""
         mock_openai_cls.side_effect = lambda **kwargs: _named_model(**kwargs)
         mock_anthropic_cls.side_effect = lambda **kwargs: _named_model(**kwargs)
-        mock_create_client.return_value = MagicMock(spec=httpx.AsyncClient)
+        mock_create_client.return_value = MagicMock(spec=httpx2.AsyncClient)
         config = ModelConfig(
             provider="openai",
             model="acme-primary",
@@ -1072,7 +1076,7 @@ class TestCreateModelFallbackChain:
     ) -> None:
         """An unsupported provider in a fallback entry raises the primary path's ValueError."""
         mock_model_cls.side_effect = lambda **kwargs: _named_model(**kwargs)
-        mock_client = MagicMock(spec=httpx.AsyncClient)
+        mock_client = MagicMock(spec=httpx2.AsyncClient)
         config = ModelConfig(
             provider="openai",
             model="acme-primary",
@@ -1089,7 +1093,7 @@ class TestCreateModelFallbackChain:
 
     def test_unsupported_provider_message_identical_in_both_positions(self) -> None:
         """The fallback path's error is the primary path's error, not a variant of it."""
-        mock_client = MagicMock(spec=httpx.AsyncClient)
+        mock_client = MagicMock(spec=httpx2.AsyncClient)
 
         primary_only = ModelConfig(provider="openai", model="acme-primary")
         object.__setattr__(primary_only, "provider", "unknown-provider")

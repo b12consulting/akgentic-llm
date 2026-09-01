@@ -1951,7 +1951,7 @@ class TestReactAgentConcludeWithoutTools:
     def test_sync_bridge_runs_on_the_agents_own_loop(self, minimal_config):
         """One loop strategy, not two (AC #14).
 
-        ``asyncio.run()`` or a fresh loop per call would detach the pooled httpx
+        ``asyncio.run()`` or a fresh loop per call would detach the pooled httpx2
         connections from the loop that owns them, so ``aclose()`` raises on stop
         and the pool leaks. Two calls, so a per-call loop shows up as two distinct
         loops rather than one.
@@ -3023,7 +3023,7 @@ class TestReactAgentResolvesCompaction:
         assert "_compaction" not in type(agent._config).model_fields
 
     def test_summarizer_reuses_shared_http_client(self, minimal_config):
-        """The default 'summarize' strategy reuses the agent's shared httpx client (no 2nd pool)."""
+        """The default 'summarize' strategy reuses the agent's shared httpx2 client (one pool)."""
         agent = ReactAgent(config=minimal_config)
         assert isinstance(agent._compaction, SummarizingCompaction)
         assert agent._compaction._http_client is agent._http_client
@@ -3818,7 +3818,7 @@ class TestReactAgentSwitchModelCouplings:
         assert await agent.run("still one agent") == OPENAI_KEY
 
     def test_every_switch_reuses_the_one_connection_pool(self, model_factory):
-        """NFR1: one httpx client for the agent's life, handed to every model built."""
+        """NFR1: one httpx2 client for the agent's life, handed to every model built."""
         agent = ReactAgent(config=_two_model_config())
         client = agent._http_client
 

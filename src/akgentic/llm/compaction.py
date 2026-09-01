@@ -5,7 +5,7 @@ a public mutable ``COMPACTION_STRATEGIES`` registry with a ``create_compaction``
 resolver (registry id, else a dotted FQCN via stdlib ``importlib``), and three
 built-in strategies. ``SummarizingCompaction`` implements an LLM history-summarization
 algorithm: the summarizer is ``await``-ed (never ``run_sync``) and reuses the agent's
-shared httpx client.
+shared ``httpx2`` client.
 
 Imports no akgentic sibling package — the FQCN escape hatch uses stdlib ``importlib``.
 """
@@ -17,7 +17,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Protocol, TypeGuard, runtime_checkable
 
-from httpx import AsyncClient
+from httpx2 import AsyncClient
 from pydantic_ai import Agent
 from pydantic_ai.messages import (
     ModelMessage,
@@ -406,7 +406,7 @@ class SummarizingCompaction:
     """Summarize the middle via an awaited LLM.
 
     Falls back to a count-based truncation marker (never raises) when the summarizer
-    errors. Built from ``model_cfg`` on the agent's shared httpx client; the summarizer
+    errors. Built from ``model_cfg`` on the agent's shared ``httpx2`` client; the summarizer
     is constructed lazily so construction needs no provider env (registry resolution).
     """
 

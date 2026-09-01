@@ -60,7 +60,7 @@ call any LLM without coupling to a specific vendor or framework primitive.
   `FallbackModel` when `ModelConfig.fallback_models` is non-empty; `get_output_type()` wraps
   output types with `NativeOutput` for providers that support structured output, falls back to
   prompt-based extraction for those that don't
-- **HTTP retry** — `create_http_client()` configures `AsyncTenacityTransport` with exponential
+- **HTTP retry** — `create_http_client()` configures `AsyncHTTPX2TenacityTransport` with exponential
   backoff, jitter, and `Retry-After` header support; fast-fails on 4xx (except 429)
 - **Context management** — `ContextManager` tracks message history across multiple `run()` calls,
   folds it into a summary on compaction or drops it outright on clear, and applies a sliding
@@ -103,9 +103,9 @@ ReactAgent
   └── system_prompt(func)                   # register dynamic system prompt
 ```
 
-**Runtime dependencies:** `pydantic-ai[mistral]>=2,<3`, `genai-prices>=0.1.0`, `pydantic>=2.0.0`,
-`httpx>=0.27.0`, `tenacity>=8.0.0`, `pyyaml>=6.0`. An optional `loadtest` extra pulls in the
-token-free mock agent's own `pyyaml` requirement.
+**Runtime dependencies:** `pydantic-ai-slim[anthropic,google,mistral,openai,retries]>=2.32,<3`,
+`genai-prices>=0.1.0`, `pydantic>=2.0.0`, `httpx2>=2.7`, `tenacity>=8.0.0`, `pyyaml>=6.0`. An
+optional `loadtest` extra pulls in the token-free mock agent's own `pyyaml` requirement.
 
 **Module boundary:** `akgentic-llm` MUST NOT import from `akgentic-core`, `akgentic-tool`, or
 `akgentic-agent`.
@@ -120,7 +120,7 @@ uv add akgentic-llm
 pip install akgentic-llm
 ```
 
-That is the whole install. `pydantic-ai`, `genai-prices`, `httpx`, `tenacity`
+That is the whole install. `pydantic-ai-slim`, `genai-prices`, `httpx2`, `tenacity`
 and `pyyaml` come with it as ordinary dependencies — no workspace checkout, no
 submodules.
 
@@ -850,7 +850,7 @@ class ReactAgent:
     def tool(self, func: F) -> F: ...            # wraps @agent.tool()
 
     # Teardown
-    async def aclose(self) -> None: ...  # release the httpx pool; leaves the loop open
+    async def aclose(self) -> None: ...  # release the httpx2 pool; leaves the loop open
     def close(self) -> None: ...         # full synchronous teardown; idempotent
 
     # Advanced

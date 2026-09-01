@@ -3,12 +3,12 @@
 Covers Story 11-1 (Epic 11, ADR-009): ``ReactAgent`` creates and owns its own
 asyncio loop in ``__init__``, ``run_sync`` always runs on that loop (no
 ``asyncio.run()`` fallback) and raises once the agent is closed, ``aclose()``
-stays async and resource-only (httpx, double-close guarded), and the new
+stays async and resource-only (httpx2, double-close guarded), and the new
 synchronous idempotent ``close()`` drives ``aclose()`` then drains and closes
 the loop.
 
 Also retains Story 10-1 (Epic 10, ADR-008) coverage of the instance-held
-``httpx.AsyncClient`` handle and ``aclose()`` releasing that pool.
+``httpx2.AsyncClient`` handle and ``aclose()`` releasing that pool.
 
 All tests are zero-egress: ``aclose()`` / ``close()`` are exercised on the real
 client the agent builds (no request is ever sent), and the ``run_sync``
@@ -21,7 +21,7 @@ import warnings
 from typing import Any
 from unittest.mock import patch
 
-import httpx
+import httpx2
 import pytest
 from akgentic.llm import ModelConfig, ReactAgent, ReactAgentConfig
 
@@ -38,9 +38,9 @@ def minimal_config() -> ReactAgentConfig:
 
 
 def test_http_client_held_on_instance(minimal_config: ReactAgentConfig) -> None:
-    """The agent exposes the ``httpx.AsyncClient`` it built as ``_http_client``."""
+    """The agent exposes the ``httpx2.AsyncClient`` it built as ``_http_client``."""
     agent = ReactAgent(config=minimal_config)
-    assert isinstance(agent._http_client, httpx.AsyncClient)
+    assert isinstance(agent._http_client, httpx2.AsyncClient)
     assert not agent._http_client.is_closed
 
 
@@ -51,7 +51,7 @@ def test_model_uses_the_held_client(minimal_config: ReactAgentConfig) -> None:
     captured: dict[str, Any] = {}
     real_create_model = agent_mod.create_model
 
-    def spy_create_model(model_cfg: Any, http_client: httpx.AsyncClient) -> Any:
+    def spy_create_model(model_cfg: Any, http_client: httpx2.AsyncClient) -> Any:
         captured["http_client"] = http_client
         return real_create_model(model_cfg, http_client)
 
@@ -179,7 +179,7 @@ def test_run_sync_after_close_raises(minimal_config: ReactAgentConfig) -> None:
 
 
 def test_close_closes_client_and_loop(minimal_config: ReactAgentConfig) -> None:
-    """``close()`` closes both the httpx client and the owned loop (AC #5, #6)."""
+    """``close()`` closes both the httpx2 client and the owned loop (AC #5, #6)."""
     agent = ReactAgent(config=minimal_config)
     assert not agent._http_client.is_closed
     assert not agent._loop.is_closed()

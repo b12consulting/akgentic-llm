@@ -3,9 +3,12 @@
 This module provides factory functions for creating LLM models and
 HTTP clients with production-ready retry logic.
 
-The HTTP client uses pydantic-ai's ``AsyncTenacityTransport`` with
+The HTTP client uses pydantic-ai's ``AsyncHTTPX2TenacityTransport`` with
 ``wait_retry_after`` to implement exponential backoff with jitter and
 automatic ``Retry-After`` header support for transient failures (429, 5xx).
+The LLM tier runs on ``httpx2``: the migrated provider SDKs reject a client
+of the other stack at runtime, so one ``httpx2.AsyncClient`` serves every
+provider builder below (ADR-020).
 
 Supported LLM Providers:
     - OpenAI (GPT-4, GPT-4o, o1 series)
@@ -31,11 +34,11 @@ import logging
 import os
 from typing import TYPE_CHECKING, Any, cast
 
-import httpx
+import httpx2
 from pydantic_ai import NativeOutput
 from pydantic_ai.models import Model
 from pydantic_ai.models.fallback import FallbackModel
-from pydantic_ai.retries import AsyncTenacityTransport, RetryConfig, wait_retry_after
+from pydantic_ai.retries import AsyncHTTPX2TenacityTransport, RetryConfig, wait_retry_after
 from pydantic_ai.settings import ModelSettings
 from tenacity import retry_if_exception, stop_after_attempt, wait_random_exponential
 
@@ -50,10 +53,10 @@ logger = logging.getLogger(__name__)
 
 
 _RETRYABLE_NETWORK_ERRORS = (
-    httpx.ConnectError,
-    httpx.RemoteProtocolError,
-    httpx.ReadError,
-    httpx.WriteError,
+    httpx2.ConnectError,
+    httpx2.RemoteProtocolError,
+    httpx2.ReadError,
+    httpx2.WriteError,
 )
 
 
@@ -74,7 +77,7 @@ def _is_retryable_http_error(exc: BaseException) -> bool:
     """
     if isinstance(exc, _RETRYABLE_NETWORK_ERRORS):
         return True
-    if not isinstance(exc, httpx.HTTPStatusError):
+    if not isinstance(exc, httpx2.HTTPStatusError):
         return False
     status = exc.response.status_code
     return status == 429 or 500 <= status < 600
@@ -183,10 +186,10 @@ def create_http_client(
     exp_multiplier: float = 0.5,
     exp_max_s: float = 60.0,
     retry_after_cap_s: float = 300.0,
-) -> httpx.AsyncClient:
+) -> httpx2.AsyncClient:
     """Create an async HTTP client with production-ready retry logic for LLM requests.
 
-    Uses pydantic-ai's ``AsyncTenacityTransport`` with ``wait_retry_after`` to
+    Uses pydantic-ai's ``AsyncHTTPX2TenacityTransport`` with ``wait_retry_after`` to
     automatically retry transient failures using randomised exponential backoff
     while respecting ``Retry-After`` response headers.
 
@@ -201,13 +204,13 @@ def create_http_client(
     Timeout Behavior:
         All requests use ``timeout_s`` as a total per-request timeout.
         If the server does not respond within this duration the request
-        raises ``httpx.TimeoutException``.
+        raises ``httpx2.TimeoutException``.
 
     Error Handling:
-        - 429 / 5xx → ``httpx.HTTPStatusError`` raised internally, retried
+        - 429 / 5xx → ``httpx2.HTTPStatusError`` raised internally, retried
           automatically until ``max_attempts`` is exhausted (then re-raised)
-        - 4xx (non-429) → ``httpx.HTTPStatusError`` raised immediately
-        - Timeout → ``httpx.TimeoutException`` raised immediately
+        - 4xx (non-429) → ``httpx2.HTTPStatusError`` raised immediately
+        - Timeout → ``httpx2.TimeoutException`` raised immediately
 
     Args:
         timeout_s: Per-request timeout in seconds. Default: 120.0.
@@ -218,7 +221,7 @@ def create_http_client(
             Values above this cap are clamped. Default: 300.0.
 
     Returns:
-        ``httpx.AsyncClient`` configured with retry transport and timeout.
+        ``httpx2.AsyncClient`` configured with retry transport and timeout.
         Use as an async context manager to ensure proper connection cleanup.
 
     Example:
@@ -233,7 +236,7 @@ def create_http_client(
         The client must be used as an async context manager (``async with``) or
         explicitly closed via ``await client.aclose()`` to release connections.
     """
-    transport = AsyncTenacityTransport(
+    transport = AsyncHTTPX2TenacityTransport(
         config=RetryConfig(
             retry=retry_if_exception(_is_retryable_http_error),
             wait=wait_retry_after(
@@ -249,7 +252,7 @@ def create_http_client(
         validate_response=lambda r: r.raise_for_status(),
     )
 
-    return httpx.AsyncClient(
+    return httpx2.AsyncClient(
         transport=transport,
         timeout=timeout_s,
     )
@@ -299,7 +302,7 @@ def _build_openai_settings(config: ModelConfig) -> "OpenAIChatModelSettings | No
 
 def _create_openai_model(
     config: ModelConfig,
-    http_client: httpx.AsyncClient,
+    http_client: httpx2.AsyncClient,
 ) -> "OpenAIChatModel":
     """Create OpenAI chat model.
 
@@ -322,7 +325,7 @@ def _create_openai_model(
 
 def _create_azure_model(
     config: ModelConfig,
-    http_client: httpx.AsyncClient,
+    http_client: httpx2.AsyncClient,
 ) -> "OpenAIChatModel":
     """Create Azure OpenAI model.
 
@@ -357,7 +360,7 @@ def _create_azure_model(
 
 def _create_anthropic_model(
     config: ModelConfig,
-    http_client: httpx.AsyncClient,
+    http_client: httpx2.AsyncClient,
 ) -> "AnthropicModel":
     """Create Anthropic model.
 
@@ -381,7 +384,7 @@ def _create_anthropic_model(
 
 def _create_google_model(
     config: ModelConfig,
-    http_client: httpx.AsyncClient,
+    http_client: httpx2.AsyncClient,
 ) -> Model:
     """Create Google Gemini model.
 
@@ -421,7 +424,7 @@ def _create_google_model(
 
 def _create_mistral_model(
     config: ModelConfig,
-    http_client: httpx.AsyncClient,
+    http_client: httpx2.AsyncClient,
 ) -> "MistralModel":
     """Create Mistral model.
 
@@ -445,7 +448,7 @@ def _create_mistral_model(
 
 def _create_nvidia_model(
     config: ModelConfig,
-    http_client: httpx.AsyncClient,
+    http_client: httpx2.AsyncClient,
 ) -> "OpenAIChatModel":
     """Create NVIDIA NIM model.
 
@@ -483,7 +486,7 @@ _PROVIDER_FACTORIES = {
 
 def _build_single_model(
     config: ModelConfig,
-    http_client: httpx.AsyncClient,
+    http_client: httpx2.AsyncClient,
 ) -> Model:
     """Build one pydantic-ai model from one configuration.
 
@@ -514,7 +517,7 @@ def _build_single_model(
 
 def create_model(
     config: ModelConfig,
-    http_client: httpx.AsyncClient | None = None,
+    http_client: httpx2.AsyncClient | None = None,
 ) -> Model:
     """Create pydantic-ai model from configuration.
 

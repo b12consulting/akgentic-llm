@@ -195,7 +195,7 @@ class ReactAgent:
                 here.
         """
         # The agent owns its loop: create it and make it current on the
-        # constructing thread BEFORE building the httpx client / model, so the
+        # constructing thread BEFORE building the httpx2 client / model, so the
         # connection pool stays a per-agent resource bound to one stable loop
         # (ADR-008).
         self._loop = asyncio.new_event_loop()
@@ -215,7 +215,7 @@ class ReactAgent:
 
         # Create HTTP client. Held on the instance so its connection pool can be
         # released on stop via aclose(); otherwise the pydantic-ai Model keeps the
-        # httpx.AsyncClient (open sockets/TLS buffers) alive past team teardown.
+        # httpx2.AsyncClient (open sockets/TLS buffers) alive past team teardown.
         self._http_client = create_http_client(
             timeout_s=config.runtime_cfg.http_client_config.timeout,
             max_attempts=config.runtime_cfg.http_client_config.max_retries,
@@ -237,7 +237,7 @@ class ReactAgent:
 
         # Resolve the compaction strategy as runtime state (never a Pydantic
         # field). Built AFTER self._http_client so the summarizer reuses the
-        # agent's shared httpx client (no second pool); the summarizer model uses
+        # agent's shared httpx2 client (no second pool); the summarizer model uses
         # summary_model_cfg when set, else the primary model_cfg.
         summary_cfg = config.compaction_cfg.summary_model_cfg or config.model_cfg
         strategy: CompactionStrategy = create_compaction(
@@ -540,7 +540,7 @@ class ReactAgent:
         Mirrors ``run_sync`` and ``compact``: closed-agent guard, then
         ``run_until_complete`` on the agent's own loop. There is deliberately no
         ``asyncio.run()`` fallback and no second loop — a fresh loop per call would
-        leave pooled httpx connections attached to already-closed loops, making
+        leave pooled httpx2 connections attached to already-closed loops, making
         ``aclose()`` raise on stop and leaking the pool.
 
         Args:
@@ -856,7 +856,7 @@ class ReactAgent:
                 produced nothing usable. A recovered run-tier breach RETURNS the
                 conclusion's answer from here, exactly as it does from run().
         """
-        # Always run on the agent's own loop so the httpx connection pool stays
+        # Always run on the agent's own loop so the httpx2 connection pool stays
         # bound to ONE stable loop across calls. There is no asyncio.run()
         # fallback: a fresh loop per call would leave pooled connections attached
         # to already-closed loops, making aclose() raise on stop and leaking the
@@ -866,7 +866,7 @@ class ReactAgent:
         return self._loop.run_until_complete(self.run(user_prompt, deps, output_type))
 
     async def aclose(self) -> None:
-        """Release async resources (the httpx connection pool); does NOT close the loop.
+        """Release async resources (the httpx2 connection pool); does NOT close the loop.
 
         Resource-only teardown driven by ``close()`` on a still-open loop. The
         pydantic-ai Model (and its provider) hold this client, so without
