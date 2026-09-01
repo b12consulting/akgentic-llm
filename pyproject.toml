@@ -31,7 +31,15 @@ dependencies = [
     # See decisions/adr-020. No ceiling on pydantic-ai, anthropic or openai: the ceilings that once
     # blocked the migrated majors were removed with the migration itself. The floor is 2.32 because
     # AsyncHTTPX2TenacityTransport first exists there — below it, providers.py cannot import.
-    "pydantic-ai[mistral]>=2.32,<3",
+    # This is pydantic-ai-SLIM, not the pydantic-ai metapackage, with exactly the extras this
+    # package imports. The metapackage is a convenience bundle for application authors: it adds
+    # cli, evals, logfire and web on top of slim, so a library that depends on it drags a CLI, an
+    # eval harness and a web framework into every consumer's dependency cone — and web is what
+    # pulled starlette in. The extras below are derived from the lazy provider imports in
+    # providers.py; openai covers OpenAI, Azure AND NVIDIA, since all three ride the OpenAI SDK,
+    # and retries is what makes pydantic_ai.retries importable (that is not the tenacity line
+    # below, which is a direct import of ours).
+    "pydantic-ai-slim[anthropic,google,mistral,openai,retries]>=2.32,<3",
     # NEVER cap this: genai-prices ships the price table itself, so an upper bound
     # freezes prices and the framework reports stale costs. The floor is the v2
     # pricing-data line; a ceiling here also transitively caps pydantic-ai, since
