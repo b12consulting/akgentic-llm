@@ -71,6 +71,14 @@ class ModelConfig(BaseModel):
     Example:
         >>> # OpenAI GPT-4o with moderate creativity
         >>> config = ModelConfig(
+        ...     provider="openai-chat",
+        ...     model="gpt-4o",
+        ...     temperature=0.7,
+        ...     max_tokens=1000
+        ... )
+        >>>
+        >>> # OpenAI GPT-5.6-luna with responses api
+        >>> config = ModelConfig(
         ...     provider="openai",
         ...     model="gpt-4o",
         ...     temperature=0.7,
@@ -95,7 +103,7 @@ class ModelConfig(BaseModel):
         >>> # A fallback chain: gpt-4o first, then Claude, then Azure. All three
         >>> # support native structured output, so the chain is homogeneous.
         >>> config = ModelConfig(
-        ...     provider="openai",
+        ...     provider="openai-chat",
         ...     model="gpt-4o",
         ...     fallback_models=[
         ...         ModelConfig(provider="anthropic", model="claude-sonnet-4-5"),
@@ -104,9 +112,16 @@ class ModelConfig(BaseModel):
         ... )
     """
 
-    provider: Literal["openai", "azure", "nvidia", "google-gla", "mistral", "anthropic"] = Field(
-        default="openai", description="Model provider"
-    )
+    provider: Literal[
+        "openai",
+        "openai-chat",
+        "azure",
+        "azure-chat",
+        "nvidia",
+        "google-gla",
+        "mistral",
+        "anthropic",
+    ] = Field(default="openai", description="Model provider")
 
     model: str = Field(
         default="gpt-5.2",
@@ -187,8 +202,10 @@ def _supports_native_output(config: ModelConfig) -> bool:
     """Check if provider supports native structured output via NativeOutput wrapper.
 
     Providers with native support (via function calling or tool use APIs):
-    - openai: GPT-4o, o1 series, etc.
-    - azure: Azure OpenAI Service
+    - openai: GPT-4o, o1 series, etc. (Responses API)
+    - openai-chat: OpenAI models via the legacy Chat Completions API
+    - azure: Azure OpenAI Service (Responses API)
+    - azure-chat: Azure OpenAI Service via the legacy Chat Completions API
     - anthropic: Claude 3.5 Sonnet, etc.
     - nvidia: Only for models with "openai" prefix (e.g., "openai/gpt-oss-120b")
 
@@ -218,7 +235,7 @@ def _supports_native_output(config: ModelConfig) -> bool:
         >>> _supports_native_output(config)
         True
     """
-    if config.provider in ("openai", "azure", "anthropic"):
+    if config.provider in ("openai", "openai-chat", "azure", "azure-chat", "anthropic"):
         return True
     if config.provider == "nvidia":
         return config.model.startswith("openai")

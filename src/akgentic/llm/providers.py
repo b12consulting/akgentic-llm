@@ -47,7 +47,12 @@ from .config import ModelConfig, _supports_native_output
 if TYPE_CHECKING:
     from pydantic_ai.models.anthropic import AnthropicModel
     from pydantic_ai.models.mistral import MistralModel
-    from pydantic_ai.models.openai import OpenAIChatModel, OpenAIChatModelSettings
+    from pydantic_ai.models.openai import (
+        OpenAIChatModel,
+        OpenAIChatModelSettings,
+        OpenAIResponsesModel,
+        OpenAIResponsesModelSettings,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -280,7 +285,27 @@ def _build_core_settings(config: ModelConfig) -> ModelSettings | None:
     return cast(ModelSettings, kwargs) if kwargs else None
 
 
-def _build_openai_settings(config: ModelConfig) -> "OpenAIChatModelSettings | None":
+def _build_openai_settings(config: ModelConfig) -> "OpenAIResponsesModelSettings | None":
+    """Build OpenAIResponsesModelSettings from ModelConfig, including reasoning_effort.
+
+    Delegates shared parameters (temperature, max_tokens, seed) to
+    ``_build_core_settings`` and extends with OpenAI-specific fields.
+
+    Args:
+        config: LLM model configuration.
+
+    Returns:
+        OpenAIResponsesModelSettings instance if any parameters are set, else None.
+    """
+    from pydantic_ai.models.openai import OpenAIResponsesModelSettings  # noqa: PLC0415
+
+    kwargs: dict[str, Any] = dict(cast(dict[str, Any], _build_core_settings(config) or {}))
+    if config.reasoning_effort is not None:
+        kwargs["openai_reasoning_effort"] = config.reasoning_effort
+    return cast(OpenAIResponsesModelSettings, kwargs) if kwargs else None
+
+
+def _build_openai_chat_settings(config: ModelConfig) -> "OpenAIChatModelSettings | None":
     """Build OpenAIChatModelSettings from ModelConfig, including reasoning_effort.
 
     Delegates shared parameters (temperature, max_tokens, seed) to
@@ -293,7 +318,6 @@ def _build_openai_settings(config: ModelConfig) -> "OpenAIChatModelSettings | No
         OpenAIChatModelSettings instance if any parameters are set, else None.
     """
     from pydantic_ai.models.openai import OpenAIChatModelSettings  # noqa: PLC0415
-
     kwargs: dict[str, Any] = dict(cast(dict[str, Any], _build_core_settings(config) or {}))
     if config.reasoning_effort is not None:
         kwargs["openai_reasoning_effort"] = config.reasoning_effort
@@ -301,6 +325,29 @@ def _build_openai_settings(config: ModelConfig) -> "OpenAIChatModelSettings | No
 
 
 def _create_openai_model(
+    config: ModelConfig,
+    http_client: httpx2.AsyncClient,
+) -> "OpenAIResponsesModel":
+    """Create OpenAI responses model.
+
+    Args:
+        config: LLM model configuration.
+        http_client: Async HTTP client with retry logic.
+
+    Returns:
+        Configured OpenAIResponsesModel instance.
+    """
+    from pydantic_ai.models.openai import OpenAIResponsesModel  # noqa: PLC0415
+    from pydantic_ai.providers.openai import OpenAIProvider  # noqa: PLC0415
+
+    return OpenAIResponsesModel(
+        model_name=config.model,
+        provider=OpenAIProvider(http_client=http_client),
+        settings=_build_openai_settings(config),
+    )
+
+
+def _create_openai_chat_model(
     config: ModelConfig,
     http_client: httpx2.AsyncClient,
 ) -> "OpenAIChatModel":
@@ -319,15 +366,50 @@ def _create_openai_model(
     return OpenAIChatModel(
         model_name=config.model,
         provider=OpenAIProvider(http_client=http_client),
-        settings=_build_openai_settings(config),
+        settings=_build_openai_chat_settings(config),
     )
 
 
 def _create_azure_model(
     config: ModelConfig,
     http_client: httpx2.AsyncClient,
+) -> "OpenAIResponsesModel":
+    """Create Azure OpenAI responses model.
+
+    Uses the Azure OpenAI endpoint from ``AZURE_OPENAI_ENDPOINT`` env var,
+    the API key from ``AZURE_OPENAI_API_KEY``, and the API version from
+    ``OPENAI_API_VERSION``.
+
+    Args:
+        config: LLM model configuration.
+        http_client: Async HTTP client with retry logic.
+
+    Returns:
+        Configured OpenAIResponsesModel instance pointing at Azure endpoint.
+
+    Raises:
+        ValueError: If ``AZURE_OPENAI_ENDPOINT`` environment variable is not set.
+    """
+    from pydantic_ai.models.openai import OpenAIResponsesModel  # noqa: PLC0415
+    from pydantic_ai.providers.azure import AzureProvider  # noqa: PLC0415
+
+    base_url = os.getenv("AZURE_OPENAI_ENDPOINT")
+    if not base_url:
+        raise ValueError(
+            "AZURE_OPENAI_ENDPOINT environment variable is required for Azure provider"
+        )
+    return OpenAIResponsesModel(
+        model_name=config.model,
+        provider=AzureProvider(azure_endpoint=base_url, http_client=http_client),
+        settings=_build_openai_settings(config),
+    )
+
+
+def _create_azure_chat_model(
+    config: ModelConfig,
+    http_client: httpx2.AsyncClient,
 ) -> "OpenAIChatModel":
-    """Create Azure OpenAI model.
+    """Create Azure OpenAI chat model.
 
     Uses the Azure OpenAI endpoint from ``AZURE_OPENAI_ENDPOINT`` env var,
     the API key from ``AZURE_OPENAI_API_KEY``, and the API version from
@@ -354,7 +436,7 @@ def _create_azure_model(
     return OpenAIChatModel(
         model_name=config.model,
         provider=AzureProvider(azure_endpoint=base_url, http_client=http_client),
-        settings=_build_openai_settings(config),
+        settings=_build_openai_chat_settings(config),
     )
 
 
@@ -476,7 +558,9 @@ def _create_nvidia_model(
 
 _PROVIDER_FACTORIES = {
     "openai": _create_openai_model,
+    "openai-chat": _create_openai_chat_model,
     "azure": _create_azure_model,
+    "azure-chat": _create_azure_chat_model,
     "anthropic": _create_anthropic_model,
     "google-gla": _create_google_model,
     "mistral": _create_mistral_model,
@@ -526,8 +610,10 @@ def create_model(
     for maximum flexibility.
 
     Supported Providers:
-        - openai: OpenAI models (GPT-4, GPT-4o, o1, etc.)
-        - azure: Azure OpenAI Service
+        - openai: OpenAI models via the Responses API (GPT-4, GPT-4o, o1, etc.)
+        - openai-chat: OpenAI models via the legacy Chat Completions API
+        - azure: Azure OpenAI Service via the Responses API
+        - azure-chat: Azure OpenAI Service via the legacy Chat Completions API
         - anthropic: Anthropic models (Claude 3.5 Sonnet, etc.)
         - google-gla: Google Gemini models
         - mistral: Mistral AI models
