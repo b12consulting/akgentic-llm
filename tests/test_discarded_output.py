@@ -803,9 +803,7 @@ async def test_budget_is_per_run_because_each_run_gets_its_own_instance() -> Non
     first, second = await _bind(mounted), await _bind(mounted)
     request_context = _request_context(_output_object())
 
-    async def strip(
-        capability: DiscardedOutputCapability, run_id: str
-    ) -> ModelResponse:
+    async def strip(capability: DiscardedOutputCapability, run_id: str) -> ModelResponse:
         return await capability.after_model_request(
             _run_context(),
             request_context=request_context,
