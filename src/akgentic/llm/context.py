@@ -1,7 +1,6 @@
 """Context management for LLM conversation history."""
 
 import hashlib
-from collections.abc import Sequence
 from typing import Literal
 
 from pydantic_ai.messages import (
@@ -529,7 +528,9 @@ class ContextManager:
         self._notify(LlmContextClearedEvent(None, removed))
         return removed
 
-    def record_discarded_output(self, run_id: str | None, content: Sequence[str]) -> None:
+    def record_discarded_output(
+        self, run_id: str | None, content: list[str] | tuple[str, ...]
+    ) -> None:
         """Record that part of a model response was dropped before reaching history.
 
         A recorder in the ``record_system_prompt`` family, not a mutator: it builds an
@@ -545,6 +546,11 @@ class ContextManager:
                 originating response carries no run id.
             content: Text of each dropped part, in the order the model emitted them.
                 Normalised to a tuple on the event, whose persisted shape is a tuple.
+                Spelled ``list | tuple`` rather than ``Sequence[str]`` on purpose: a
+                bare ``str`` *is* a ``Sequence[str]``, so the likeliest caller mistake —
+                handing over a single ``TextPart.content`` — would type-check clean and
+                record a tuple of one-character strings, corrupting the very audit trail
+                the event exists to provide. Both realistic shapes still pass.
         """
         self._notify(LlmOutputDiscardedEvent(run_id, tuple(content)))
 

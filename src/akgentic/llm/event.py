@@ -237,7 +237,9 @@ class LlmOutputDiscardedEvent:
         run_id: ReactAgent run ID the discard belongs to; None if unset on the
             originating response.
         discarded_content: Text of each dropped part, in the order the model emitted
-            them. Empty when nothing was dropped -- the event is not emitted in that case.
+            them. Emitters record a discard only when something was actually dropped,
+            so an empty tuple is not expected in a stream; the event itself does not
+            enforce that, and a consumer meeting one should treat it as a no-op.
     """
 
     run_id: str | None
