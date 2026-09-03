@@ -6,17 +6,16 @@ first entry on the ``after_model_request`` anchor and explains why it uses that 
 
 from __future__ import annotations
 
-import json
 import logging
 from dataclasses import dataclass, field, replace
 from typing import Any
 
+from pydantic import BaseModel, ValidationError
 from pydantic_ai import EndStrategy
 from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.messages import ModelResponse, TextPart
 from pydantic_ai.models import ModelRequestContext
-from pydantic_ai.output import OutputObjectDefinition
-from pydantic_ai.tools import ObjectJsonSchema, RunContext
+from pydantic_ai.tools import RunContext
 
 from ..context import ContextManager
 
@@ -36,229 +35,45 @@ sit on the boundary with no headroom. Three covers it with one spare and still c
 extra requests at a small constant, far below any request limit.
 """
 
-# JSON Schema keywords that constrain nothing — they annotate. Ignored outright.
-#
-# Membership here is a claim that the keyword cannot change the verdict, so it is not a
-# place to park anything merely unfamiliar: an ignored keyword that does affect the
-# outcome reads as "valid" and strips a part the schema would have rejected. ``$id`` is
-# the near miss and is deliberately **absent** — it re-roots ``$ref`` resolution, which
-# this module resolves only against the top-level ``$defs``, so a schema carrying one is
-# undecidable rather than ignorable.
-_ANNOTATION_KEYWORDS = frozenset(
-    {
-        "$comment",
-        "$defs",
-        "$schema",
-        "default",
-        "deprecated",
-        "description",
-        "examples",
-        "format",
-        "readOnly",
-        "title",
-        "writeOnly",
-    }
-)
 
-# The keywords this module actually evaluates. Anything outside these two sets makes the
-# schema undecidable here, and an undecidable schema means "does not validate" — which
-# keeps the part. See `_validates` for why that direction is the safe one.
-_SUPPORTED_KEYWORDS = frozenset(
-    {
-        "$ref",
-        "additionalProperties",
-        "anyOf",
-        "const",
-        "enum",
-        "items",
-        "oneOf",
-        "properties",
-        "required",
-        "type",
-    }
-)
+def _validates(content: str, output_type: type[BaseModel]) -> bool:
+    """Whether ``content`` is an instance of the run's own output class.
 
-_MAX_SCHEMA_DEPTH = 32
-"""Recursion bound. A self-referential ``$ref`` would otherwise not terminate; exceeding
-the bound is treated as undecidable, so the part survives."""
+    **The verdict, not an approximation of it.** ``model_validate_json`` is the same call
+    pydantic-ai's own output processor makes on the same text against the same class
+    (``_output.py`` — ``self.validator.validate_json(...)``), so "this text is the run's
+    structured output" is answered by the library that decides it rather than by a
+    re-implementation of JSON Schema. Prose and truncated JSON fail on the parse pydantic
+    performs first, so there is no separate parse gate to keep in step.
 
-_REF_PREFIX = "#/$defs/"
+    **No ``strict=True``.** ``NativeOutput(output_type, strict=True)`` in ``providers.py``
+    sets ``OutputObjectDefinition.strict``, a JSON-Schema strictness hint carried to the
+    provider; it is not pydantic's validation mode and never reaches the validator that
+    decides the output. Validating strictly here would reject payloads pydantic-ai accepts
+    — a numeric string for an ``int`` field being the everyday case — so those parts would
+    survive a discard the graph performs anyway, which is the defect this capability
+    exists to fix.
 
+    **No markdown-fence stripping.** pydantic-ai runs ``strip_markdown_fences`` over text
+    output before validating, so a fenced payload it would discard is kept here instead.
+    That helper is private to pydantic-ai, and the divergence falls in the safe direction:
+    a kept part costs the fix, never data.
 
-def _is_instance_of(value: object, type_name: str) -> bool:
-    """Whether ``value`` is an instance of one JSON Schema primitive type name.
-
-    ``bool`` is excluded from the numeric types deliberately: Python makes it a subclass
-    of ``int``, JSON Schema does not. An unrecognised name returns False, which makes the
-    schema undecidable and keeps the part.
-    """
-    if type_name == "boolean":
-        return isinstance(value, bool)
-    if type_name == "integer":
-        return isinstance(value, int) and not isinstance(value, bool)
-    if type_name == "number":
-        return isinstance(value, (int, float)) and not isinstance(value, bool)
-    if type_name == "string":
-        return isinstance(value, str)
-    if type_name == "array":
-        return isinstance(value, list)
-    if type_name == "object":
-        return isinstance(value, dict)
-    if type_name == "null":
-        return value is None
-    return False
-
-
-def _matches_type(value: object, declared: object) -> bool:
-    """Whether ``value`` satisfies a ``type`` keyword, single-valued or a list of names."""
-    names = declared if isinstance(declared, list) else [declared]
-    return any(isinstance(name, str) and _is_instance_of(value, name) for name in names)
-
-
-def _resolve_ref(ref: object, defs: dict[str, Any]) -> dict[str, Any] | None:
-    """Resolve a local ``#/$defs/<name>`` reference; None for anything else.
-
-    Only the local form pydantic emits is understood. A remote or pointer-style ``$ref``
-    resolves to None, which the caller reads as undecidable.
-    """
-    if not isinstance(ref, str) or not ref.startswith(_REF_PREFIX):
-        return None
-    target = defs.get(ref[len(_REF_PREFIX) :])
-    return target if isinstance(target, dict) else None
-
-
-def _matches_object(
-    value: dict[str, Any], schema: dict[str, Any], defs: dict[str, Any], depth: int
-) -> bool:
-    """Check ``required``, ``properties`` and ``additionalProperties`` against a mapping.
-
-    A keyword present but malformed is undecidable, never ignored: skipping a ``required``
-    that is not a list would drop the strongest constraint in the schema and let a
-    mismatched payload read as valid — a strip on doubt, in the one direction that costs
-    data. Its *elements* are checked for the same reason and one more: a name that is not
-    a string decides nothing, and an unhashable one would raise ``TypeError`` out of a
-    hook that runs on every model response.
-    """
-    required = schema.get("required", [])
-    if not isinstance(required, list) or not all(isinstance(name, str) for name in required):
-        return False
-    if any(name not in value for name in required):
-        return False
-
-    properties = schema.get("properties", {})
-    if not isinstance(properties, dict):
-        return False
-    additional = schema.get("additionalProperties", True)
-    if not isinstance(additional, (bool, dict)):
-        return False
-
-    for key, item in value.items():
-        sub_schema = properties.get(key)
-        if sub_schema is None:
-            if additional is False:
-                return False
-            if isinstance(additional, dict) and not _matches(item, additional, defs, depth + 1):
-                return False
-            continue
-        if not _matches(item, sub_schema, defs, depth + 1):
-            return False
-    return True
-
-
-def _matches_enumeration(value: object, schema: dict[str, Any]) -> bool:
-    """Check the two value-listing keywords, ``const`` and ``enum``."""
-    if "const" in schema and value != schema["const"]:
-        return False
-    if "enum" in schema:
-        options = schema["enum"]
-        return isinstance(options, list) and value in options
-    return True
-
-
-def _matches_composition(
-    value: object, schema: dict[str, Any], defs: dict[str, Any], depth: int
-) -> bool:
-    """Check the two subschema-combining keywords, ``anyOf`` and ``oneOf``."""
-    if "anyOf" in schema:
-        options = schema["anyOf"]
-        if not isinstance(options, list):
-            return False
-        if not any(_matches(value, option, defs, depth + 1) for option in options):
-            return False
-    if "oneOf" in schema:
-        options = schema["oneOf"]
-        if not isinstance(options, list):
-            return False
-        if sum(_matches(value, option, defs, depth + 1) for option in options) != 1:
-            return False
-    return True
-
-
-def _matches(value: object, schema: object, defs: dict[str, Any], depth: int) -> bool:
-    """Whether ``value`` conforms to ``schema``, over the subset pydantic emits.
-
-    Every uncertainty resolves to False. A keyword outside the two sets above, a ``$ref``
-    that does not resolve, a type name not enumerated, a schema nested past
-    ``_MAX_SCHEMA_DEPTH`` — each says "does not validate", so the part is kept. That is
-    the direction that cannot destroy the model's reasoning; the opposite direction can.
-    """
-    if depth > _MAX_SCHEMA_DEPTH or not isinstance(schema, dict):
-        return False
-    if set(schema) - _ANNOTATION_KEYWORDS - _SUPPORTED_KEYWORDS:
-        return False
-
-    if "$ref" in schema:
-        # A ``$ref`` alongside another constraining keyword applies both, and this walk
-        # follows only the reference. Ignoring the sibling is the permissive direction —
-        # a payload the sibling rejects would read as valid and be stripped — so a
-        # ``$ref`` that is not alone (annotations aside) is undecidable. Annotations are
-        # still allowed beside it: that is the form pydantic actually emits.
-        if set(schema) - _ANNOTATION_KEYWORDS - {"$ref"}:
-            return False
-        target = _resolve_ref(schema["$ref"], defs)
-        return target is not None and _matches(value, target, defs, depth + 1)
-
-    if not _matches_enumeration(value, schema):
-        return False
-    if not _matches_composition(value, schema, defs, depth):
-        return False
-    if "type" in schema and not _matches_type(value, schema["type"]):
-        return False
-
-    if isinstance(value, dict):
-        return _matches_object(value, schema, defs, depth)
-    if isinstance(value, list) and "items" in schema:
-        return all(_matches(item, schema["items"], defs, depth + 1) for item in value)
-    return True
-
-
-def _validates(content: str, output_object: OutputObjectDefinition) -> bool:
-    """Whether ``content`` is an instance of the run's own output schema.
-
-    Two gates, both conservative. The text must parse as JSON — prose and truncated JSON
-    fail here — and the parsed value must conform to ``output_object.json_schema``.
-
-    **Why a schema walk and not a library.** ``jsonschema`` is not a dependency of this
-    package (it reaches this workspace transitively through ``mcp``, which belongs to
-    ``akgentic-tool``), and pydantic cannot build a validator from a JSON schema, so the
-    only in-package option is to walk the schema. The walk covers the constructs pydantic
-    emits for an output object — ``$defs``/``$ref``, ``type``, ``properties``,
-    ``required``, ``items``, ``enum``, ``const``, ``anyOf``/``oneOf``,
-    ``additionalProperties`` — and calls anything else undecidable rather than guessing.
-
-    That incompleteness is safe in exactly one direction, and it is this one: an
-    unrecognised construct makes the capability a no-op for that schema, which costs the
-    fix; the opposite failure would delete the model's reasoning from history, which
-    costs data. "Never strip on doubt" is what makes an incomplete checker acceptable.
+    A model whose validators raise something other than ``ValidationError`` must not end
+    the run from a hook that fires on every model response, so anything else is logged and
+    read as "does not validate" — the direction that keeps the part.
     """
     try:
-        value = json.loads(content)
-    except ValueError:
+        output_type.model_validate_json(content)
+    except ValidationError:
         return False
-    schema: ObjectJsonSchema = output_object.json_schema
-    raw_defs = schema.get("$defs", {})
-    defs: dict[str, Any] = raw_defs if isinstance(raw_defs, dict) else {}
-    return _matches(value, schema, defs, 0)
+    except Exception:
+        logger.exception(
+            "Validating a text part against %s raised; leaving the part in place",
+            output_type.__name__,
+        )
+        return False
+    return True
 
 
 @dataclass
@@ -284,11 +99,19 @@ class DiscardedOutputCapability(AbstractCapability[Any]):
     hook and no ``wrap_run``; mounting it anywhere in the stack gives the same history and
     the same event sequence.
 
-    **It strips only what validates against the run's own output schema.** Never on
+    **It strips only what validates against the run's own output class.** Never on
     ``isinstance(part, TextPart)``: a tool call sitting beside plain narration is
     ordinary, and stripping on the type alone would silently delete the model's
-    reasoning. Parse failure, schema mismatch, or a schema this module cannot decide all
-    mean "keep".
+    reasoning. Parse failure and schema mismatch both mean "keep".
+
+    **The host declares the output class, once per run.** ``expect_output_type`` is called
+    with the class *this* run will produce, immediately before the run starts;
+    ``for_run`` snapshots it onto the per-run instance and clears the slot. A host that
+    declares nothing — a bare ``Agent`` with this capability mounted by hand — gets a
+    no-op, which is the same fail-closed direction as an unparseable part. The class is
+    never guessed from ``ModelRequestContext``: what the request carries is a JSON Schema,
+    and deciding conformance against a schema by hand is exactly what this capability used
+    to do and stopped doing.
 
     **Audit only, never annotation.** The stripped response is what is evented, so
     ``restore_context`` rebuilds the stripped history and the defect does not return on
@@ -314,17 +137,78 @@ class DiscardedOutputCapability(AbstractCapability[Any]):
     budget: int = DEFAULT_STRIP_BUDGET
     """Strips allowed per run. See ``DEFAULT_STRIP_BUDGET`` for why three."""
 
-    _run_id: str | None = field(default=None, init=False)
-    """The run the counters below belong to, taken from the response's own ``run_id`` —
-    the same source the recorder is handed. Keying on it rather than on ``for_run`` means
-    the budget is per run even for a capability instance mounted across several."""
+    _pending_output_type: type[BaseModel] | None = field(default=None, init=False)
+    """The class the next run will produce, parked here by ``expect_output_type``.
+
+    Lives on the *shared* instance because that is the only object the host holds; it is
+    read and cleared by ``for_run`` and never by a hook, so no hook ever consults a slot
+    another run can be writing.
+    """
+
+    _output_type: type[BaseModel] | None = field(default=None, init=False)
+    """This run's output class, snapshotted by ``for_run``. ``None`` on the shared
+    instance and on any run whose host declared nothing — both no-ops."""
 
     _strips: int = field(default=0, init=False)
-    """Strips already made in ``_run_id``."""
+    """Strips already made in this run. Per-run because ``for_run`` hands each run its own
+    instance; on the shared one it stays at zero forever."""
 
     _exhausted: bool = field(default=False, init=False)
-    """Whether ``_run_id``'s budget has already refused a strip. Once set, the run's
+    """Whether this run's budget has already refused a strip. Once set, the run's
     remaining responses pass through without the budget being tested again."""
+
+    def expect_output_type(self, output_type: object) -> None:
+        """Declare the class the next run's structured output will be validated against.
+
+        Called by the host immediately before it starts the run, and at that point
+        deliberately: a value resolved a frame earlier goes stale when a tool calls
+        ``switch_model`` mid-run, which is the same reason ``ReactAgent`` resolves the
+        model and the effective output type at the ``run()`` call itself.
+
+        Anything that is not a ``BaseModel`` subclass parks ``None`` and makes the run a
+        no-op. ``str`` and ``None`` are the ordinary cases — a run with no structured
+        output has nothing for a part to be an instance of. The others are refused on
+        purpose: pydantic-ai wraps a bare output type in a ``{"response": ...}`` envelope
+        before the model ever sees it, so validating the naked type here would answer a
+        different question than the graph does, and in the direction that strips.
+
+        Args:
+            output_type: The run's effective output type, wrapper-free.
+        """
+        self._pending_output_type = (
+            output_type
+            if isinstance(output_type, type) and issubclass(output_type, BaseModel)
+            else None
+        )
+
+    async def for_run(self, ctx: RunContext[Any]) -> AbstractCapability[Any]:
+        """Hand this run its own instance, carrying its output class and its own budget.
+
+        Upstream's sanctioned per-run isolation, and load-bearing twice over. The budget
+        was previously a single slot on the shared instance, so interleaved runs reset
+        each other's counters and the bound was lost; the output class on a shared slot
+        would be worse — a run could validate against another run's schema and strip a
+        part that is not its output at all. Neither is reachable once the state lives on
+        the instance only this run holds.
+
+        Clearing the pending slot is what makes an undeclared run a no-op rather than a
+        run validated against whatever the previous one declared.
+
+        Upstream notes that under durable execution per-run state must be derivable from
+        ``ctx``. It is not derivable here — ``RunContext`` carries no output schema — and
+        this package does not use durable execution; a durable host would have to declare
+        the class through its own serialised state.
+
+        Args:
+            ctx: This run's context. Unread — the class comes from the host.
+
+        Returns:
+            A copy of this capability bound to this run.
+        """
+        bound = replace(self)
+        bound._output_type = self._pending_output_type
+        self._pending_output_type = None
+        return bound
 
     async def after_model_request(
         self,
@@ -335,17 +219,15 @@ class DiscardedOutputCapability(AbstractCapability[Any]):
     ) -> ModelResponse:
         """Return ``response`` with the about-to-be-discarded output removed, or unchanged.
 
-        Unchanged unless every gate passes: the strategy is ``'exhaustive'``, this run's
-        budget is unspent, the response carries at least one ``ToolCallPart``, the request
-        declares an output schema, and at least one ``TextPart`` validates against it.
+        Unchanged unless every gate passes: the strategy is ``'exhaustive'``, the host
+        declared an output class for this run, this run's budget is unspent, the response
+        carries at least one ``ToolCallPart``, the request declares an output schema, and
+        at least one ``TextPart`` validates against the class.
         """
-        if self.end_strategy != "exhaustive":
-            return response
-        self._track_run(response.run_id)
-        if self._exhausted:
+        if self.end_strategy != "exhaustive" or self._output_type is None or self._exhausted:
             return response
 
-        discardable = self._discardable(request_context, response)
+        discardable = self._discardable(request_context, response, self._output_type)
         if not discardable:
             return response
 
@@ -365,41 +247,28 @@ class DiscardedOutputCapability(AbstractCapability[Any]):
         )
         return self._without(response, discardable)
 
-    def _track_run(self, run_id: str | None) -> None:
-        """Reset the budget when the response belongs to a run this instance has not seen.
-
-        Per run, not per agent: a fresh run starts with the full budget however many runs
-        this instance has already driven. Two consecutive runs that both leave ``run_id``
-        unset share one budget — a synthetic case, since the agent graph fills the id in
-        before this hook is reached.
-        """
-        if run_id == self._run_id:
-            return
-        self._run_id = run_id
-        self._strips = 0
-        self._exhausted = False
-
     @staticmethod
     def _discardable(
-        request_context: ModelRequestContext, response: ModelResponse
+        request_context: ModelRequestContext,
+        response: ModelResponse,
+        output_type: type[BaseModel],
     ) -> list[TextPart]:
         """The text parts this response would lose to the discard branch, in emission order.
 
         Empty unless the response carries a tool call *and* the request declared an output
         schema. Text with no tool call is not discarded by the graph at all — that case is
         the multi-part merge, and this capability must leave it alone — and a request with
-        no ``output_object`` (``text`` mode, or ``tool``-mode output) has nothing for a
-        part to be an instance of, so nothing can validate.
+        no ``output_object`` (``text`` mode, or ``tool``-mode output) puts the output
+        somewhere other than a text part, so no text part can be one.
         """
         if not response.tool_calls:
             return []
-        output_object = request_context.model_request_parameters.output_object
-        if output_object is None:
+        if request_context.model_request_parameters.output_object is None:
             return []
         return [
             part
             for part in response.parts
-            if isinstance(part, TextPart) and _validates(part.content, output_object)
+            if isinstance(part, TextPart) and _validates(part.content, output_type)
         ]
 
     @staticmethod

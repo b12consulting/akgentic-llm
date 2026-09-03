@@ -5,13 +5,15 @@ Two harnesses, deliberately.
 Most specs drive ``after_model_request`` **directly**, with a hand-built
 ``ModelRequestContext``: the hook's whole contract is "given this response and these request
 parameters, return that response", and calling it directly pins the gates one at a time
-without a run's scheduling in the way.
+without a run's scheduling in the way. They drive the instance ``for_run`` hands back, never
+the mounted one — that is the object a real run's hooks are called on.
 
 The specs that are *about* the anchor — that the strip lands before history, that mount order
 does not matter, that restore rebuilds the stripped history — drive a **bare pydantic-ai
 ``Agent``** with ``EventSourcingCapability`` co-mounted, since only a real run exercises the
 append the anchor is chosen to precede. Never a ``ReactAgent``: the capability must be
-provable on any agent.
+provable on any agent, and a bare one declares its output class exactly as ``ReactAgent``
+does.
 
 ``asyncio_mode = "auto"`` — plain ``async def`` tests, no ``@pytest.mark.asyncio``.
 """
@@ -19,10 +21,11 @@ provable on any agent.
 from __future__ import annotations
 
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Literal
+from unittest.mock import patch
 
 import pytest
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, field_validator
 from pydantic_ai import Agent, PromptedOutput
 from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.messages import (
@@ -48,11 +51,11 @@ from akgentic.llm import (
     ReactAgentConfig,
 )
 from akgentic.llm.capabilities import DEFAULT_STRIP_BUDGET
-from akgentic.llm.capabilities.discarded_output import _MAX_SCHEMA_DEPTH, _validates
+from akgentic.llm.capabilities.discarded_output import _validates
 from akgentic.llm.event import LlmMessageEvent, LlmOutputDiscardedEvent, LlmUsageEvent
 
 # ---------------------------------------------------------------------------
-# Fixtures of the domain: an output schema and the text that satisfies it
+# Fixtures of the domain: an output class and the text that satisfies it
 # ---------------------------------------------------------------------------
 
 
@@ -75,10 +78,15 @@ SECOND_VALID_OUTPUT = '{"messages": [{"recipient": "@Human", "message": "on it"}
 PROSE = "I should ask the assistant to look this up before answering."
 PARTIAL_JSON = '{"messages":[{"message_ty'
 WRONG_SHAPE = '{"unexpected": 1}'
+FENCED_OUTPUT = f"```json\n{VALID_OUTPUT}\n```"
 
 
 def _output_object() -> OutputObjectDefinition:
-    """The run's own output schema, exactly as pydantic generates it."""
+    """The run's own output schema, exactly as pydantic generates it.
+
+    Only its *presence* is read now — it is what says the request declared structured
+    output. Conformance is decided against the class, never against this.
+    """
     return OutputObjectDefinition(json_schema=_Out.model_json_schema(), name="Out")
 
 
@@ -124,12 +132,30 @@ class _Recorder:
         self.events.append(event)
 
 
-def _wired() -> tuple[ContextManager, _Recorder, DiscardedOutputCapability]:
-    """A context manager, its recorder, and a capability bound to it."""
+def _mount(**kwargs: Any) -> tuple[ContextManager, _Recorder, DiscardedOutputCapability]:
+    """A context manager, its recorder, and the capability a host would mount."""
     manager = ContextManager()
     recorder = _Recorder()
     manager.subscribe(recorder)
-    return manager, recorder, DiscardedOutputCapability(context=manager)
+    return manager, recorder, DiscardedOutputCapability(context=manager, **kwargs)
+
+
+async def _bind(
+    mounted: DiscardedOutputCapability, output_type: object = _Out
+) -> DiscardedOutputCapability:
+    """Declare a run's output class and take the per-run instance, as a real run does."""
+    mounted.expect_output_type(output_type)
+    bound = await mounted.for_run(_run_context())
+    assert isinstance(bound, DiscardedOutputCapability)
+    return bound
+
+
+async def _wired(
+    output_type: object = _Out, **kwargs: Any
+) -> tuple[ContextManager, _Recorder, DiscardedOutputCapability]:
+    """A mounted capability already bound to one run — the common shape of a spec."""
+    manager, recorder, mounted = _mount(**kwargs)
+    return manager, recorder, await _bind(mounted, output_type)
 
 
 def _discards(recorder: _Recorder) -> list[LlmOutputDiscardedEvent]:
@@ -151,15 +177,18 @@ def test_only_after_model_request_is_implemented() -> None:
     Compared against ``AbstractCapability``'s own functions: an inherited hook is the base
     class's function object, an overridden one is not. A node hook or a ``wrap_run`` here
     would mean the capability edits a response already in history and has to be sequenced
-    against the persistence sweep — the design AC 3 exists to keep out.
+    against the persistence sweep — the design AC 3 exists to keep out. ``for_run`` is
+    overridden and is deliberately not in that list: it is not a hook, it is upstream's
+    per-run binding step, and it fires before any hook does.
     """
     cls = DiscardedOutputCapability
     assert cls.after_model_request is not AbstractCapability.after_model_request
+    assert cls.for_run is not AbstractCapability.for_run
 
     for hook in ("before_node_run", "after_node_run", "wrap_node_run", "wrap_run"):
         assert getattr(cls, hook) is getattr(AbstractCapability, hook), hook
 
-    manager, _, capability = _wired()
+    manager, _, capability = _mount()
     assert capability.get_ordering() is None
     assert "get_ordering" not in vars(cls)
     assert manager.messages == []
@@ -178,8 +207,7 @@ async def test_no_op_under_non_exhaustive_strategies(strategy: str) -> None:
     destroy a live result. ``graceful`` does take the discard branch, but was never
     measured; extending to it is a decision, not a freebie.
     """
-    manager, recorder, _ = _wired()
-    capability = DiscardedOutputCapability(context=manager, end_strategy=strategy)  # type: ignore[arg-type]
+    _, recorder, capability = await _wired(end_strategy=strategy)
     response = _response(TextPart(VALID_OUTPUT), _tool_call())
 
     result = await capability.after_model_request(
@@ -192,8 +220,7 @@ async def test_no_op_under_non_exhaustive_strategies(strategy: str) -> None:
 
 async def test_no_op_under_early() -> None:
     """AC 4: named spec for ``early`` — the strategy is read from configuration."""
-    manager, recorder, _ = _wired()
-    capability = DiscardedOutputCapability(context=manager, end_strategy="early")
+    _, recorder, capability = await _wired(end_strategy="early")
     response = _response(TextPart(VALID_OUTPUT), _tool_call())
 
     result = await capability.after_model_request(
@@ -207,8 +234,7 @@ async def test_no_op_under_early() -> None:
 
 async def test_no_op_under_graceful() -> None:
     """AC 4: named spec for ``graceful`` — same discard branch upstream, still not ours."""
-    manager, recorder, _ = _wired()
-    capability = DiscardedOutputCapability(context=manager, end_strategy="graceful")
+    _, recorder, capability = await _wired(end_strategy="graceful")
     response = _response(TextPart(VALID_OUTPUT), _tool_call())
 
     result = await capability.after_model_request(
@@ -221,13 +247,13 @@ async def test_no_op_under_graceful() -> None:
 
 
 # ---------------------------------------------------------------------------
-# AC 5 — strip only what validates against the run's own output schema
+# AC 5 — strip only what validates against the run's own output class
 # ---------------------------------------------------------------------------
 
 
 async def test_prose_beside_a_tool_call_survives() -> None:
     """AC 5: plain narration next to a tool call is the model's reasoning — never stripped."""
-    manager, recorder, capability = _wired()
+    _, recorder, capability = await _wired()
     response = _response(TextPart(PROSE), _tool_call())
 
     result = await capability.after_model_request(
@@ -241,7 +267,7 @@ async def test_prose_beside_a_tool_call_survives() -> None:
 
 async def test_partial_json_beside_a_tool_call_survives() -> None:
     """AC 5: truncated JSON does not parse, so it does not validate, so it stays."""
-    manager, recorder, capability = _wired()
+    _, recorder, capability = await _wired()
     response = _response(TextPart(PARTIAL_JSON), _tool_call())
 
     result = await capability.after_model_request(
@@ -255,7 +281,7 @@ async def test_partial_json_beside_a_tool_call_survives() -> None:
 
 async def test_schema_mismatched_json_survives() -> None:
     """AC 5: valid JSON of the wrong shape is not this run's output — it stays."""
-    manager, recorder, capability = _wired()
+    _, recorder, capability = await _wired()
     response = _response(TextPart(WRONG_SHAPE), _tool_call())
 
     result = await capability.after_model_request(
@@ -269,7 +295,7 @@ async def test_schema_mismatched_json_survives() -> None:
 
 async def test_mixed_parts_strips_only_the_valid_one() -> None:
     """AC 5: one valid output and one prose part ⇒ exactly one stripped, order preserved."""
-    manager, recorder, capability = _wired()
+    _, recorder, capability = await _wired()
     thinking = ThinkingPart(content="weighing options")
     call = _tool_call()
     response = _response(thinking, TextPart(VALID_OUTPUT), TextPart(PROSE), call)
@@ -284,12 +310,13 @@ async def test_mixed_parts_strips_only_the_valid_one() -> None:
 
 
 async def test_no_output_schema_strips_nothing() -> None:
-    """AC 5 / Dev Notes: ``output_object is None`` means nothing can validate.
+    """AC 5 / Dev Notes: ``output_object is None`` means the output is not in a text part.
 
-    ``text`` mode has no schema to be an instance of, and the gate is never relaxed to an
-    ``isinstance`` check to compensate.
+    ``text`` mode has no structured output at all and ``tool`` mode puts it in a tool call,
+    so a text part beside the call is narration whatever it happens to parse as. The gate
+    is never relaxed to an ``isinstance`` check to compensate.
     """
-    manager, recorder, capability = _wired()
+    _, recorder, capability = await _wired()
     response = _response(TextPart(VALID_OUTPUT), _tool_call())
 
     result = await capability.after_model_request(
@@ -301,171 +328,290 @@ async def test_no_output_schema_strips_nothing() -> None:
 
 
 # ---------------------------------------------------------------------------
-# AC 5 — the schema walk itself
+# AC 5 — the validator itself
 #
-# This decides what gets deleted from history, so each branch is exercised on its own
-# rather than only through the four end-to-end specs above. Every case that reads
-# "undecidable" must answer False: an incomplete checker is safe only while it errs
-# towards keeping the part.
+# This decides what gets deleted from history, so each construct is exercised on its own
+# rather than only through the four end-to-end specs above. The verdicts are pydantic's,
+# which is the point of the swap: the same call pydantic-ai makes, against the same class.
 # ---------------------------------------------------------------------------
 
 
-def _schema(**keywords: Any) -> OutputObjectDefinition:
-    return OutputObjectDefinition(json_schema=dict(keywords))
+class _Inner(BaseModel):
+    b: int
+
+
+class _Int(BaseModel):
+    a: int
+
+
+class _Bool(BaseModel):
+    a: bool
+
+
+class _Float(BaseModel):
+    a: float
+
+
+class _Str(BaseModel):
+    a: str
+
+
+class _Null(BaseModel):
+    a: None
+
+
+class _IntList(BaseModel):
+    a: list[int]
+
+
+class _Mapping(BaseModel):
+    a: dict[str, int]
+
+
+class _Either(BaseModel):
+    a: str | int
+
+
+class _Choice(BaseModel):
+    a: Literal["a", "b"]
+
+
+class _Fixed(BaseModel):
+    a: Literal[7]
+
+
+class _Nested(BaseModel):
+    a: _Inner
+
+
+class _Forbidding(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    a: int
+
+
+class _TwoRequired(BaseModel):
+    a: int
+    b: int
+
+
+class _Recursive(BaseModel):
+    a: _Recursive | None = None
 
 
 @pytest.mark.parametrize(
-    ("content", "schema", "expected"),
+    ("content", "output_type", "expected"),
     [
-        # -- primitive types, and JSON's bool/int distinction Python does not share --
-        ("1", _schema(type="integer"), True),
-        ("true", _schema(type="integer"), False),
-        ("true", _schema(type="boolean"), True),
-        ("1", _schema(type="boolean"), False),
-        ("1.5", _schema(type="number"), True),
-        ("true", _schema(type="number"), False),
-        ('"s"', _schema(type="string"), True),
-        ("null", _schema(type="null"), True),
-        ("[]", _schema(type="array"), True),
-        ("{}", _schema(type="object"), True),
-        ("1", _schema(type=["string", "integer"]), True),
-        ("1", _schema(type="fantasy"), False),
-        # -- required, properties, additionalProperties --
-        ('{"a": 1}', _schema(type="object", required=["a", "b"]), False),
-        ('{"a": 1}', _schema(type="object", properties={"a": {"type": "integer"}}), True),
-        ('{"a": "x"}', _schema(type="object", properties={"a": {"type": "integer"}}), False),
-        ('{"z": 1}', _schema(type="object", additionalProperties=False), False),
-        ('{"z": 1}', _schema(type="object", additionalProperties={"type": "integer"}), True),
-        ('{"z": "x"}', _schema(type="object", additionalProperties={"type": "integer"}), False),
-        # -- items --
-        ("[1, 2]", _schema(type="array", items={"type": "integer"}), True),
-        ('[1, "x"]', _schema(type="array", items={"type": "integer"}), False),
-        # -- enum / const --
-        ('"a"', _schema(enum=["a", "b"]), True),
-        ('"c"', _schema(enum=["a", "b"]), False),
-        ('"a"', _schema(enum="not-a-list"), False),
-        ("7", _schema(const=7), True),
-        ("8", _schema(const=7), False),
-        # -- anyOf / oneOf --
-        ("1", _schema(anyOf=[{"type": "string"}, {"type": "integer"}]), True),
-        ("1.5", _schema(anyOf=[{"type": "string"}, {"type": "integer"}]), False),
-        ("1", _schema(anyOf="not-a-list"), False),
-        ("1", _schema(oneOf=[{"type": "string"}, {"type": "integer"}]), True),
-        ("1", _schema(oneOf=[{"type": "integer"}, {"type": "number"}]), False),
-        ("1", _schema(oneOf="not-a-list"), False),
-        # -- $ref, resolvable and not --
-        (
-            '{"a": 1}',
-            _schema(**{"$ref": "#/$defs/A", "$defs": {"A": {"type": "object", "required": ["a"]}}}),
-            True,
-        ),
-        ('{"a": 1}', _schema(**{"$ref": "#/$defs/Missing", "$defs": {}}), False),
-        ('{"a": 1}', _schema(**{"$ref": "https://example.test/schema"}), False),
-        # A `$ref` applies alongside its siblings; this walk follows only the reference,
-        # so a constraining sibling is undecidable rather than ignored. Ignoring the
-        # `required` below would call a payload without "b" valid and strip it.
-        (
-            '{"a": 1}',
-            _schema(
-                **{
-                    "$ref": "#/$defs/A",
-                    "required": ["b"],
-                    "$defs": {"A": {"type": "object"}},
-                }
-            ),
-            False,
-        ),
-        # ...but an *annotation* beside a `$ref` is the form pydantic actually emits, so
-        # the rule above must not disable the common case.
-        (
-            '{"a": 1}',
-            _schema(
-                **{
-                    "$ref": "#/$defs/A",
-                    "description": "the one pydantic writes",
-                    "$defs": {"A": {"type": "object", "required": ["a"]}},
-                }
-            ),
-            True,
-        ),
-        # `$id` re-roots reference resolution, which this walk does only against the
-        # top-level `$defs` — so it is undecidable, not ignorable.
-        (
-            '{"a": 1}',
-            _schema(
-                **{
-                    "$ref": "#/$defs/A",
-                    "$id": "https://example.test/root",
-                    "$defs": {"A": {"type": "object"}},
-                }
-            ),
-            False,
-        ),
-        # -- undecidable: a keyword this module does not evaluate --
-        ('"abc"', _schema(type="string", pattern="^a"), False),
-        ('{"a": 1}', _schema(type="object", allOf=[{"type": "object"}]), False),
-        # -- annotations constrain nothing and must not make a schema undecidable --
-        ('"s"', _schema(type="string", title="T", description="D", default="x"), True),
-        # -- not JSON at all --
-        (PROSE, _schema(type="string"), False),
-        (PARTIAL_JSON, _schema(type="object"), False),
+        # -- primitives, and the coercions pydantic performs where JSON Schema would not.
+        # The bool/number pairs below are the three verdicts the schema walk got the other
+        # way round: it applied JSON Schema's rule, under which `true` is not an `integer`.
+        # pydantic's lax mode — the mode pydantic-ai validates the real output in — coerces
+        # between them, so these payloads ARE this run's output and the graph does discard
+        # them. Answering False here left them in history, which is the defect.
+        ('{"a": 1}', _Int, True),
+        ('{"a": true}', _Int, True),
+        ('{"a": true}', _Bool, True),
+        ('{"a": 1}', _Bool, True),
+        ('{"a": 1.5}', _Float, True),
+        ('{"a": 1}', _Float, True),
+        ('{"a": true}', _Float, True),
+        ('{"a": "s"}', _Str, True),
+        ('{"a": 1}', _Str, False),
+        ('{"a": null}', _Null, True),
+        ('{"a": []}', _IntList, True),
+        ('{"a": {}}', _Mapping, True),
+        ('{"a": 1}', _Either, True),
+        ('{"a": "5"}', _Int, True),
+        # -- required fields, and what an absent or extra key does --
+        ('{"a": 1}', _TwoRequired, False),
+        ('{"a": 1}', _Int, True),
+        ('{"a": "x"}', _Int, False),
+        ('{"a": 1, "z": 2}', _Int, True),
+        ('{"a": 1, "z": 2}', _Forbidding, False),
+        ('{"a": 1}', _Forbidding, True),
+        # -- collection members --
+        ('{"a": [1, 2]}', _IntList, True),
+        ('{"a": [1, "x"]}', _IntList, False),
+        ('{"a": {"k": 1}}', _Mapping, True),
+        ('{"a": {"k": "x"}}', _Mapping, False),
+        # -- closed value sets --
+        ('{"a": "a"}', _Choice, True),
+        ('{"a": "c"}', _Choice, False),
+        ('{"a": 7}', _Fixed, True),
+        ('{"a": 8}', _Fixed, False),
+        # -- unions --
+        ('{"a": 1}', _Either, True),
+        ('{"a": 1.5}', _Either, False),
+        ('{"a": null}', _Either, False),
+        # -- a nested model, which is what a `$ref` in the schema stood for --
+        ('{"a": {"b": 1}}', _Nested, True),
+        ('{"a": {}}', _Nested, False),
+        ('{"a": 1}', _Nested, False),
+        # -- not JSON at all, or not this run's output --
+        (PROSE, _Out, False),
+        (PARTIAL_JSON, _Out, False),
+        ("", _Out, False),
+        ('{"a": 1}', _Out, False),
+        (VALID_OUTPUT, _Out, True),
+        (WRONG_SHAPE, _Out, False),
+        # pydantic-ai strips markdown fences before validating and this does not, so a
+        # fenced payload is KEPT. The divergence is in the direction that costs the fix,
+        # never data — and the helper that would close it is private to pydantic-ai.
+        (FENCED_OUTPUT, _Out, False),
     ],
 )
-def test_schema_walk_decides_each_construct(
-    content: str, schema: OutputObjectDefinition, expected: bool
+def test_the_validator_decides_each_construct(
+    content: str, output_type: type[BaseModel], expected: bool
 ) -> None:
-    """AC 5: the subset walk answers each construct, and answers False when unsure."""
-    assert _validates(content, schema) is expected
+    """AC 5: the run's own class answers each construct, through pydantic."""
+    assert _validates(content, output_type) is expected
 
 
-def test_a_self_referential_schema_terminates_and_keeps_the_part() -> None:
-    """AC 5: a recursive ``$ref`` is bounded, and the bound reads as 'does not validate'.
+def test_a_numeric_string_validates_because_validation_is_not_strict() -> None:
+    """AC 5: ``strict=True`` is deliberately NOT passed, and this is where it would show.
 
-    Left unbounded this would not terminate; answering True at the bound would strip on a
-    schema never actually checked. Both failure modes are worse than a surviving part.
+    ``NativeOutput(output_type, strict=True)`` sets a JSON-Schema strictness hint for the
+    provider, not pydantic's validation mode: pydantic-ai's own output processor calls
+    ``validator.validate_json`` with no strict flag. Validating strictly here would keep a
+    part the graph discards anyway, which is the whole defect.
     """
-    nested: Any = 1
-    for _ in range(_MAX_SCHEMA_DEPTH + 2):
-        nested = {"a": nested}
-    recursive = OutputObjectDefinition(
-        json_schema={
-            "$ref": "#/$defs/Node",
-            "$defs": {"Node": {"type": "object", "properties": {"a": {"$ref": "#/$defs/Node"}}}},
-        }
+    assert _validates('{"a": "5"}', _Int) is True
+    assert _validates('{"a": 5}', _Int) is True
+
+
+def test_a_self_referential_model_terminates() -> None:
+    """AC 5: a recursive output class is decided, not given up on.
+
+    The schema walk this replaced bounded recursion at a fixed depth and called anything
+    deeper undecidable, so a legitimately deep output survived a discard the graph
+    performs regardless. pydantic recurses over the payload itself and answers.
+    """
+    deep = "{"
+    for _ in range(40):
+        deep += '"a": {'
+    deep += '"a": null' + "}" * 40 + "}"
+
+    assert _validates(deep, _Recursive) is True
+    assert _validates('{"a": {"a": 1}}', _Recursive) is False
+
+
+class _Exploding(BaseModel):
+    """An output class whose validator raises something pydantic does not wrap."""
+
+    a: int
+
+    @field_validator("a")
+    @classmethod
+    def _boom(cls, value: int) -> int:
+        raise RuntimeError("validator blew up")
+
+
+def test_a_validator_that_raises_keeps_the_part() -> None:
+    """AC 5: a caller's output class must not end a run from this hook.
+
+    ``ValueError`` and ``AssertionError`` become ``ValidationError``; anything else
+    propagates out of ``model_validate_json``. This hook fires on every model response, so
+    that would turn an audit-only capability into a run-ending one. It is logged and read
+    as "does not validate" — the direction that keeps the part.
+    """
+    assert _validates('{"a": 1}', _Exploding) is False
+
+
+# ---------------------------------------------------------------------------
+# AC 5 — the output class comes from the host, once per run
+# ---------------------------------------------------------------------------
+
+
+async def test_no_op_when_the_host_declares_nothing() -> None:
+    """AC 5: an unbound mount cannot know what this run produces, so it strips nothing."""
+    manager, recorder, mounted = _mount()
+    bound = await mounted.for_run(_run_context())
+    assert isinstance(bound, DiscardedOutputCapability)
+    response = _response(TextPart(VALID_OUTPUT), _tool_call())
+
+    result = await bound.after_model_request(
+        _run_context(), request_context=_request_context(_output_object()), response=response
     )
 
-    import json as _json
-
-    assert _validates(_json.dumps(nested), recursive) is False
+    assert result is response
+    assert _discards(recorder) == []
+    assert manager.messages == []
 
 
 @pytest.mark.parametrize(
-    "schema",
-    [
-        _schema(type="object", properties="not-a-mapping"),
-        _schema(type="object", properties={"a": "not-a-schema"}),
-        _schema(type="object", required="not-a-list", properties={"a": {"type": "integer"}}),
-        _schema(type="object", required=[["a"]]),
-        _schema(type="object", additionalProperties="not-a-schema"),
-    ],
-    ids=[
-        "properties-not-a-mapping",
-        "subschema-not-a-mapping",
-        "required-not-a-list",
-        "required-element-not-a-string",
-        "additional-properties-not-a-schema",
-    ],
+    "declared", [str, None, int, list[int]], ids=["str", "none", "int", "list"]
 )
-def test_a_malformed_schema_is_undecidable(schema: OutputObjectDefinition) -> None:
-    """AC 5: a schema that is not shaped like one decides nothing, so the part is kept.
+async def test_no_op_for_an_output_type_that_is_not_a_model(declared: object) -> None:
+    """AC 5: only a ``BaseModel`` subclass is decidable here.
 
-    ``required`` here is the case worth naming: ignoring a malformed one would silently
-    drop the strongest constraint in the schema and make a mismatched payload look valid.
-    Its elements are checked too — an unhashable name would otherwise raise ``TypeError``
-    out of a hook that runs on every model response, turning an audit-only capability into
-    a run-ending one.
+    ``str`` and ``None`` are the ordinary cases — no structured output to be an instance
+    of. A bare ``int`` or ``list[int]`` is refused for a sharper reason: pydantic-ai wraps
+    it in a ``{"response": ...}`` envelope before the model sees it, so validating the
+    naked type would answer a different question than the graph does, and in the direction
+    that strips.
     """
-    assert _validates('{"a": 1}', schema) is False
+    _, recorder, capability = await _wired(declared)
+    response = _response(TextPart(VALID_OUTPUT), TextPart("5"), _tool_call())
+
+    result = await capability.after_model_request(
+        _run_context(), request_context=_request_context(_output_object()), response=response
+    )
+
+    assert result is response
+    assert _discards(recorder) == []
+
+
+async def test_the_declaration_is_consumed_by_for_run() -> None:
+    """AC 5: a run that declares nothing never inherits the previous run's class.
+
+    The pending slot lives on the shared mount, so leaving it set would let an undeclared
+    run validate against whatever the last one produced — a strip decided against the
+    wrong schema, which deletes a part that is not this run's output.
+    """
+    _, recorder, mounted = _mount()
+    first = await _bind(mounted)
+    second = await mounted.for_run(_run_context())
+    assert isinstance(second, DiscardedOutputCapability)
+
+    stripped = await first.after_model_request(
+        _run_context(),
+        request_context=_request_context(_output_object()),
+        response=_response(TextPart(VALID_OUTPUT), _tool_call()),
+    )
+    kept = await second.after_model_request(
+        _run_context(),
+        request_context=_request_context(_output_object()),
+        response=_response(TextPart(VALID_OUTPUT), _tool_call(), run_id="run-2"),
+    )
+
+    assert _texts(stripped) == []
+    assert _texts(kept) == [VALID_OUTPUT]
+    assert [e.run_id for e in _discards(recorder)] == ["run-1"]
+
+
+async def test_react_agent_declares_the_effective_output_class() -> None:
+    """AC 5: the wiring hands the capability the class THIS run produces.
+
+    Read at the ``run()`` call, never threaded in from ``run()``'s own frame: a tool may
+    call ``switch_model`` mid-run, and the per-call override wins over the constructor's
+    ``result_type``. Patching ``run`` leaves ``for_run`` unfired, so the pending slot is
+    still readable — which is exactly the value ``for_run`` would have snapshotted.
+    """
+    agent = ReactAgent(
+        config=ReactAgentConfig(model_cfg=ModelConfig(provider="openai", model="gpt-4o")),
+        result_type=_Out,
+    )
+    declared: list[object] = []
+
+    async def _capture(**kwargs: Any) -> SimpleNamespace:
+        declared.append(agent._discarded._pending_output_type)
+        return SimpleNamespace(output="done")
+
+    with patch.object(agent._pydantic_agent, "run", side_effect=_capture):
+        await agent.run("delegate this")
+        await agent.run("and this", output_type=_Request)
+
+    assert declared == [_Out, _Request]
 
 
 # ---------------------------------------------------------------------------
@@ -478,7 +624,7 @@ async def test_text_without_tool_calls_untouched() -> None:
 
     That case is the multi-part merge (story 29-3), and this capability must not touch it.
     """
-    manager, recorder, capability = _wired()
+    _, recorder, capability = await _wired()
     response = _response(TextPart(VALID_OUTPUT), TextPart(SECOND_VALID_OUTPUT))
 
     result = await capability.after_model_request(
@@ -492,7 +638,7 @@ async def test_text_without_tool_calls_untouched() -> None:
 
 async def test_tool_calls_without_text_untouched() -> None:
     """AC 6: nothing to strip when the response is tool calls only."""
-    manager, recorder, capability = _wired()
+    _, recorder, capability = await _wired()
     call = _tool_call()
     response = _response(call)
 
@@ -527,7 +673,7 @@ async def test_response_retains_tool_call_after_strip(
     pydantic-ai's empty-response retry path is therefore unreachable from this capability,
     in every stripped case rather than in the one that happened to be written down.
     """
-    _, _, capability = _wired()
+    _, _, capability = await _wired()
     response = _response(TextPart(VALID_OUTPUT), *extra_parts, _tool_call())
 
     result = await capability.after_model_request(
@@ -547,8 +693,7 @@ async def test_response_retains_tool_call_after_strip(
 
 async def test_budget_caps_strips_within_a_run() -> None:
     """AC 8: past the budget, responses in the same run come back unchanged."""
-    manager, recorder, _ = _wired()
-    capability = DiscardedOutputCapability(context=manager, budget=2)
+    _, recorder, capability = await _wired(budget=2)
     ctx, request_context = _run_context(), _request_context(_output_object())
 
     results = [
@@ -564,26 +709,58 @@ async def test_budget_caps_strips_within_a_run() -> None:
     assert len([e for e in _discards(recorder) if not e.budget_exhausted]) == 2
 
 
-async def test_budget_resets_between_runs() -> None:
-    """AC 8: the budget is per run, not per agent — a new run id restores it in full."""
-    manager, recorder, _ = _wired()
-    capability = DiscardedOutputCapability(context=manager, budget=1)
-    ctx, request_context = _run_context(), _request_context(_output_object())
+async def test_budget_is_per_run_because_each_run_gets_its_own_instance() -> None:
+    """AC 8: a second run starts with the full budget, and cannot spend the first's.
 
-    async def strip(run_id: str) -> ModelResponse:
+    ``for_run`` is what makes this true by construction rather than by bookkeeping: the
+    counters live on the instance one run holds, so two runs interleaving cannot reset
+    each other — the lost bound that a single shared slot allowed.
+    """
+    _, recorder, mounted = _mount(budget=1)
+    first, second = await _bind(mounted), await _bind(mounted)
+    request_context = _request_context(_output_object())
+
+    async def strip(
+        capability: DiscardedOutputCapability, run_id: str
+    ) -> ModelResponse:
         return await capability.after_model_request(
-            ctx,
+            _run_context(),
             request_context=request_context,
             response=_response(TextPart(VALID_OUTPUT), _tool_call(), run_id=run_id),
         )
 
-    first, spent, second_run = await strip("run-1"), await strip("run-1"), await strip("run-2")
+    # Interleaved on purpose: run-2 strips between run-1's two responses.
+    one = await strip(first, "run-1")
+    two = await strip(second, "run-2")
+    one_spent = await strip(first, "run-1")
+    two_spent = await strip(second, "run-2")
 
-    assert _texts(first) == []
-    assert _texts(spent) == [VALID_OUTPUT]
-    assert _texts(second_run) == []
+    assert [_texts(r) for r in (one, two)] == [[], []]
+    assert [_texts(r) for r in (one_spent, two_spent)] == [[VALID_OUTPUT], [VALID_OUTPUT]]
     stripped = [e for e in _discards(recorder) if not e.budget_exhausted]
     assert [e.run_id for e in stripped] == ["run-1", "run-2"]
+
+
+async def test_the_mounted_instance_holds_no_run_state() -> None:
+    """AC 8: whatever a run spends, the object the host mounted is untouched.
+
+    The mount is shared across every run of the agent, so a counter left on it is a
+    cross-run leak by definition.
+    """
+    _, _, mounted = _mount(budget=1)
+    capability = await _bind(mounted)
+
+    for _ in range(3):
+        await capability.after_model_request(
+            _run_context(),
+            request_context=_request_context(_output_object()),
+            response=_response(TextPart(VALID_OUTPUT), _tool_call()),
+        )
+
+    assert mounted._strips == 0
+    assert mounted._exhausted is False
+    assert mounted._output_type is None
+    assert mounted._pending_output_type is None
 
 
 async def test_budget_exhaustion_is_evented() -> None:
@@ -593,8 +770,7 @@ async def test_budget_exhaustion_is_evented() -> None:
     dropped — the text stayed in the response, and reaches the stream through that
     response's own ``LlmMessageEvent``.
     """
-    manager, recorder, _ = _wired()
-    capability = DiscardedOutputCapability(context=manager, budget=1)
+    _, recorder, capability = await _wired(budget=1)
     ctx, request_context = _run_context(), _request_context(_output_object())
 
     for _ in range(3):
@@ -623,7 +799,7 @@ def test_default_budget_covers_the_recorded_run() -> None:
 
 async def test_one_event_per_stripped_response() -> None:
     """AC 9: one event per response, not per part, carrying the run id."""
-    manager, recorder, capability = _wired()
+    _, recorder, capability = await _wired()
     response = _response(TextPart(VALID_OUTPUT), TextPart(SECOND_VALID_OUTPUT), _tool_call())
 
     await capability.after_model_request(
@@ -642,7 +818,7 @@ async def test_event_content_is_in_emission_order() -> None:
     A tuple of ``str``, never a tuple of one-character strings: the recorder rejects a bare
     ``str``, and this pins that the capability hands it a list.
     """
-    manager, recorder, capability = _wired()
+    _, recorder, capability = await _wired()
     response = _response(TextPart(SECOND_VALID_OUTPUT), _tool_call(), TextPart(VALID_OUTPUT))
 
     await capability.after_model_request(
@@ -695,11 +871,13 @@ def _agent(capabilities: list[Any], scripted: list[ModelResponse]) -> Agent[None
     return agent
 
 
-def _stack(manager: ContextManager, *, strip_first: bool) -> list[Any]:
-    """The two capabilities, in the requested mount order."""
+def _stack(
+    manager: ContextManager, *, strip_first: bool
+) -> tuple[list[Any], DiscardedOutputCapability]:
+    """The two capabilities, in the requested mount order, plus the strip to declare on."""
     strip = DiscardedOutputCapability(context=manager)
     persist = EventSourcingCapability(context=manager)
-    return [strip, persist] if strip_first else [persist, strip]
+    return ([strip, persist] if strip_first else [persist, strip]), strip
 
 
 def _shape(messages: list[ModelMessage]) -> list[tuple[str, tuple[tuple[str, Any], ...]]]:
@@ -722,7 +900,9 @@ async def _run_once(*, strip_first: bool = True) -> tuple[ContextManager, _Recor
     manager = ContextManager()
     recorder = _Recorder()
     manager.subscribe(recorder)
-    agent = _agent(_stack(manager, strip_first=strip_first), [_co_emitting_response()])
+    capabilities, strip = _stack(manager, strip_first=strip_first)
+    agent = _agent(capabilities, [_co_emitting_response()])
+    strip.expect_output_type(_Out)
     await agent.run("ask the assistant to search the web")
     return manager, recorder
 
