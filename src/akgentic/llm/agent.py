@@ -286,7 +286,7 @@ class ReactAgent:
             EventSourcingCapability(context=self._context),
             self._limit_recovery,
             HealingCapability(context=self._context),
-            # Last of the internal five, and the position is free: this one's only hook is
+            # Last of the internal capabilities, and the position is free: its only hook is
             # after_model_request, which fires before the response is appended to history,
             # so nothing it does can race the persistence sweep or be re-ordered against it.
             # Placed here rather than earlier purely so the two couplings above stay adjacent

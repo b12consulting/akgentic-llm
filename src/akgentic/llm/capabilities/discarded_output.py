@@ -37,11 +37,17 @@ extra requests at a small constant, far below any request limit.
 """
 
 # JSON Schema keywords that constrain nothing — they annotate. Ignored outright.
+#
+# Membership here is a claim that the keyword cannot change the verdict, so it is not a
+# place to park anything merely unfamiliar: an ignored keyword that does affect the
+# outcome reads as "valid" and strips a part the schema would have rejected. ``$id`` is
+# the near miss and is deliberately **absent** — it re-roots ``$ref`` resolution, which
+# this module resolves only against the top-level ``$defs``, so a schema carrying one is
+# undecidable rather than ignorable.
 _ANNOTATION_KEYWORDS = frozenset(
     {
         "$comment",
         "$defs",
-        "$id",
         "$schema",
         "default",
         "deprecated",
@@ -129,10 +135,12 @@ def _matches_object(
     A keyword present but malformed is undecidable, never ignored: skipping a ``required``
     that is not a list would drop the strongest constraint in the schema and let a
     mismatched payload read as valid — a strip on doubt, in the one direction that costs
-    data.
+    data. Its *elements* are checked for the same reason and one more: a name that is not
+    a string decides nothing, and an unhashable one would raise ``TypeError`` out of a
+    hook that runs on every model response.
     """
     required = schema.get("required", [])
-    if not isinstance(required, list):
+    if not isinstance(required, list) or not all(isinstance(name, str) for name in required):
         return False
     if any(name not in value for name in required):
         return False
@@ -200,6 +208,13 @@ def _matches(value: object, schema: object, defs: dict[str, Any], depth: int) ->
         return False
 
     if "$ref" in schema:
+        # A ``$ref`` alongside another constraining keyword applies both, and this walk
+        # follows only the reference. Ignoring the sibling is the permissive direction —
+        # a payload the sibling rejects would read as valid and be stripped — so a
+        # ``$ref`` that is not alone (annotations aside) is undecidable. Annotations are
+        # still allowed beside it: that is the form pydantic actually emits.
+        if set(schema) - _ANNOTATION_KEYWORDS - {"$ref"}:
+            return False
         target = _resolve_ref(schema["$ref"], defs)
         return target is not None and _matches(value, target, defs, depth + 1)
 

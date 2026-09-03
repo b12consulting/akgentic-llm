@@ -361,6 +361,46 @@ def _schema(**keywords: Any) -> OutputObjectDefinition:
         ),
         ('{"a": 1}', _schema(**{"$ref": "#/$defs/Missing", "$defs": {}}), False),
         ('{"a": 1}', _schema(**{"$ref": "https://example.test/schema"}), False),
+        # A `$ref` applies alongside its siblings; this walk follows only the reference,
+        # so a constraining sibling is undecidable rather than ignored. Ignoring the
+        # `required` below would call a payload without "b" valid and strip it.
+        (
+            '{"a": 1}',
+            _schema(
+                **{
+                    "$ref": "#/$defs/A",
+                    "required": ["b"],
+                    "$defs": {"A": {"type": "object"}},
+                }
+            ),
+            False,
+        ),
+        # ...but an *annotation* beside a `$ref` is the form pydantic actually emits, so
+        # the rule above must not disable the common case.
+        (
+            '{"a": 1}',
+            _schema(
+                **{
+                    "$ref": "#/$defs/A",
+                    "description": "the one pydantic writes",
+                    "$defs": {"A": {"type": "object", "required": ["a"]}},
+                }
+            ),
+            True,
+        ),
+        # `$id` re-roots reference resolution, which this walk does only against the
+        # top-level `$defs` — so it is undecidable, not ignorable.
+        (
+            '{"a": 1}',
+            _schema(
+                **{
+                    "$ref": "#/$defs/A",
+                    "$id": "https://example.test/root",
+                    "$defs": {"A": {"type": "object"}},
+                }
+            ),
+            False,
+        ),
         # -- undecidable: a keyword this module does not evaluate --
         ('"abc"', _schema(type="string", pattern="^a"), False),
         ('{"a": 1}', _schema(type="object", allOf=[{"type": "object"}]), False),
@@ -405,12 +445,14 @@ def test_a_self_referential_schema_terminates_and_keeps_the_part() -> None:
         _schema(type="object", properties="not-a-mapping"),
         _schema(type="object", properties={"a": "not-a-schema"}),
         _schema(type="object", required="not-a-list", properties={"a": {"type": "integer"}}),
+        _schema(type="object", required=[["a"]]),
         _schema(type="object", additionalProperties="not-a-schema"),
     ],
     ids=[
         "properties-not-a-mapping",
         "subschema-not-a-mapping",
         "required-not-a-list",
+        "required-element-not-a-string",
         "additional-properties-not-a-schema",
     ],
 )
@@ -419,6 +461,9 @@ def test_a_malformed_schema_is_undecidable(schema: OutputObjectDefinition) -> No
 
     ``required`` here is the case worth naming: ignoring a malformed one would silently
     drop the strongest constraint in the schema and make a mismatched payload look valid.
+    Its elements are checked too — an unhashable name would otherwise raise ``TypeError``
+    out of a hook that runs on every model response, turning an audit-only capability into
+    a run-ending one.
     """
     assert _validates('{"a": 1}', schema) is False
 
