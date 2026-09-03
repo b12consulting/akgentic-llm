@@ -18,7 +18,14 @@ from akgentic.llm.event import (
 # ``from __future__ import annotations``, so dataclass field types are strings.
 # ``tuple[str, ...]`` is a tuple *of* primitives and belongs here rather than as a
 # per-event exemption: widening the set keeps the check live for every event.
-_PRIMITIVE_ANNOTATIONS = {"str", "int", "str | None", "int | None", "tuple[str, ...]"}
+_PRIMITIVE_ANNOTATIONS = {
+    "str",
+    "int",
+    "bool",
+    "str | None",
+    "int | None",
+    "tuple[str, ...]",
+}
 
 
 class TestLlmContextCompactedEvent:
@@ -118,7 +125,7 @@ class TestLlmOutputDiscardedEvent:
     def test_fields_in_order(self):
         """Fields appear in the documented order, run_id first as on every sibling."""
         names = [f.name for f in dataclasses.fields(LlmOutputDiscardedEvent)]
-        assert names == ["run_id", "discarded_content"]
+        assert names == ["run_id", "discarded_content", "budget_exhausted"]
 
     def test_constructs_with_documented_fields(self):
         """Constructs with the documented fields; run_id accepts None."""
@@ -129,6 +136,18 @@ class TestLlmOutputDiscardedEvent:
         assert event.run_id == "run-1"
         assert event.discarded_content == ("@Assistant please handle this", "trailing note")
         assert LlmOutputDiscardedEvent(run_id=None, discarded_content=()).run_id is None
+
+    def test_budget_exhausted_defaults_to_false(self):
+        """The discriminator is additive: an event built as 29-1 built one still constructs.
+
+        A drop and a budget refusal are the same concern, so they share one type; the
+        default is what makes the field non-breaking on an already-frozen dataclass and
+        on every stream already persisted.
+        """
+        assert LlmOutputDiscardedEvent("run-1", ("dropped",)).budget_exhausted is False
+        refusal = LlmOutputDiscardedEvent("run-1", (), budget_exhausted=True)
+        assert refusal.budget_exhausted is True
+        assert refusal.discarded_content == ()
 
     def test_is_frozen(self):
         """Assigning to any field raises FrozenInstanceError."""

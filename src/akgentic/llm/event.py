@@ -233,17 +233,35 @@ class LlmOutputDiscardedEvent:
     ``TextPart`` objects it came from, so it round-trips through the generic serializer
     without any pydantic-ai type.
 
+    **One event type covers both outcomes of a strip decision**, discriminated by
+    ``budget_exhausted``: either the discardable output was dropped, or it was kept
+    because the per-run strip budget is spent. A second event class was the
+    alternative; a defaulted field wins because both facts are the same concern seen
+    from the same place, so a consumer counting strips and a consumer auditing the
+    ``output_tokens`` gap each read one type rather than two, and because the field is
+    additive on a frozen dataclass -- old streams deserialise unchanged, and neither
+    ``restore_context`` nor the frontend reducer gains a name to ignore.
+
     Attributes:
         run_id: ReactAgent run ID the discard belongs to; None if unset on the
             originating response.
         discarded_content: Text of each dropped part, in the order the model emitted
             them. Emitters record a discard only when something was actually dropped,
-            so an empty tuple is not expected in a stream; the event itself does not
-            enforce that, and a consumer meeting one should treat it as a no-op.
+            so an empty tuple is not expected on a ``budget_exhausted=False`` event;
+            the event itself does not enforce that, and a consumer meeting one should
+            treat it as a no-op. It is empty by construction when ``budget_exhausted``
+            is True -- nothing was dropped there, and what the model emitted instead
+            survives in that response's own ``LlmMessageEvent``, so no diagnostic is
+            lost by leaving it out.
+        budget_exhausted: True on the one event that records the per-run strip budget
+            refusing a strip it would otherwise have made. False on every event that
+            records an actual drop. Emitted once per run: after it, that run's
+            responses pass through untested.
     """
 
     run_id: str | None
     discarded_content: tuple[str, ...]
+    budget_exhausted: bool = False
 
 
 @runtime_checkable

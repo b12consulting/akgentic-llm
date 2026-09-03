@@ -658,3 +658,43 @@ class TestContextManagerRecordDiscardedOutput:
         assert recorder.events[0].run_id is None
         # A list in becomes a tuple on the event — the persisted shape is a tuple.
         assert recorder.events[0].discarded_content == ("dropped",)
+
+
+class TestContextManagerRecordDiscardBudgetExhausted:
+    """ContextManager.record_discard_budget_exhausted() — the other outcome, same stream."""
+
+    def test_emits_the_discriminated_event_and_mutates_nothing(self) -> None:
+        """One event, flagged, with empty content; history and dedup hash untouched."""
+        manager = ContextManager()
+        sys_msg = create_system_message("sys")
+        u1 = create_user_message("u1")
+        manager.add_message(sys_msg)
+        manager.add_message(u1)
+        manager.seed_system_prompt_hash("abc")
+        recorder = EventRecorder()
+        manager.subscribe(recorder)
+
+        manager.record_discard_budget_exhausted("run-1")
+
+        assert len(recorder.events) == 1
+        event = recorder.events[0]
+        assert isinstance(event, LlmOutputDiscardedEvent)
+        assert event.run_id == "run-1"
+        assert event.budget_exhausted is True
+        # Empty because nothing was dropped: the text stayed in the response and reaches
+        # the stream through that response's own LlmMessageEvent.
+        assert event.discarded_content == ()
+        assert manager.messages == [sys_msg, u1]
+        assert manager._last_system_prompt_hash == "abc"
+
+    def test_a_drop_and_a_refusal_are_told_apart_by_the_flag(self) -> None:
+        """The two recorders share one event type and differ only in the discriminator."""
+        manager = ContextManager()
+        recorder = EventRecorder()
+        manager.subscribe(recorder)
+
+        manager.record_discarded_output("run-1", ["dropped"])
+        manager.record_discard_budget_exhausted("run-1")
+
+        assert [e.budget_exhausted for e in recorder.events] == [False, True]
+        assert recorder.events[0].run_id == recorder.events[1].run_id

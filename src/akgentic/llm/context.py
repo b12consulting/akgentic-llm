@@ -554,6 +554,27 @@ class ContextManager:
         """
         self._notify(LlmOutputDiscardedEvent(run_id, tuple(content)))
 
+    def record_discard_budget_exhausted(self, run_id: str | None) -> None:
+        """Record that a run's strip budget refused a discard it would otherwise have made.
+
+        The sibling of ``record_discarded_output`` for the other outcome of the same
+        decision, and a recorder in the same ``record_system_prompt`` family: it builds
+        the event, notifies observers, and touches no state. The emitted event carries
+        an empty ``discarded_content`` because nothing was dropped -- the text stayed in
+        the response and reaches the stream through that response's own
+        ``LlmMessageEvent``.
+
+        A separate method rather than a flag on ``record_discarded_output`` so that
+        recorder's signature stays exactly as 29-1 shipped it, and because the two calls
+        read as what they are at the call site: one records a drop, the other records a
+        refusal to drop.
+
+        Args:
+            run_id: The ReactAgent run ID whose budget is spent; ``None`` when the
+                originating response carries no run id.
+        """
+        self._notify(LlmOutputDiscardedEvent(run_id, (), budget_exhausted=True))
+
     def restore(self, messages: list[ModelMessage]) -> None:
         """Replace message history with the provided list.
 
