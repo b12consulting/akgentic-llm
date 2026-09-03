@@ -509,7 +509,7 @@ Three things the shim deliberately does **not** do:
 
 **`"graceful"` is a completeness change, never a remedy.** It was admitted so the field spells the
 full upstream vocabulary instead of a two-value subset of it. It does **not** soften the
-co-emitted-output problem that [`DiscardedOutputCapability`](#discardedoutputcapability--the-multi-part-response-reconciler)
+co-emitted-output problem that [`DiscardedOutputCapability`](#the-multi-part-response-reconciler)
 addresses: `"graceful"` takes the same discard branch as `"exhaustive"`. The capability
 nevertheless gates its strip on `"exhaustive"` alone — that is the only value that was measured,
 and extending the strip to `"graceful"` is a decision rather than a freebie.
