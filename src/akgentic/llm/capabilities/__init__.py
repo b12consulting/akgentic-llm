@@ -29,6 +29,12 @@ Four hook anchors carry everything here:
   declares no ``get_ordering()``, and mounting it before or after ``EventSourcingCapability``
   yields byte-identical history and an identical event sequence.
 
+  The anchor carries **both** of ``CallToolsNode``'s multi-part collapses, split on
+  ``response.tool_calls``: with tool calls the co-emitted output is discarded and is stripped
+  here; with none the text parts are concatenated into invalid JSON and are merged here
+  instead. Same hook, same replacement response, same order-independence — the merge folds
+  parts the graph has not yet read, so like the strip it races nothing.
+
 **Durable state only.** Persistence reads the run's durable history list — the list
 ``RunContext.messages`` points at *inside a node hook*. It never reads
 ``ModelRequestContext.messages`` mid-chain: that request copy legitimately carries other

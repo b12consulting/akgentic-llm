@@ -1,4 +1,9 @@
-"""``DiscardedOutputCapability`` — strip from a response what pydantic-ai will discard.
+"""``DiscardedOutputCapability`` — reconcile a response with the graph's one-output rule.
+
+Two collapses ``CallToolsNode`` is about to perform, split on one predicate. With tool
+calls present, the co-emitted structured output is *discarded* and this module strips it
+before history. With none, several text parts are *concatenated* into invalid JSON and this
+module merges them first.
 
 See the package docstring for the hook anchors and composition order; this module is the
 first entry on the ``after_model_request`` anchor and explains why it uses that one.
@@ -13,7 +18,13 @@ from typing import Any
 from pydantic import BaseModel, ValidationError
 from pydantic_ai import EndStrategy
 from pydantic_ai.capabilities import AbstractCapability
-from pydantic_ai.messages import ModelResponse, TextPart
+from pydantic_ai.messages import (
+    ModelResponse,
+    ModelResponsePart,
+    NativeToolCallPart,
+    SpeechPart,
+    TextPart,
+)
 from pydantic_ai.models import ModelRequestContext
 from pydantic_ai.tools import RunContext
 
@@ -36,8 +47,8 @@ extra requests at a small constant, far below any request limit.
 """
 
 
-def _validates(content: str, output_type: type[BaseModel]) -> bool:
-    """Whether ``content`` is an instance of the run's own output class.
+def _validated(content: str, output_type: type[BaseModel]) -> BaseModel | None:
+    """The instance ``content`` is under the run's own output class, or ``None``.
 
     **The verdict, not an approximation of it.** ``model_validate_json`` is the same call
     pydantic-ai's own output processor makes on the same text against the same class
@@ -62,31 +73,63 @@ def _validates(content: str, output_type: type[BaseModel]) -> bool:
     A model whose validators raise something other than ``ValidationError`` must not end
     the run from a hook that fires on every model response, so anything else is logged and
     read as "does not validate" — the direction that keeps the part.
+
+    **One parse, two readers.** The strip needs only the verdict and the merge needs the
+    instance; deriving both from this one call is what stops the two paths ever disagreeing
+    about what a text part is.
     """
     try:
-        output_type.model_validate_json(content)
+        return output_type.model_validate_json(content)
     except ValidationError:
-        return False
+        return None
     except Exception:
         logger.exception(
             "Validating a text part against %s raised; leaving the part in place",
             output_type.__name__,
         )
-        return False
-    return True
+        return None
+
+
+def _validates(content: str, output_type: type[BaseModel]) -> bool:
+    """Whether ``content`` is an instance of the run's own output class.
+
+    The boolean view of :func:`_validated`, which carries the reasoning.
+    """
+    return _validated(content, output_type) is not None
 
 
 @dataclass
 class DiscardedOutputCapability(AbstractCapability[Any]):
-    """Remove the structured output ``CallToolsNode`` is about to discard, before history.
+    """Reconcile a response with the graph's one-output rule, before history.
 
-    When a model co-emits a valid structured output *and* a tool call in one response,
+    ``CallToolsNode`` collapses a multi-part response two different ways, and the class name
+    records only the first of them — it is kept because it is public API, and renaming it is
+    a change owed its own decision rather than a side effect of this one.
+
+    **With tool calls: the strip.** When a model co-emits a valid structured output *and* a
+    tool call in one response,
     ``end_strategy='exhaustive'`` drops the output, runs the tool and loops — but appends
     the response to ``message_history`` verbatim. The next request therefore shows the
     model its own words ("I've asked @Assistant to research…"), it concludes it already
     delegated, and it returns an empty output that routes nothing. The dropped message
     becomes a permanent one, because a model will not re-derive an intent it believes it
     has already acted on. Stripping the text before the append is what lets it re-derive.
+
+    **With none: the merge.** The same node accumulates every text part by string
+    concatenation — ``text += part.content``, run unconditionally for every part, under
+    every ``end_strategy`` — and hands the result to the text processor. A model that emits
+    two complete outputs as two parts therefore produces ``{...}{...}``, which is not JSON,
+    and the run spends output retries recovering from a concatenation it did not perform.
+    Folding the parts into one output before the graph sees them removes the retry. The fold
+    itself belongs to the schema, which declares it as a ``merge`` classmethod over the
+    validated instances; a class that declares none is left entirely alone and keeps
+    today's retry path.
+
+    **The split is ``response.tool_calls`` and nothing else,** so no response can take both
+    paths, and only the strip is gated on ``end_strategy`` and the budget. The concatenation
+    the merge prevents is not strategy-conditional — the ``end_strategy == 'early'`` branch
+    upstream sits *inside* ``if tool_calls:`` — and a merge buys no extra model request for a
+    budget to bound.
 
     **The anchor is ``after_model_request``, and that is the whole design.** The hook runs
     between the model response and ``ModelRequestNode._append_response``, so the response
@@ -217,17 +260,43 @@ class DiscardedOutputCapability(AbstractCapability[Any]):
         request_context: ModelRequestContext,
         response: ModelResponse,
     ) -> ModelResponse:
+        """Reconcile ``response`` with the collapse the graph is about to perform.
+
+        A response carrying tool calls loses its co-emitted output to the discard branch, so
+        it takes the strip; a response carrying none has its text parts concatenated, so it
+        takes the merge. The split is ``response.tool_calls``, which is what makes the two
+        mutually exclusive by construction rather than by their preconditions happening not
+        to overlap.
+
+        Both are no-ops unless the host declared a ``BaseModel`` output class for this run.
+        ``ReactAgent.result_type`` defaults to ``str``, and a text part is not an instance of
+        anything then — reach either path without this gate and it fires on ordinary prose.
+        """
+        output_type = self._output_type
+        if output_type is None:
+            return response
+        if response.tool_calls:
+            return self._strip(request_context, response, output_type)
+        return self._merge(request_context, response, output_type)
+
+    def _strip(
+        self,
+        request_context: ModelRequestContext,
+        response: ModelResponse,
+        output_type: type[BaseModel],
+    ) -> ModelResponse:
         """Return ``response`` with the about-to-be-discarded output removed, or unchanged.
 
-        Unchanged unless every gate passes: the strategy is ``'exhaustive'``, the host
-        declared an output class for this run, this run's budget is unspent, the response
-        carries at least one ``ToolCallPart``, the request declares an output schema, and
-        at least one ``TextPart`` validates against the class.
+        Unchanged unless every gate passes: the strategy is ``'exhaustive'``, this run's
+        budget is unspent, the request declares an output schema, and at least one
+        ``TextPart`` validates against the class. A tool call is already a precondition — it
+        is what selected this path — so a stripped response always retains one, which keeps
+        pydantic-ai's empty-response retry path unreachable from here.
         """
-        if self.end_strategy != "exhaustive" or self._output_type is None or self._exhausted:
+        if self.end_strategy != "exhaustive" or self._exhausted:
             return response
 
-        discardable = self._discardable(request_context, response, self._output_type)
+        discardable = self._discardable(request_context, response, output_type)
         if not discardable:
             return response
 
@@ -255,14 +324,12 @@ class DiscardedOutputCapability(AbstractCapability[Any]):
     ) -> list[TextPart]:
         """The text parts this response would lose to the discard branch, in emission order.
 
-        Empty unless the response carries a tool call *and* the request declared an output
-        schema. Text with no tool call is not discarded by the graph at all — that case is
-        the multi-part merge, and this capability must leave it alone — and a request with
-        no ``output_object`` (``text`` mode, or ``tool``-mode output) puts the output
-        somewhere other than a text part, so no text part can be one.
+        The tool call is a precondition of this path rather than a gate here:
+        ``after_model_request`` split on it, and a response without one is the merge's. What
+        remains to check is the request — with no ``output_object`` (``text`` mode, or
+        ``tool``-mode output) the structured output lives somewhere other than a text part,
+        so no text part can be one.
         """
-        if not response.tool_calls:
-            return []
         if request_context.model_request_parameters.output_object is None:
             return []
         return [
@@ -286,3 +353,132 @@ class DiscardedOutputCapability(AbstractCapability[Any]):
         return replace(
             response, parts=[part for part in response.parts if id(part) not in dropped_ids]
         )
+
+    def _merge(
+        self,
+        request_context: ModelRequestContext,
+        response: ModelResponse,
+        output_type: type[BaseModel],
+    ) -> ModelResponse:
+        """Return ``response`` with its text parts folded into one output, or unchanged.
+
+        Neither budgeted nor strategy-gated, and both omissions are deliberate — see the
+        class docstring. The ``debug`` line is the proportionate record of what was folded:
+        the merged output is what is evented, so nothing is lost unless a schema's own
+        ``merge`` is lossy, and that count is what would show it.
+        """
+        outputs = self._mergeable(request_context, response, output_type)
+        if not outputs:
+            return response
+
+        content = self._merged_content(outputs, output_type)
+        if content is None:
+            return response
+
+        logger.debug(
+            "Merged %d text parts into one %s for run %s",
+            len(outputs),
+            output_type.__name__,
+            response.run_id,
+        )
+        return self._with_merged(response, content)
+
+    @staticmethod
+    def _mergeable(
+        request_context: ModelRequestContext,
+        response: ModelResponse,
+        output_type: type[BaseModel],
+    ) -> list[BaseModel]:
+        """The instances this response's text parts are, in emission order, or empty.
+
+        Empty — a no-op — unless every gate passes:
+
+        - **the request declares an output schema**, or the output does not live in a text
+          part at all, exactly as on the strip path;
+        - **no part feeds or resets the same accumulation.** ``SpeechPart`` adds its
+          transcript to the very same ``text`` string and ``NativeToolCallPart`` clears it,
+          and neither is a ``ToolCallPart``, so ``response.tool_calls`` does not see either.
+          Merging beside one would leave the merged object concatenated with another
+          contribution — the JSON stays invalid — and the original parts destroyed for
+          nothing;
+        - **at least two text parts.** One is never concatenated, so re-serialising it would
+          change the record for no gain;
+        - **the class declares a callable ``merge``.** That is the entire protocol —
+          ``merge(outputs: Sequence[Self]) -> Self`` — with no name check, no import and no
+          ``Protocol`` naming a sibling package's type. A class declaring none keeps today's
+          retry path, which is the production case until ``akgentic-agent`` grows one;
+        - **every text part validates.** One that does not means "leave it to pydantic-ai's
+          output retry": a partial merge would silently drop whatever failed to parse, which
+          is data loss dressed as a fix. All or nothing is the requirement, not a
+          simplification of it.
+        """
+        if request_context.model_request_parameters.output_object is None:
+            return []
+        if any(isinstance(part, SpeechPart | NativeToolCallPart) for part in response.parts):
+            return []
+        if not callable(getattr(output_type, "merge", None)):
+            return []
+
+        contents = [part.content for part in response.parts if isinstance(part, TextPart)]
+        if len(contents) < 2:
+            return []
+
+        validated = [_validated(content, output_type) for content in contents]
+        if not all(instance is not None for instance in validated):
+            return []
+        return [instance for instance in validated if instance is not None]
+
+    @staticmethod
+    def _merged_content(outputs: list[BaseModel], output_type: type[BaseModel]) -> str | None:
+        """The text of ``output_type.merge(outputs)``, or ``None`` to leave the response be.
+
+        ``merge`` is the schema's own code, called from a hook that fires on **every** model
+        response, so neither a raise nor a wrong-typed result may end the run: both fall back
+        to what happens today, which is pydantic-ai's output retry.
+
+        **Serialised by alias**, because this text is validated straight back through the
+        same class by pydantic-ai's own output processor: a field carrying an alias, dumped
+        by field name, produces JSON the class itself refuses — failing the very validation
+        this capability exists to make succeed. Without aliases the two are identical.
+
+        ``merge`` is fetched with ``getattr`` rather than named on the type: it is not on
+        ``BaseModel``, and the duck-typed lookup is the protocol.
+        """
+        try:
+            merged = getattr(output_type, "merge")(outputs)  # noqa: B009
+        except Exception:
+            logger.exception(
+                "%s.merge raised over %d outputs; leaving the response unchanged",
+                output_type.__name__,
+                len(outputs),
+            )
+            return None
+
+        if not isinstance(merged, output_type):
+            logger.warning(
+                "%s.merge returned %s, not an instance of the run's output class; "
+                "leaving the response unchanged",
+                output_type.__name__,
+                type(merged).__name__,
+            )
+            return None
+        return merged.model_dump_json(by_alias=True)
+
+    @staticmethod
+    def _with_merged(response: ModelResponse, content: str) -> ModelResponse:
+        """A copy of ``response`` whose text parts are one part carrying ``content``.
+
+        The merged part sits at the **first** text part's position and is derived from that
+        part by copy-and-override, so its ``id`` — and whatever field upstream adds next —
+        survives rather than being re-enumerated here and silently dropped. Every other part
+        is carried through in order and by identity, thinking parts and files included.
+        """
+        merged: ModelResponsePart | None = None
+        parts: list[ModelResponsePart] = []
+        for part in response.parts:
+            if not isinstance(part, TextPart):
+                parts.append(part)
+            elif merged is None:
+                merged = replace(part, content=content)
+                parts.append(merged)
+        return replace(response, parts=parts)
