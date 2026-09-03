@@ -7,10 +7,10 @@ first entry on the ``after_model_request`` anchor and explains why it uses that 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field, is_dataclass, replace
-from typing import Any, TypeGuard, is_typeddict
+from dataclasses import dataclass, field, replace
+from typing import Any
 
-from pydantic import BaseModel, TypeAdapter, ValidationError
+from pydantic import BaseModel, ValidationError
 from pydantic_ai import EndStrategy
 from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.messages import ModelResponse, TextPart
@@ -36,71 +36,42 @@ extra requests at a small constant, far below any request limit.
 """
 
 
-def _is_decidable(output_type: object) -> TypeGuard[type[Any]]:
-    """Whether validating ``output_type`` here answers the question the graph asks.
+def _validates(content: str, output_type: type[BaseModel]) -> bool:
+    """Whether ``content`` is an instance of the run's own output class.
 
-    It does for a pydantic model, a dataclass and a ``TypedDict``, and for nothing else.
-    That line is not a preference — it is upstream's, drawn in ``_output.py`` where
-    ``ObjectOutputProcessor`` builds the validator that decides the real output. A
-    *model-like* type generates ``{"type": "object"}`` and is validated as itself; every
-    other type is wrapped in a ``{"response": ...}`` envelope and validated as
-    ``TypedDict{'response': T | Json[T]}``. So for a bare ``str``, ``int``, ``list[X]`` or
-    scalar union, the text the model actually emits is the envelope and the naked type is
-    a *different question* — one that answers True on payloads the graph never treated as
-    output. ``TypeAdapter(str).validate_json`` accepting every quoted string is the sharp
-    end of that, and a wrong True here deletes the model's narration.
-
-    Mirrored rather than imported: ``pydantic_ai._utils.is_model_like`` is private and this
-    package's CI floats across pydantic-ai minors. If upstream ever stops enveloping, this
-    goes from correct to merely conservative — a no-op, never a bad strip.
-    """
-    return isinstance(output_type, type) and (
-        issubclass(output_type, BaseModel)
-        or is_dataclass(output_type)
-        or is_typeddict(output_type)
-        or getattr(output_type, "__is_model_like__", False)
-    )
-
-
-def _validates(content: str, validator: TypeAdapter[Any]) -> bool:
-    """Whether ``content`` is an instance of the run's own output type.
-
-    **The verdict, not an approximation of it.** ``TypeAdapter.validate_json`` is the same
-    call pydantic-ai's own output processor makes on the same text against the same type
-    (``_output.py`` — ``self.validator.validate_json(...)``, over a ``TypeAdapter`` built
-    from the output type), so "this text is the run's structured output" is answered by the
-    library that decides it rather than by a re-implementation of JSON Schema. A
-    ``TypeAdapter`` and not ``model_validate_json``: the output type is only *usually* a
-    ``BaseModel`` — a dataclass and a ``TypedDict`` are equally legal and have no such
-    method, and pydantic-ai validates all three the same way.
+    **The verdict, not an approximation of it.** ``model_validate_json`` is the same call
+    pydantic-ai's own output processor makes on the same text against the same class
+    (``_output.py`` — ``self.validator.validate_json(...)``), so "this text is the run's
+    structured output" is answered by the library that decides it rather than by a
+    re-implementation of JSON Schema. Prose and truncated JSON fail on the parse pydantic
+    performs first, so there is no separate parse gate to keep in step.
 
     **No ``strict=True``.** ``NativeOutput(output_type, strict=True)`` in ``providers.py``
-    sets ``OutputObjectDefinition.strict``, which asks the *provider* for schema-constrained
-    decoding. It is a different axis from pydantic's ``strict=``, which forbids coercion,
-    and it never reaches the validator: what pydantic-ai runs is
-    ``validator.validate_json(data, ...)`` with no strict argument — lax. Validating
-    strictly here would make this capability stricter than the run it is shadowing and cut
-    its hit rate on exactly the coercion-heavy payloads models emit (``"41"`` for an ``int``
-    field), leaving them in history. This is the one knob that changes behaviour, so it is
-    stated rather than left to be "fixed" later.
+    sets ``OutputObjectDefinition.strict``, a JSON-Schema strictness hint carried to the
+    provider; it is not pydantic's validation mode and never reaches the validator that
+    decides the output. Validating strictly here would reject payloads pydantic-ai accepts
+    — a numeric string for an ``int`` field being the everyday case — so those parts would
+    survive a discard the graph performs anyway, which is the defect this capability
+    exists to fix.
 
-    **Known gap: markdown fences.** pydantic-ai runs ``strip_markdown_fences`` over text
-    output *before* validating (``_output.py:934``); this does not. A prompted-mode model
-    that fences its delegation therefore emits something pydantic-ai accepts and discards,
-    and this keeps. "Matches exactly what pydantic-ai accepts" is not literally true for
-    that case. Left deliberately: the helper is private, and the gap is under-strip, which
-    costs the fix rather than data.
+    **No markdown-fence stripping.** pydantic-ai runs ``strip_markdown_fences`` over text
+    output before validating, so a fenced payload it would discard is kept here instead.
+    That helper is private to pydantic-ai, and the divergence falls in the safe direction:
+    a kept part costs the fix, never data.
 
-    A type whose validators raise something other than ``ValidationError`` must not end the
-    run from a hook that fires on every model response, so anything else is logged and read
-    as "does not validate" — the direction that keeps the part.
+    A model whose validators raise something other than ``ValidationError`` must not end
+    the run from a hook that fires on every model response, so anything else is logged and
+    read as "does not validate" — the direction that keeps the part.
     """
     try:
-        validator.validate_json(content)
+        output_type.model_validate_json(content)
     except ValidationError:
         return False
     except Exception:
-        logger.exception("Validating a text part raised; leaving the part in place")
+        logger.exception(
+            "Validating a text part against %s raised; leaving the part in place",
+            output_type.__name__,
+        )
         return False
     return True
 
@@ -128,18 +99,16 @@ class DiscardedOutputCapability(AbstractCapability[Any]):
     hook and no ``wrap_run``; mounting it anywhere in the stack gives the same history and
     the same event sequence.
 
-    **It strips only what validates against the run's own output type, and only where the
-    request put the output in a text part.** Never on ``isinstance(part, TextPart)``: a
-    tool call sitting beside plain narration is ordinary, and stripping on the part type
-    alone would silently delete the model's reasoning. Parse failure, type mismatch, and a
-    request with no ``output_object`` all mean "keep" — see ``_discardable`` for why that
-    last gate is the one that matters most.
+    **It strips only what validates against the run's own output class.** Never on
+    ``isinstance(part, TextPart)``: a tool call sitting beside plain narration is
+    ordinary, and stripping on the type alone would silently delete the model's
+    reasoning. Parse failure and schema mismatch both mean "keep".
 
-    **The host declares the output type, once per run.** ``expect_output_type`` is called
-    with the type *this* run will produce, immediately before the run starts; ``for_run``
-    builds a validator from it onto the per-run instance and clears the slot. A host that
+    **The host declares the output class, once per run.** ``expect_output_type`` is called
+    with the class *this* run will produce, immediately before the run starts;
+    ``for_run`` snapshots it onto the per-run instance and clears the slot. A host that
     declares nothing — a bare ``Agent`` with this capability mounted by hand — gets a
-    no-op, which is the same fail-closed direction as an unparseable part. The type is
+    no-op, which is the same fail-closed direction as an unparseable part. The class is
     never guessed from ``ModelRequestContext``: what the request carries is a JSON Schema,
     and deciding conformance against a schema by hand is exactly what this capability used
     to do and stopped doing.
@@ -168,19 +137,17 @@ class DiscardedOutputCapability(AbstractCapability[Any]):
     budget: int = DEFAULT_STRIP_BUDGET
     """Strips allowed per run. See ``DEFAULT_STRIP_BUDGET`` for why three."""
 
-    _pending_output_type: type[Any] | None = field(default=None, init=False)
-    """The type the next run will produce, parked here by ``expect_output_type``.
+    _pending_output_type: type[BaseModel] | None = field(default=None, init=False)
+    """The class the next run will produce, parked here by ``expect_output_type``.
 
     Lives on the *shared* instance because that is the only object the host holds; it is
     read and cleared by ``for_run`` and never by a hook, so no hook ever consults a slot
     another run can be writing.
     """
 
-    _validator: TypeAdapter[Any] | None = field(default=None, init=False)
-    """This run's validator, built by ``for_run`` from the declared type. ``None`` on the
-    shared instance and on any run whose host declared nothing decidable — both no-ops.
-    Built once per run rather than per response: constructing a ``TypeAdapter`` compiles a
-    schema, and this hook fires on every model request."""
+    _output_type: type[BaseModel] | None = field(default=None, init=False)
+    """This run's output class, snapshotted by ``for_run``. ``None`` on the shared
+    instance and on any run whose host declared nothing — both no-ops."""
 
     _strips: int = field(default=0, init=False)
     """Strips already made in this run. Per-run because ``for_run`` hands each run its own
@@ -191,72 +158,57 @@ class DiscardedOutputCapability(AbstractCapability[Any]):
     remaining responses pass through without the budget being tested again."""
 
     def expect_output_type(self, output_type: object) -> None:
-        """Declare the type the next run's structured output will be validated against.
+        """Declare the class the next run's structured output will be validated against.
 
         Called by the host immediately before it starts the run, and at that point
         deliberately: a value resolved a frame earlier goes stale when a tool calls
         ``switch_model`` mid-run, which is the same reason ``ReactAgent`` resolves the
         model and the effective output type at the ``run()`` call itself.
 
-        A type ``_is_decidable`` refuses parks ``None`` and makes the run a no-op — ``str``
-        (this package's default output type) and ``None`` being the ordinary cases, since a
-        run with no structured output has nothing for a part to be an instance of.
+        Anything that is not a ``BaseModel`` subclass parks ``None`` and makes the run a
+        no-op. ``str`` and ``None`` are the ordinary cases — a run with no structured
+        output has nothing for a part to be an instance of. The others are refused on
+        purpose: pydantic-ai wraps a bare output type in a ``{"response": ...}`` envelope
+        before the model ever sees it, so validating the naked type here would answer a
+        different question than the graph does, and in the direction that strips.
 
         Args:
             output_type: The run's effective output type, wrapper-free.
         """
-        self._pending_output_type = output_type if _is_decidable(output_type) else None
+        self._pending_output_type = (
+            output_type
+            if isinstance(output_type, type) and issubclass(output_type, BaseModel)
+            else None
+        )
 
     async def for_run(self, ctx: RunContext[Any]) -> AbstractCapability[Any]:
-        """Hand this run its own instance, carrying its validator and its own budget.
+        """Hand this run its own instance, carrying its output class and its own budget.
 
         Upstream's sanctioned per-run isolation, and load-bearing twice over. The budget
         was previously a single slot on the shared instance, so interleaved runs reset
-        each other's counters and the bound was lost; the output type on a shared slot
+        each other's counters and the bound was lost; the output class on a shared slot
         would be worse — a run could validate against another run's schema and strip a
         part that is not its output at all. Neither is reachable once the state lives on
         the instance only this run holds.
 
         Clearing the pending slot is what makes an undeclared run a no-op rather than a
-        run validated against whatever the previous one declared. Building the validator
-        here rather than in the hook keeps schema compilation off the per-response path and
-        makes a type pydantic cannot build an adapter for a no-op for the whole run instead
-        of a log line per model request.
+        run validated against whatever the previous one declared.
 
         Upstream notes that under durable execution per-run state must be derivable from
-        ``ctx``. A captured type does not satisfy that — ``RunContext`` carries no output
-        schema — and this package does not use durable execution. It is a constraint on
-        supporting it later, not a defect today: a durable host would have to declare the
-        type through its own serialised state.
+        ``ctx``. It is not derivable here — ``RunContext`` carries no output schema — and
+        this package does not use durable execution; a durable host would have to declare
+        the class through its own serialised state.
 
         Args:
-            ctx: This run's context. Unread — the type comes from the host.
+            ctx: This run's context. Unread — the class comes from the host.
 
         Returns:
             A copy of this capability bound to this run.
         """
         bound = replace(self)
-        bound._validator = self._build_validator(self._pending_output_type)
+        bound._output_type = self._pending_output_type
         self._pending_output_type = None
         return bound
-
-    @staticmethod
-    def _build_validator(output_type: type[Any] | None) -> TypeAdapter[Any] | None:
-        """A validator for ``output_type``, or None when there is nothing to validate.
-
-        A type pydantic cannot build an adapter for is a no-op rather than a run-ending
-        error: this is an audit-only capability and must never be the reason a run fails.
-        """
-        if output_type is None:
-            return None
-        try:
-            return TypeAdapter(output_type)
-        except Exception:
-            logger.exception(
-                "Could not build a validator for %s; leaving this run's output in place",
-                output_type,
-            )
-            return None
 
     async def after_model_request(
         self,
@@ -268,14 +220,14 @@ class DiscardedOutputCapability(AbstractCapability[Any]):
         """Return ``response`` with the about-to-be-discarded output removed, or unchanged.
 
         Unchanged unless every gate passes: the strategy is ``'exhaustive'``, the host
-        declared a decidable output type for this run, this run's budget is unspent, the
-        response carries at least one ``ToolCallPart``, the request declares an output
-        schema, and at least one ``TextPart`` validates against the type.
+        declared an output class for this run, this run's budget is unspent, the response
+        carries at least one ``ToolCallPart``, the request declares an output schema, and
+        at least one ``TextPart`` validates against the class.
         """
-        if self.end_strategy != "exhaustive" or self._validator is None or self._exhausted:
+        if self.end_strategy != "exhaustive" or self._output_type is None or self._exhausted:
             return response
 
-        discardable = self._discardable(request_context, response, self._validator)
+        discardable = self._discardable(request_context, response, self._output_type)
         if not discardable:
             return response
 
@@ -299,23 +251,15 @@ class DiscardedOutputCapability(AbstractCapability[Any]):
     def _discardable(
         request_context: ModelRequestContext,
         response: ModelResponse,
-        validator: TypeAdapter[Any],
+        output_type: type[BaseModel],
     ) -> list[TextPart]:
         """The text parts this response would lose to the discard branch, in emission order.
 
         Empty unless the response carries a tool call *and* the request declared an output
         schema. Text with no tool call is not discarded by the graph at all — that case is
-        the multi-part merge, and this capability must leave it alone.
-
-        **The ``output_object`` gate is not a formality — it is the load-bearing one.** A
-        request with no ``output_object`` is in ``text`` mode (no structured output at all)
-        or ``tool`` mode (the output arrives in a tool call), so a text part beside the call
-        is narration whatever it happens to parse as. Dropping this gate would not weaken
-        the capability, it would invert it: ``str`` is this package's default output type,
-        and every quoted string validates against it, so the capability would silently
-        become "delete any co-emitted string" — a data-deletion regression worse than
-        anything the schema walk could do. It is never relaxed to an ``isinstance`` check
-        to compensate.
+        the multi-part merge, and this capability must leave it alone — and a request with
+        no ``output_object`` (``text`` mode, or ``tool``-mode output) puts the output
+        somewhere other than a text part, so no text part can be one.
         """
         if not response.tool_calls:
             return []
@@ -324,7 +268,7 @@ class DiscardedOutputCapability(AbstractCapability[Any]):
         return [
             part
             for part in response.parts
-            if isinstance(part, TextPart) and _validates(part.content, validator)
+            if isinstance(part, TextPart) and _validates(part.content, output_type)
         ]
 
     @staticmethod
