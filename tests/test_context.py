@@ -30,6 +30,7 @@ ContextObserver = context_module.ContextObserver
 LlmMessageEvent = context_module.LlmMessageEvent
 LlmContextCompactedEvent = context_module.LlmContextCompactedEvent
 LlmContextClearedEvent = context_module.LlmContextClearedEvent
+LlmOutputDiscardedEvent = context_module.LlmOutputDiscardedEvent
 
 
 class EventRecorder:
@@ -618,3 +619,42 @@ class TestContextManagerClearContext:
         assert manager.clear_context() == 0
         cleared = [e for e in recorder.events if isinstance(e, LlmContextClearedEvent)]
         assert cleared[0].cleared_message_count == 0
+
+
+class TestContextManagerRecordDiscardedOutput:
+    """ContextManager.record_discarded_output() — emits without mutating (AC 8)."""
+
+    def test_emits_one_event_and_leaves_history_untouched(self) -> None:
+        """Emits exactly one event carrying the given values; messages are unchanged."""
+        manager = ContextManager()
+        sys_msg = create_system_message("sys")
+        u1 = create_user_message("u1")
+        manager.add_message(sys_msg)
+        manager.add_message(u1)
+        manager.seed_system_prompt_hash("abc")  # a recorded rendering, must survive
+        recorder = EventRecorder()
+        manager.subscribe(recorder)
+
+        manager.record_discarded_output("run-1", ("@Assistant handle this", "trailing note"))
+
+        discarded = [e for e in recorder.events if isinstance(e, LlmOutputDiscardedEvent)]
+        assert len(discarded) == 1
+        assert discarded[0].run_id == "run-1"
+        assert discarded[0].discarded_content == ("@Assistant handle this", "trailing note")
+        # Unlike compact() and clear_context(), this method mutates nothing. The
+        # history is populated above so "unchanged" is not vacuously true.
+        assert manager.messages == [sys_msg, u1]
+        assert manager._last_system_prompt_hash == "abc"
+
+    def test_emits_nothing_else_and_accepts_a_null_run_id(self) -> None:
+        """The call emits that one event and no other; run_id may be None."""
+        manager = ContextManager()
+        recorder = EventRecorder()
+        manager.subscribe(recorder)
+
+        manager.record_discarded_output(None, ["dropped"])
+
+        assert len(recorder.events) == 1
+        assert recorder.events[0].run_id is None
+        # A list in becomes a tuple on the event — the persisted shape is a tuple.
+        assert recorder.events[0].discarded_content == ("dropped",)

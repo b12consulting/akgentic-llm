@@ -625,7 +625,21 @@ class RuntimeConfig(BaseModel):
             (timeout and retry settings)
 
     Tool Execution Strategies:
-        - 'early': Stops after first successful result (fast path)
+        The three values are exactly pydantic-ai's ``EndStrategy`` vocabulary. akgentic's
+        default is 'exhaustive' and is deliberately not pydantic-ai's own default
+        ('graceful'): ReactAgent passes end_strategy explicitly on every construction, so
+        the upstream default never applies here.
+
+        - 'early': Stops after first successful result (fast path). Output tools run in
+          emission order and the run ends at the first one that succeeds; function tools
+          are not executed. If every output tool fails, function tools run so the model can
+          correct on the next round.
+        - 'graceful': Tools run in the order the model emitted them -- function tools that
+          precede an output tool complete before it. Output tools run in order and the first
+          success wins; subsequent output tools are skipped (their side effects don't run).
+          The same "retry-wins" rule described below for 'exhaustive' applies: a function
+          tool raising ModelRetry suppresses the output result and surfaces the retry to the
+          model instead.
         - 'exhaustive': Executes all tool calls even when result available (complete data
           gathering). Under pydantic-ai v2, this strategy also applies a "retry-wins" rule: if a
           function tool call in the same round as an already-successful output call
@@ -661,9 +675,9 @@ class RuntimeConfig(BaseModel):
         description="Number of retry attempts for tool call failures and output validation errors",
     )
 
-    end_strategy: Literal["early", "exhaustive"] = Field(
+    end_strategy: Literal["early", "graceful", "exhaustive"] = Field(
         default="exhaustive",
-        description="Tool execution strategy: 'early' stops after first result, 'exhaustive' runs all tools",  # noqa: E501
+        description="Tool execution strategy: 'early' stops at the first successful output and skips function tools, 'graceful' runs tools in emission order and lets the first successful output win, 'exhaustive' runs every tool",  # noqa: E501
     )
 
     parallel_tool_calls: bool = Field(

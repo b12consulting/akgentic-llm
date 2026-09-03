@@ -78,6 +78,7 @@ from .event import (
     LlmContextClearedEvent,
     LlmContextCompactedEvent,
     LlmMessageEvent,
+    LlmOutputDiscardedEvent,
     LlmSystemPromptEvent,
     LlmUsageEvent,
     SystemPromptPartSnapshot,
@@ -140,6 +141,7 @@ __all__ = [
     # Compaction
     "LlmContextCompactedEvent",
     "LlmContextClearedEvent",
+    "LlmOutputDiscardedEvent",
     "CompactionStrategy",
     "CompactionResult",
     "COMPACTION_STRATEGIES",

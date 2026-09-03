@@ -1,4 +1,4 @@
-"""Sibling-free shape tests for the context-compaction events (AC 5, 6, 7).
+"""Sibling-free shape tests for the context and output events (AC 5, 6, 7).
 
 Imports only ``dataclasses``, ``pytest``, and ``akgentic.llm.event`` — no akgentic
 sibling (not even ``akgentic.core``) and no ``pydantic_ai.messages.ModelMessage`` (NFR1).
@@ -8,11 +8,17 @@ import dataclasses
 
 import pytest
 
-from akgentic.llm.event import LlmContextClearedEvent, LlmContextCompactedEvent
+from akgentic.llm.event import (
+    LlmContextClearedEvent,
+    LlmContextCompactedEvent,
+    LlmOutputDiscardedEvent,
+)
 
-# Primitive annotation strings permitted on the compaction events. event.py uses
+# Primitive annotation strings permitted on these events. event.py uses
 # ``from __future__ import annotations``, so dataclass field types are strings.
-_PRIMITIVE_ANNOTATIONS = {"str", "int", "str | None", "int | None"}
+# ``tuple[str, ...]`` is a tuple *of* primitives and belongs here rather than as a
+# per-event exemption: widening the set keeps the check live for every event.
+_PRIMITIVE_ANNOTATIONS = {"str", "int", "str | None", "int | None", "tuple[str, ...]"}
 
 
 class TestLlmContextCompactedEvent:
@@ -103,4 +109,38 @@ class TestLlmContextClearedEvent:
         """Every field annotation is a primitive — no ModelMessage / sibling type."""
         for field in dataclasses.fields(LlmContextClearedEvent):
             assert "ModelMessage" not in str(field.type)
+            assert field.type in _PRIMITIVE_ANNOTATIONS
+
+
+class TestLlmOutputDiscardedEvent:
+    """LlmOutputDiscardedEvent shape — AC 6, 7."""
+
+    def test_fields_in_order(self):
+        """Fields appear in the documented order, run_id first as on every sibling."""
+        names = [f.name for f in dataclasses.fields(LlmOutputDiscardedEvent)]
+        assert names == ["run_id", "discarded_content"]
+
+    def test_constructs_with_documented_fields(self):
+        """Constructs with the documented fields; run_id accepts None."""
+        event = LlmOutputDiscardedEvent(
+            run_id="run-1",
+            discarded_content=("@Assistant please handle this", "trailing note"),
+        )
+        assert event.run_id == "run-1"
+        assert event.discarded_content == ("@Assistant please handle this", "trailing note")
+        assert LlmOutputDiscardedEvent(run_id=None, discarded_content=()).run_id is None
+
+    def test_is_frozen(self):
+        """Assigning to any field raises FrozenInstanceError."""
+        event = LlmOutputDiscardedEvent(run_id="run-1", discarded_content=("dropped",))
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            event.discarded_content = ("mutated",)  # type: ignore[misc]
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            event.run_id = "run-2"  # type: ignore[misc]
+
+    def test_annotations_are_primitive_only(self):
+        """No pydantic-ai type in the shape: the event carries text, never parts."""
+        for field in dataclasses.fields(LlmOutputDiscardedEvent):
+            assert "ModelMessage" not in str(field.type)
+            assert "TextPart" not in str(field.type)
             assert field.type in _PRIMITIVE_ANNOTATIONS

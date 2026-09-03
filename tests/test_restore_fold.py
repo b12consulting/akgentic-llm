@@ -22,7 +22,7 @@ from typing import Any
 from pydantic_ai.messages import ModelMessage, ModelRequest, UserPromptPart
 
 from akgentic.llm import ContextManager, ModelConfig, ReactAgent, ReactAgentConfig
-from akgentic.llm.event import LlmContextCompactedEvent
+from akgentic.llm.event import LlmContextCompactedEvent, LlmMessageEvent, LlmOutputDiscardedEvent
 
 
 class _Recorder:
@@ -146,6 +146,50 @@ def test_cleared_event_rebuilds_identical_post_clear_context() -> None:
     # Only the post-clear message survives in both paths (same object instance).
     assert restored == [m3]
     assert _shape(restored) == _shape(live.messages)
+
+
+def _splice_discards(stream: list[SimpleNamespace]) -> list[SimpleNamespace]:
+    """Interleave an ``LlmOutputDiscardedEvent`` after every ``LlmMessageEvent``."""
+    spliced: list[SimpleNamespace] = []
+    for i, wrapper in enumerate(stream):
+        spliced.append(wrapper)
+        if isinstance(wrapper.event, LlmMessageEvent):
+            discarded = LlmOutputDiscardedEvent(
+                run_id=f"run-{i}", discarded_content=(f"dropped text {i}",)
+            )
+            spliced.append(SimpleNamespace(event=discarded))
+    return spliced
+
+
+def test_discarded_output_event_is_ignored_by_restore() -> None:
+    """AC 9: the discard event is audit-only — splicing it in changes nothing on restore.
+
+    ``restore_context``'s ``if/elif`` chain already ignores payloads it does not
+    recognise, so this holds by construction. The spec exists so a later contributor
+    cannot "helpfully" add a fold branch for the event without turning a test red.
+    """
+    live = ContextManager()
+    recorder = _Recorder()
+    live.subscribe(recorder)
+
+    m1, m2, m3 = _user("m1"), _user("m2"), _user("m3")
+    for m in (m1, m2, m3):
+        live.add_message(m)
+    live.compact(_compacted("SUMMARY-A", replaced=2))  # folds m1+m2
+    m4 = _user("m4")
+    live.add_message(m4)
+
+    baseline = _fresh_agent()
+    baseline.restore_context(_stream(recorder))
+
+    with_discards = _fresh_agent()
+    with_discards.restore_context(_splice_discards(_stream(recorder)))
+
+    assert _shape(with_discards.context.messages) == _shape(baseline.context.messages)
+    assert _shape(with_discards.context.messages) == _shape(live.messages)
+    # Retained originals are still the very same objects — the event folded nothing.
+    assert with_discards.context.messages[1] is m3
+    assert with_discards.context.messages[2] is m4
 
 
 def test_clear_event_resets_then_message_after_is_kept() -> None:

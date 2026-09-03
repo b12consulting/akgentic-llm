@@ -1,6 +1,7 @@
 """Context management for LLM conversation history."""
 
 import hashlib
+from collections.abc import Sequence
 from typing import Literal
 
 from pydantic_ai.messages import (
@@ -16,6 +17,7 @@ from akgentic.llm.event import (
     LlmContextClearedEvent,
     LlmContextCompactedEvent,
     LlmMessageEvent,
+    LlmOutputDiscardedEvent,
     LlmSystemPromptEvent,
     LlmUsageEvent,
     SystemPromptPartSnapshot,
@@ -526,6 +528,25 @@ class ContextManager:
         self.seed_system_prompt_hash(None)
         self._notify(LlmContextClearedEvent(None, removed))
         return removed
+
+    def record_discarded_output(self, run_id: str | None, content: Sequence[str]) -> None:
+        """Record that part of a model response was dropped before reaching history.
+
+        A recorder in the ``record_system_prompt`` family, not a mutator: it builds an
+        ``LlmOutputDiscardedEvent`` and notifies observers, and touches **no** state.
+        Nothing is written to ``_messages``, and the ADR-004 dedup hash is left alone.
+        This is what separates it from ``compact()`` and ``clear_context()``, which both
+        fold or wipe the history before emitting. Here the drop has already happened
+        upstream — the response never reached the history in the first place — so there
+        is nothing left to mutate and the event is purely a record of it.
+
+        Args:
+            run_id: The ReactAgent run ID the discard belongs to; ``None`` when the
+                originating response carries no run id.
+            content: Text of each dropped part, in the order the model emitted them.
+                Normalised to a tuple on the event, whose persisted shape is a tuple.
+        """
+        self._notify(LlmOutputDiscardedEvent(run_id, tuple(content)))
 
     def restore(self, messages: list[ModelMessage]) -> None:
         """Replace message history with the provided list.

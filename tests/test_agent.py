@@ -597,6 +597,32 @@ class TestReactAgentEndStrategyRetryWins:
         assert result == RouteDecision(target="billing")
 
 
+class TestReactAgentEndStrategyForwarding:
+    """The widened end_strategy literal reaches pydantic-ai through the existing wire.
+
+    ``agent.py`` already forwards ``config.runtime_cfg.end_strategy`` verbatim, so this
+    asserts the widening is end-to-end rather than merely accepted by the config model.
+    Setting ``'graceful'`` changes nothing about a run: it takes the same discard branch
+    as the ``'exhaustive'`` default.
+    """
+
+    def test_graceful_reaches_the_pydantic_agent(self, monkeypatch):
+        """AC 4: a config carrying 'graceful' constructs an Agent with end_strategy='graceful'."""
+        from akgentic.llm.config import RuntimeConfig
+
+        # FunctionModel never runs here, but ReactAgent builds the provider model
+        # eagerly; the key is never dereferenced. Mirrors the retry-wins setup above.
+        monkeypatch.setenv("GOOGLE_API_KEY", "test-key")
+
+        config = ReactAgentConfig(
+            model_cfg=ModelConfig(provider="google-gla", model="gemini-2.0-flash"),
+            runtime_cfg=RuntimeConfig(end_strategy="graceful"),
+        )
+        agent = ReactAgent(config=config)
+
+        assert agent.pydantic_agent.end_strategy == "graceful"
+
+
 class TestReactAgentRun:
     """Test ReactAgent.run() method."""
 
