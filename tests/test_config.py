@@ -493,6 +493,11 @@ class TestAgentRuntimeConfig:
         assert config.http_client_config.timeout == 60.0
         assert config.http_client_config.max_retries == 3
 
+    def test_graceful_strategy_accepted(self):
+        """'graceful' -- pydantic-ai's third EndStrategy value -- is accepted (AC 1)."""
+        config = RuntimeConfig(end_strategy="graceful")
+        assert config.end_strategy == "graceful"
+
     def test_invalid_strategy(self):
         """Test invalid end_strategy raises error."""
         with pytest.raises(ValidationError):

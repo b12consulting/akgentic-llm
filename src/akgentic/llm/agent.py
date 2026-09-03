@@ -23,6 +23,7 @@ from .capabilities import (
 from .capabilities import (
     CompactionCapability,
     ConclusionDecision,
+    DiscardedOutputCapability,
     EventSourcingCapability,
     HealingCapability,
     LifetimeBudgetCapability,
@@ -263,6 +264,17 @@ class ReactAgent:
         # and replaces the default; it is never mounted alongside it.
         self._limit_recovery = limit_recovery or LimitRecoveryCapability()
 
+        # The co-emitted-output strip. Held on the instance because `_run_with_limits` has to
+        # declare each run's output CLASS on it before the run starts — the capability
+        # validates against that class rather than walking the request's JSON Schema, and
+        # nothing on `RunContext` carries it. Unlike the recovery capability above, this one
+        # DOES override `for_run`: the object mounted here is the host-facing slot, and every
+        # run gets its own copy of the budget and of the declared class.
+        self._discarded = DiscardedOutputCapability(
+            context=self._context,
+            end_strategy=config.runtime_cfg.end_strategy,
+        )
+
         # The whole capability stack, assembled once, here — the only place its order is
         # decided. The budget is first of all, so a run it refuses reaches none of the
         # others and in particular never pays for compaction's summarizer; nothing but
@@ -285,6 +297,12 @@ class ReactAgent:
             EventSourcingCapability(context=self._context),
             self._limit_recovery,
             HealingCapability(context=self._context),
+            # Last of the internal capabilities, and the position is free: its only hook is
+            # after_model_request, which fires before the response is appended to history,
+            # so nothing it does can race the persistence sweep or be re-ordered against it.
+            # Placed here rather than earlier purely so the two couplings above stay adjacent
+            # — budget ahead of compaction, limit recovery immediately ahead of healing.
+            self._discarded,
             *(capabilities or []),
         ]
 
@@ -626,6 +644,12 @@ class ReactAgent:
         # threaded in from `run()`: a tool may call `switch_model` mid-run, so a value
         # hoisted one frame up is already stale by the time the conclusion runs. The
         # `Agent`'s constructor arguments stay as unused defaults — it is never rebuilt.
+        # The unwrapped class this run will produce, resolved once and used twice: the
+        # capability validates a co-emitted text part against it, and get_output_type wraps
+        # the same object for the provider. One expression so the two cannot drift — a strip
+        # decided against a class the run is not producing would delete the model's output.
+        effective_output_type = output_type or self._result_type
+        self._discarded.expect_output_type(effective_output_type)
         try:
             result = await self._pydantic_agent.run(
                 user_prompt=user_prompt,
@@ -633,9 +657,7 @@ class ReactAgent:
                 usage_limits=pydantic_limits,
                 message_history=self._context.messages,
                 model=self._model,
-                output_type=get_output_type(
-                    self._config.model_cfg, output_type or self._result_type
-                ),
+                output_type=get_output_type(self._config.model_cfg, effective_output_type),
             )
             return result.output
         except UsageLimitExceeded as e:

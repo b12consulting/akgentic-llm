@@ -1,6 +1,6 @@
 """Run-loop concerns as standalone, mountable pydantic-ai capabilities.
 
-Three hook anchors carry everything here:
+Four hook anchors carry everything here:
 
 - ``wrap_run``'s **head** — the pre-flight anchor. It runs before the wrapped run does
   anything at all, which is where the agent-lifetime budget refuses a spent agent (the
@@ -17,6 +17,23 @@ Three hook anchors carry everything here:
   node interrupted by cancellation, and a node can append to history and then die before its
   own boundary, so without a closing sweep the run's tail is never persisted. The sweep in the
   ``finally`` closes that blind tail, and the per-run system-prompt recording rides with it.
+- ``after_model_request`` — the pre-history anchor, and the only one here that sits *outside*
+  the ordering problem the other three live inside. It fires between the model response and
+  ``ModelRequestNode._append_response``, so a capability that returns a replacement response
+  decides what reaches durable history in the first place — before the sweep, before the
+  cursor, before any other capability's node hooks can see it. ``DiscardedOutputCapability``
+  is the first capability here to use it, and it uses it **because** of that: stripping the
+  output the discard branch is about to throw away has to happen before the append, and doing
+  it from a node hook instead would mean editing a response already in history and sequencing
+  that edit against persistence. It is deliberately order-independent as a result — it
+  declares no ``get_ordering()``, and mounting it before or after ``EventSourcingCapability``
+  yields byte-identical history and an identical event sequence.
+
+  The anchor carries **both** of ``CallToolsNode``'s multi-part collapses, split on
+  ``response.tool_calls``: with tool calls the co-emitted output is discarded and is stripped
+  here; with none the text parts are concatenated into invalid JSON and are merged here
+  instead. Same hook, same replacement response, same order-independence — the merge folds
+  parts the graph has not yet read, so like the strip it races nothing.
 
 **Durable state only.** Persistence reads the run's durable history list — the list
 ``RunContext.messages`` points at *inside a node hook*. It never reads
@@ -33,7 +50,8 @@ list order, ``after_*`` in reverse, and ``wrap_run``s nest with the first one wr
 rest (pydantic-ai 2.27.1 — ``capabilities/combined.py`` builds each chain over
 ``reversed(self.capabilities)``). ``ReactAgent`` mounts ``[LifetimeBudgetCapability,
 CompactionCapability, EventSourcingCapability, LimitRecoveryCapability, HealingCapability,
-*yours]``. Two couplings ride on exactly that order and nothing else: the budget refuses a spent
+DiscardedOutputCapability, *yours]``. Two couplings ride on exactly that order and nothing
+else: the budget refuses a spent
 agent **before** compaction pays for a summarizer, and limit recovery sits immediately *before*
 healing so that healing — the later entry, and therefore the first to fire in the **reversed**
 ``on_run_error`` walk — has written its ``ToolReturnPart`` before the recovery seam is consulted.
@@ -49,6 +67,8 @@ deliberately does not declare one to pin itself outermost — that would be a be
 owed its own decision. What a co-mounted capability needs from the order does **not** depend on
 where it sits: the closing sweep is in ``wrap_run``'s ``finally``, outside every capability's
 node hooks whatever the order, so durable ``after_*`` edits are always the ones persisted.
+``DiscardedOutputCapability``'s position in that list carries nothing at all — its anchor runs
+before the append, so there is no sweep for it to race and no order for a re-sort to break.
 
 **The ``wrap_run`` context stops tracking the run — but it is not a detached copy** (pydantic-ai
 2.27.1, verified by running it, both halves). ``run_ctx`` is built once, before the graph starts,
@@ -79,6 +99,7 @@ in silence. Two back-to-back ``append_user_prompt`` calls are enough to trigger 
 
 from .budget import LifetimeBudgetCapability
 from .compaction import CompactionCapability
+from .discarded_output import DEFAULT_STRIP_BUDGET, DiscardedOutputCapability
 from .errors import (
     RUN_LIMIT_HEALING_MESSAGE,
     AgentUsageLimitError,
@@ -95,10 +116,12 @@ from .limit_recovery import (
 
 __all__ = [
     "DEFAULT_CONCLUSION_REASON",
+    "DEFAULT_STRIP_BUDGET",
     "RUN_LIMIT_HEALING_MESSAGE",
     "AgentUsageLimitError",
     "CompactionCapability",
     "ConclusionDecision",
+    "DiscardedOutputCapability",
     "EventSourcingCapability",
     "HealingCapability",
     "LifetimeBudgetCapability",

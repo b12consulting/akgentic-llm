@@ -90,7 +90,8 @@ ReactAgent
   │     │     ├── EventSourcingCapability, after each graph node:
   │     │     │     context.add_message()   # persists + notifies observers
   │     │     ├── LimitRecoveryCapability   # on a run-tier breach, decides: conclude, or raise
-  │     │     └── HealingCapability         # closes out tool calls a failed run left dangling
+  │     │     ├── HealingCapability         # closes out tool calls a failed run left dangling
+  │     │     └── DiscardedOutputCapability # strips / merges a multi-part response before history
   │     │
   │     ├── on a run-tier breach the seam asked to conclude:
   │     │     conclude_without_tools(decision.reason)   # sibling run, no tools
@@ -494,13 +495,28 @@ Three things the shim deliberately does **not** do:
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `retries` | `int` | `3` | Retry attempts for tool failures and output validation errors |
-| `end_strategy` | `Literal["early","exhaustive"]` | `"exhaustive"` | Tool execution termination |
+| `end_strategy` | `Literal["early", "graceful", "exhaustive"]` | `"exhaustive"` | Tool execution termination |
 | `parallel_tool_calls` | `bool` | `True` | Accepted and validated, but read by nothing — see the note below |
 | `http_client_config` | `HttpClientConfig` | `HttpClientConfig()` | HTTP timeout and retry tuning |
 
-**End strategies:**
-- `"early"` — stops after the first successful result (fast path)
+**End strategies** — the three values are exactly pydantic-ai's own `EndStrategy` vocabulary:
+
+- `"early"` — stops after the first successful result (fast path). Function tools are not
+  executed unless every output tool fails.
+- `"graceful"` — tools run in the order the model emitted them; output tools run in order and the
+  first success wins, later ones are skipped.
 - `"exhaustive"` — runs all tool calls even when a result is available (complete data gathering)
+
+**`"graceful"` is a completeness change, never a remedy.** It was admitted so the field spells the
+full upstream vocabulary instead of a two-value subset of it. It does **not** soften the
+co-emitted-output problem that [`DiscardedOutputCapability`](#the-multi-part-response-reconciler)
+addresses: `"graceful"` takes the same discard branch as `"exhaustive"`. The capability
+nevertheless gates its strip on `"exhaustive"` alone — that is the only value that was measured,
+and extending the strip to `"graceful"` is a decision rather than a freebie.
+
+**akgentic's default stays `"exhaustive"`, and the divergence is deliberate.** pydantic-ai's own
+`Agent` constructor defaults to `"graceful"`. `ReactAgent` passes `end_strategy` explicitly on
+every construction, so the upstream default never applies here.
 
 Under pydantic-ai v2, `"exhaustive"` also carries a **retry-wins** rule: when a function tool
 called in the same round as an already-successful output call raises `ModelRetry` — or fails
@@ -906,18 +922,19 @@ mirroring `run_sync()`: closed-agent guard, then the agent's own loop.
 
 `capabilities` is an optional constructor argument on `ReactAgent` (accepted-and-ignored on
 `MockReactAgent`) — a sequence of pydantic-ai `AgentCapability` instances. They are **not**
-forwarded unchanged: `ReactAgent` mounts five internal capabilities of its own first and appends
+forwarded unchanged: `ReactAgent` mounts six internal capabilities of its own first and appends
 yours after them, so the wrapped `Agent(...)` always receives
 
 ```python
 [LifetimeBudgetCapability, CompactionCapability, EventSourcingCapability,
- LimitRecoveryCapability, HealingCapability,
+ LimitRecoveryCapability, HealingCapability, DiscardedOutputCapability,
  *(capabilities or [])]
 ```
 
-The stack is never `[]`, even when the argument is omitted — those five are how every run
+The stack is never `[]`, even when the argument is omitted — those six are how every run
 enforces the agent-lifetime budget, folds an over-long history, persists its messages, decides
-whether a run-tier breach degrades into an answer, and closes out its dangling tool calls. See
+whether a run-tier breach degrades into an answer, closes out its dangling tool calls, and
+reconciles a multi-part response with the graph's one-output rule. See
 [Run-loop capabilities](#run-loop-capabilities) and [Run-tier recovery](#run-tier-recovery)
 below.
 
@@ -1012,11 +1029,12 @@ of your own:
 | `EventSourcingCapability(context=…)` | Hands every message a run produces to `ContextManager.add_message()`, exactly once, in run order; records the run's system-prompt rendering | `after_node_run` (steady state, keeps emission incremental), `before_node_run` (re-anchors the live history), `wrap_run`'s `finally` (closing sweep + system-prompt recording) |
 | `LimitRecoveryCapability()` | The run-tier recovery **policy** — on a `UsageLimitExceeded`, whether the turn degrades into a tool-free conclusion and with what prompt. It only *decides* and records; the conclusion is a sibling run driven by whoever mounted it. Anything that is not a `UsageLimitExceeded` passes straight through without consulting the seam | `on_run_error` — always re-raises, never returns a result to suppress the error |
 | `HealingCapability(context=…)` | Appends one `ToolReturnPart` per tool call left dangling by a failed run, so the *next* run is not rejected for unprocessed tool calls | `on_run_error` — it always re-raises the original exception, never returns to recover |
+| `DiscardedOutputCapability(context=…, end_strategy=…, budget=…)` | Both of `CallToolsNode`'s multi-part collapses — the **strip** of a co-emitted structured output the graph is about to discard, and the **merge** of text parts it would otherwise concatenate into invalid JSON. See [The multi-part response reconciler](#the-multi-part-response-reconciler) | `after_model_request` — its **only** hook, returning a replacement `ModelResponse` before the response reaches history; `for_run` hands each run its own budget and output class |
 
 **Ordering.** The stack is
 `[LifetimeBudgetCapability, CompactionCapability, EventSourcingCapability,
-LimitRecoveryCapability, HealingCapability, *yours]`, and the **first capability is the
-outermost**: `before_*` hooks fire in list order,
+LimitRecoveryCapability, HealingCapability, DiscardedOutputCapability, *yours]`, and the **first
+capability is the outermost**: `before_*` hooks fire in list order,
 `after_*` in reverse, and `wrap_run`s nest with the first wrapping all the rest. Each position
 earns its place, and they are not equally load-bearing:
 
@@ -1046,12 +1064,23 @@ earns its place, and they are not equally load-bearing:
 - **Healing last of the internals.** Error hooks fire after `wrap_run` has unwound, so the
   dangling `ModelResponse` is already persisted by the time the healer looks for it. That is
   structural rather than positional.
+- **The reconciler's position carries nothing at all.** It sits last purely so the two couplings
+  above stay adjacent. Its only hook, `after_model_request`, fires *before* the response is
+  appended to history, so there is no persistence sweep for it to race and no other capability's
+  node hook that could observe the unstripped response under any order. Mounting it before or
+  after `EventSourcingCapability` yields byte-identical history and an identical event sequence.
+
+**The reconciler declares no `get_ordering()`, and must not gain one.** That is a decision, not an
+accident of the current code. It would buy nothing — the response is rewritten before it is ever
+appended, so no ordering can change what any other capability sees. And it would cost something
+real: declaring `get_ordering()` on **any** leaf makes pydantic-ai re-sort the *whole* chain,
+putting the two couplings that genuinely depend on list position back in play.
 
 **The order is a default, not a guarantee.** If **any** capability in the chain declares
 `get_ordering()` — a fixed `position`, or a `wraps=` / `wrapped_by=` constraint — pydantic-ai
 topologically re-sorts the whole chain to satisfy it, keeping the given order only as a
-tiebreaker. None of the five declares one, so the shipped stack is the list above; a caller
-capability that declares `position='outermost'` lands ahead of all five, whatever the list says.
+tiebreaker. None of the six declares one, so the shipped stack is the list above; a caller
+capability that declares `position='outermost'` lands ahead of all six, whatever the list says.
 What survives that and what does not:
 
 - **Persistence survives any ordering.** The closing sweep is in `wrap_run`'s `finally`, outside
@@ -1061,7 +1090,7 @@ What survives that and what does not:
   recovering capability pre-empting `HealingCapability`. That is exactly the "limit recovery
   before healing" coupling above: it holds for the shipped list and is **not** guaranteed under a
   re-sort. Pinning the budget outermost by declaring an ordering would be a behavioural change
-  owed its own decision, so none of the five does it.
+  owed its own decision, so none of the six does it.
 
 **Compaction writes twice, as one operation.** When the gate arms, `CompactionCapability` applies
 the fold to `ContextManager` *and* mirrors the result into the run's own history list, in one
@@ -1134,6 +1163,10 @@ not what a run emits: the same seven event types (`LlmMessageEvent`, `ToolCallEv
 `LlmContextClearedEvent`), the same payload shapes, the same per-message ordering
 (`LlmMessageEvent` → tool events → `LlmUsageEvent`), the same run-id correlation. **No consumer
 needs a schema change.** Two paths do emit *more* than they used to, both described below.
+
+An **eighth** type, `LlmOutputDiscardedEvent`, was added later by `DiscardedOutputCapability`. It
+is **audit-only** and still needs no consumer change: nothing has to read it to be correct. See
+[Discarded-output events](#discarded-output-events).
 
 **Two behavioural differences, and both are the fix working.**
 
@@ -1353,6 +1386,114 @@ are; the consumer is left with a single `except UsageLimitError`. Two things the
 currently express are ADR-021 §Q1 and §Q2 — see
 [What a consumer has to handle](#what-a-consumer-has-to-handle).
 
+### The multi-part response reconciler
+
+`DiscardedOutputCapability` (ADR-023) exists because `CallToolsNode` collapses a multi-part
+`ModelResponse` in two different ways, and both destroy work the model actually did.
+
+**With tool calls — the collapse is a discard.** When a model co-emits a valid structured output
+*and* a tool call in one response, `end_strategy='exhaustive'` drops the output, runs the tool and
+loops — but appends the response to `message_history` **verbatim**. The next request therefore
+shows the model its own words ("I've asked @Assistant to research…"), it concludes it already
+delegated, and it returns an empty output that routes nothing. The dropped message becomes a
+*permanent* one, because a model will not re-derive an intent it believes it has already acted on.
+
+**With none — the collapse is a concatenation.** The same node accumulates every text part by
+string concatenation — `text += part.content`, unconditionally, under every `end_strategy` — and
+hands the result to the text processor. A model that emits two complete outputs as two parts
+therefore produces `{...}{...}`, which is not JSON, and the run spends output retries recovering
+from a concatenation it did not perform.
+
+**One class, two mutually exclusive branches, split on `response.tool_calls`:**
+
+| | **Strip** | **Merge** |
+|---|---|---|
+| fires when | text parts **and** tool calls | text parts, **no** tool call |
+| gated on `end_strategy` | **yes** — `"exhaustive"` only | **no** — all three strategies |
+| budgeted | **yes** — `DEFAULT_STRIP_BUDGET = 3` per run | **no** |
+| evented | **yes** — `LlmOutputDiscardedEvent` | **no event at all** |
+| further gate | each part validates individually; only those that validate are stripped | **all** parts must validate, **and** the output class must declare `merge` |
+
+The split is `response.tool_calls` and nothing else, so no response can take both paths.
+
+**Why the merge is not strategy-gated.** The concatenation it prevents is not
+strategy-conditional: `text += part.content` runs for every text part regardless, and upstream's
+`end_strategy == 'early'` branch sits *inside* `if tool_calls:` — a branch the merge path never
+reaches by definition.
+
+**Why the merge is not budgeted.** Each strip **costs an extra model request** — the discarded
+intent has to be re-derived on the next iteration, which is the whole point of it, and an
+unbounded strip loop would re-derive until pydantic-ai's `run_request_limit`. A merge buys no
+extra request; it *removes* a retry. There is nothing for a budget to bound. The budget is **3**
+because the motivating run co-emitted twice in one turn, so two is the observed need and a budget
+of exactly two sits on the boundary with no headroom.
+
+**The anchor is `after_model_request`, and that is the whole design.** It runs between the model
+response and the append to history, and **returns a replacement** `ModelResponse`. So
+`LlmMessageEvent` carries the stripped/merged response, no discarded part is ever shipped, and
+`restore_context` rebuilds an honest history — the fix survives a resume. It is also why there is
+**no mount-order constraint**; see [Run-loop capabilities](#run-loop-capabilities).
+
+**It gates on the run's output CLASS, declared per run.** `ReactAgent` declares the effective
+output class through `expect_output_type` immediately before each run, and `for_run` snapshots it
+onto a per-run copy carrying its own budget. The host declares a **class**, not a JSON Schema. The
+boundary is **`BaseModel` only** — anything else parks `None` and the run is a no-op, which is the
+ordinary case for a `str` result type.
+
+> **The reason for the `BaseModel` boundary is scope, not a type hazard.** Widening it to
+> upstream's `is_model_like` (dataclasses, `TypedDict`) was an increase on a branch already under
+> review, and `BaseModel`-only fails safe by no-opping, so the narrower boundary shipped. Nothing
+> in this workspace declares a dataclass or `TypedDict` output type.
+
+**Validation is `model_validate_json`, and it is LAX.** It is the same call pydantic-ai's own
+output processor makes, on the same text, against the same class — so "is this text the run's
+structured output?" is answered by the library that decides it.
+
+> **Never `strict=True` here.** The `strict=True` on `NativeOutput(...)` in `providers.py` is the
+> **provider-side JSON-Schema hint**; it is a *different axis* from pydantic's validation mode and
+> never reaches this validator. Validating strictly would refuse payloads pydantic-ai itself
+> accepts — a numeric string for an `int` field being the everyday case — so those parts would
+> survive a discard the graph performs anyway, which is exactly the defect being fixed.
+
+#### The class name covers both collapses
+
+The name `DiscardedOutputCapability` records only the **first** collapse, and it is **kept
+deliberately**: it is public API, exported from both `akgentic.llm` and
+`akgentic.llm.capabilities`, and renaming it is a change owed its own decision rather than a side
+effect of adding the merge. Read the name as the origin of the class, not the boundary of its
+scope — it handles the strip **and** the merge.
+
+#### Known limitations — recorded, and none of them defects
+
+| Limitation | Direction | Where it is tracked |
+|---|---|---|
+| **Markdown fences are not stripped.** pydantic-ai runs its own private `strip_markdown_fences` over text output before validating; this capability does not, so a fenced structured output fails validation here and is **kept** rather than stripped. The original defect survives for that shape. | Under-strip. Costs the fix, never data. | `backlog.md` row 20 |
+| **Dataclass and `TypedDict` output types no-op.** The gate is drawn at `BaseModel`, not at upstream's `is_model_like`, so those types park `None` and are never stripped or merged. | No-op. | `backlog.md` row 21 |
+| **`StructuredOutput.merge` does not exist**, so the merge branch is **INERT for `StructuredOutput`** — the only output type this framework's agents actually use. The concatenation defect and its `json_invalid` retries still occur in production today. | The intended degradation. | [b12consulting/akgentic-agent#142](https://github.com/b12consulting/akgentic-agent/issues/142) |
+
+> **Do not read "the merge shipped" as "the concatenation is fixed."** The merge fires only when
+> the run's output class declares a `merge` classmethod. `StructuredOutput` — what
+> `akgentic-agent` passes on every `act()` — declares none, and it lives in a different package,
+> so this one cannot add it (Golden Rule #4). Until #142 lands, a multi-part response with no tool
+> call still concatenates into invalid JSON and still burns output retries.
+
+#### The exit criterion — what would let you delete this capability
+
+This capability compensates for one provider's output shape. It is **not** a permanent feature,
+and it should not outlive its cause.
+
+**Delete it when no supported model emits multiple text parts in one response.** The observation
+that licenses the deletion is concrete: run the recorded multi-agent delegation scenario with the
+capability **unmounted**, across the supported model roster, and confirm that it produces
+
+- **no discard** — no response carries a valid structured output alongside a tool call, and
+- **no `json_invalid`** — no response carries two text parts that concatenate into invalid JSON.
+
+If both hold, the collapses this class reconciles no longer occur, and the class is dead weight:
+remove the mount, the class, the event and this section. Leaving it mounted "just in case" is how
+a compensation for a transient provider behaviour becomes permanent architecture that nobody dares
+touch because nobody remembers what it was for.
+
 ## Multimodal Prompts
 
 `UserPrompt = str | list[str | BinaryContent]` is the accepted type for `run()` and
@@ -1439,7 +1580,8 @@ ctx.clear()                   # drop every message, silently
 ```python
 from akgentic.llm import (
     ContextObserver, LlmMessageEvent, LlmUsageEvent, LlmSystemPromptEvent,
-    LlmContextCompactedEvent, LlmContextClearedEvent, ToolCallEvent, ToolReturnEvent,
+    LlmContextCompactedEvent, LlmContextClearedEvent, LlmOutputDiscardedEvent,
+    ToolCallEvent, ToolReturnEvent,
 )
 
 class MyObserver:
@@ -1461,14 +1603,22 @@ class MyObserver:
             print(f"Compacted {event.replaced_message_count} msg(s) via '{event.strategy_id}'")
         elif isinstance(event, LlmContextClearedEvent):
             print(f"Cleared {event.cleared_message_count} msg(s)")
+        elif isinstance(event, LlmOutputDiscardedEvent):
+            if event.budget_exhausted:
+                print(f"Strip budget spent for run {event.run_id}")
+            else:
+                print(f"Discarded {len(event.discarded_content)} output part(s)")
 
 agent = ReactAgent(config=config, observer=MyObserver())
 # or: agent.subscribe_context(MyObserver())
 ```
 
 Events: `LlmMessageEvent`, `LlmUsageEvent`, `LlmSystemPromptEvent`,
-`LlmContextCompactedEvent`, `LlmContextClearedEvent`, `ToolCallEvent`, `ToolReturnEvent`.
-Observers are notified synchronously — exceptions propagate to the caller.
+`LlmContextCompactedEvent`, `LlmContextClearedEvent`, `LlmOutputDiscardedEvent`, `ToolCallEvent`,
+`ToolReturnEvent`. Observers are notified synchronously — exceptions propagate to the caller.
+
+`LlmOutputDiscardedEvent` is the one that is **purely informational** — the branch above is a
+diagnostic, not a requirement. An observer that omits it stays correct.
 
 ### Tool Event Observability
 
@@ -1617,6 +1767,44 @@ class CompactionTracer:
 agent = ReactAgent(config=config, observer=CompactionTracer())
 # or: agent.subscribe_context(CompactionTracer())
 ```
+
+### Discarded-output events
+
+**`LlmOutputDiscardedEvent`** — emitted when `DiscardedOutputCapability` removes part of a model
+response before it reaches history, or when the per-run strip budget declines to:
+
+| Field | Type | Description |
+|---|---|---|
+| `run_id` | `str \| None` | ReactAgent run the discard belongs to; `None` if unset on the originating response |
+| `discarded_content` | `tuple[str, ...]` | Text of each dropped part, in the order the model emitted them. Empty by construction when `budget_exhausted` is `True` |
+| `budget_exhausted` | `bool` | `False` (default) on every event recording an actual drop. `True` on the one event per run recording the strip budget refusing a drop it would otherwise have made; after it, that run's responses pass through untested |
+
+**This event is AUDIT-ONLY. It is never a fold instruction.** Unlike the compaction and clear
+events above, **no consumer has to read it to reconstruct a correct context**:
+
+- **`restore_context` gains no branch for it.** The strip happens at `after_model_request`, before
+  the response is appended, so the `LlmMessageEvent` already carries the honest, stripped message.
+  A replay that ignores this event entirely rebuilds exactly the right history — which is also why
+  the defect does not return on a resume.
+- **`akgentic-frontend` needs no change.** Its `contextReduce` folds exactly three events and is
+  unaffected by a fourth it does not know about.
+
+**Why it carries content rather than a count.** `LlmUsageEvent.output_tokens` counts the *whole*
+generation the provider billed for, discarded text included, while the recorded `LlmMessageEvent`
+is smaller. This event's `discarded_content` is what closes that gap: recorded content **plus**
+discarded content accounts for the full generation, so the divergence is reconcilable from the
+stream alone. A counter would say only that something happened and would destroy the diagnostic —
+in the run that motivated the event, the discarded text *was* the instruction naming another
+agent, and that string is what identified the defect.
+
+> **Do not "fix" `LlmUsageEvent` to match the recorded message.** The tokens were billed and
+> `pricing.py` derives cost from them; trimming the count would under-report real spend. The
+> divergence is deliberate and is reconciled by this event.
+
+**Why one type with a discriminating field, not two classes.** Both facts are the same concern seen
+from the same place, so a consumer counting strips and a consumer auditing the `output_tokens` gap
+each read one type rather than two. The field is additive on a frozen dataclass, so old streams
+deserialise unchanged and neither `restore_context` nor the frontend reducer gains a name to ignore.
 
 ### Compaction Strategies
 
@@ -1847,6 +2035,7 @@ src/akgentic/llm/
         __init__.py      # Re-exports; holds the whole composition/cursor module docstring
         budget.py        # LifetimeBudgetCapability
         compaction.py    # CompactionCapability
+        discarded_output.py  # DiscardedOutputCapability, DEFAULT_STRIP_BUDGET
         errors.py        # UsageLimitError, RunUsageLimitError, AgentUsageLimitError,
                          #   RUN_LIMIT_HEALING_MESSAGE
         event_sourcing.py  # EventSourcingCapability
@@ -1863,7 +2052,8 @@ src/akgentic/llm/
     context.py      # ContextManager
     event.py        # LlmMessageEvent, LlmUsageEvent, LlmSystemPromptEvent,
                     #   SystemPromptPartSnapshot, LlmContextCompactedEvent,
-                    #   LlmContextClearedEvent, ToolCallEvent, ToolReturnEvent,
+                    #   LlmContextClearedEvent, LlmOutputDiscardedEvent,
+                    #   ToolCallEvent, ToolReturnEvent,
                     #   ContextObserver and EventMessage protocols
     pricing.py      # _compute_cost() (genai-prices), ModelUsage, RunUsageSummary,
                     #   AgentUsageSummary, aggregate_usage()

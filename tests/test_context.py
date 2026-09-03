@@ -30,6 +30,7 @@ ContextObserver = context_module.ContextObserver
 LlmMessageEvent = context_module.LlmMessageEvent
 LlmContextCompactedEvent = context_module.LlmContextCompactedEvent
 LlmContextClearedEvent = context_module.LlmContextClearedEvent
+LlmOutputDiscardedEvent = context_module.LlmOutputDiscardedEvent
 
 
 class EventRecorder:
@@ -618,3 +619,82 @@ class TestContextManagerClearContext:
         assert manager.clear_context() == 0
         cleared = [e for e in recorder.events if isinstance(e, LlmContextClearedEvent)]
         assert cleared[0].cleared_message_count == 0
+
+
+class TestContextManagerRecordDiscardedOutput:
+    """ContextManager.record_discarded_output() — emits without mutating (AC 8)."""
+
+    def test_emits_one_event_and_leaves_history_untouched(self) -> None:
+        """Emits exactly one event carrying the given values; messages are unchanged."""
+        manager = ContextManager()
+        sys_msg = create_system_message("sys")
+        u1 = create_user_message("u1")
+        manager.add_message(sys_msg)
+        manager.add_message(u1)
+        manager.seed_system_prompt_hash("abc")  # a recorded rendering, must survive
+        recorder = EventRecorder()
+        manager.subscribe(recorder)
+
+        manager.record_discarded_output("run-1", ("@Assistant handle this", "trailing note"))
+
+        discarded = [e for e in recorder.events if isinstance(e, LlmOutputDiscardedEvent)]
+        assert len(discarded) == 1
+        assert discarded[0].run_id == "run-1"
+        assert discarded[0].discarded_content == ("@Assistant handle this", "trailing note")
+        # Unlike compact() and clear_context(), this method mutates nothing. The
+        # history is populated above so "unchanged" is not vacuously true.
+        assert manager.messages == [sys_msg, u1]
+        assert manager._last_system_prompt_hash == "abc"
+
+    def test_emits_nothing_else_and_accepts_a_null_run_id(self) -> None:
+        """The call emits that one event and no other; run_id may be None."""
+        manager = ContextManager()
+        recorder = EventRecorder()
+        manager.subscribe(recorder)
+
+        manager.record_discarded_output(None, ["dropped"])
+
+        assert len(recorder.events) == 1
+        assert recorder.events[0].run_id is None
+        # A list in becomes a tuple on the event — the persisted shape is a tuple.
+        assert recorder.events[0].discarded_content == ("dropped",)
+
+
+class TestContextManagerRecordDiscardBudgetExhausted:
+    """ContextManager.record_discard_budget_exhausted() — the other outcome, same stream."""
+
+    def test_emits_the_discriminated_event_and_mutates_nothing(self) -> None:
+        """One event, flagged, with empty content; history and dedup hash untouched."""
+        manager = ContextManager()
+        sys_msg = create_system_message("sys")
+        u1 = create_user_message("u1")
+        manager.add_message(sys_msg)
+        manager.add_message(u1)
+        manager.seed_system_prompt_hash("abc")
+        recorder = EventRecorder()
+        manager.subscribe(recorder)
+
+        manager.record_discard_budget_exhausted("run-1")
+
+        assert len(recorder.events) == 1
+        event = recorder.events[0]
+        assert isinstance(event, LlmOutputDiscardedEvent)
+        assert event.run_id == "run-1"
+        assert event.budget_exhausted is True
+        # Empty because nothing was dropped: the text stayed in the response and reaches
+        # the stream through that response's own LlmMessageEvent.
+        assert event.discarded_content == ()
+        assert manager.messages == [sys_msg, u1]
+        assert manager._last_system_prompt_hash == "abc"
+
+    def test_a_drop_and_a_refusal_are_told_apart_by_the_flag(self) -> None:
+        """The two recorders share one event type and differ only in the discriminator."""
+        manager = ContextManager()
+        recorder = EventRecorder()
+        manager.subscribe(recorder)
+
+        manager.record_discarded_output("run-1", ["dropped"])
+        manager.record_discard_budget_exhausted("run-1")
+
+        assert [e.budget_exhausted for e in recorder.events] == [False, True]
+        assert recorder.events[0].run_id == recorder.events[1].run_id

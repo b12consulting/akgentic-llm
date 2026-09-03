@@ -16,6 +16,7 @@ from akgentic.llm.event import (
     LlmContextClearedEvent,
     LlmContextCompactedEvent,
     LlmMessageEvent,
+    LlmOutputDiscardedEvent,
     LlmSystemPromptEvent,
     LlmUsageEvent,
     SystemPromptPartSnapshot,
@@ -526,6 +527,53 @@ class ContextManager:
         self.seed_system_prompt_hash(None)
         self._notify(LlmContextClearedEvent(None, removed))
         return removed
+
+    def record_discarded_output(
+        self, run_id: str | None, content: list[str] | tuple[str, ...]
+    ) -> None:
+        """Record that part of a model response was dropped before reaching history.
+
+        A recorder in the ``record_system_prompt`` family, not a mutator: it builds an
+        ``LlmOutputDiscardedEvent`` and notifies observers, and touches **no** state.
+        Nothing is written to ``_messages``, and the ADR-004 dedup hash is left alone.
+        This is what separates it from ``compact()`` and ``clear_context()``, which both
+        fold or wipe the history before emitting. Here the drop has already happened
+        upstream — the response never reached the history in the first place — so there
+        is nothing left to mutate and the event is purely a record of it.
+
+        Args:
+            run_id: The ReactAgent run ID the discard belongs to; ``None`` when the
+                originating response carries no run id.
+            content: Text of each dropped part, in the order the model emitted them.
+                Normalised to a tuple on the event, whose persisted shape is a tuple.
+                Spelled ``list | tuple`` rather than ``Sequence[str]`` on purpose: a
+                bare ``str`` *is* a ``Sequence[str]``, so the likeliest caller mistake —
+                handing over a single ``TextPart.content`` — would type-check clean and
+                record a tuple of one-character strings, corrupting the very audit trail
+                the event exists to provide. Both realistic shapes still pass.
+        """
+        self._notify(LlmOutputDiscardedEvent(run_id, tuple(content)))
+
+    def record_discard_budget_exhausted(self, run_id: str | None) -> None:
+        """Record that a run's strip budget refused a discard it would otherwise have made.
+
+        The sibling of ``record_discarded_output`` for the other outcome of the same
+        decision, and a recorder in the same ``record_system_prompt`` family: it builds
+        the event, notifies observers, and touches no state. The emitted event carries
+        an empty ``discarded_content`` because nothing was dropped -- the text stayed in
+        the response and reaches the stream through that response's own
+        ``LlmMessageEvent``.
+
+        A separate method rather than a flag on ``record_discarded_output`` so that
+        recorder's signature stays exactly as 29-1 shipped it, and because the two calls
+        read as what they are at the call site: one records a drop, the other records a
+        refusal to drop.
+
+        Args:
+            run_id: The ReactAgent run ID whose budget is spent; ``None`` when the
+                originating response carries no run id.
+        """
+        self._notify(LlmOutputDiscardedEvent(run_id, (), budget_exhausted=True))
 
     def restore(self, messages: list[ModelMessage]) -> None:
         """Replace message history with the provided list.

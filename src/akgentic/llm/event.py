@@ -206,6 +206,64 @@ class LlmContextClearedEvent:
     cleared_message_count: int
 
 
+@dataclass(frozen=True)
+class LlmOutputDiscardedEvent:
+    """Event emitted when part of a model response is dropped before reaching history.
+
+    **Audit only, never a fold instruction.** No consumer has to read this event to
+    rebuild a correct context: ``LlmMessageEvent`` already carries the response as it
+    was recorded, so ``restore_context`` and the frontend reducer both ignore this
+    event by construction. It exists so that a drop is never silent, per ADR-022's
+    invariant that every change to what the history holds is represented by an event.
+
+    **It carries the discarded content, not a count.** ``LlmUsageEvent.output_tokens``
+    counts the whole generation the provider billed for, discarded text included, while
+    the recorded ``LlmMessageEvent`` is smaller. This event's content is what closes
+    that gap: recorded content plus discarded content accounts for the full generation,
+    so anyone auditing the divergence can do it from the stream alone. A counter would
+    say only that something happened and would destroy the diagnostic -- in the run that
+    motivated this event, the discarded text was the instruction naming another agent,
+    and that string is what identified the defect.
+
+    **Deliberately not a core ``SentMessage``.** No message was sent: the text was
+    generated and then dropped before it reached the conversation. Modelling it as a
+    message would put content into the history that no participant ever received.
+
+    Primitive-only by design, like its context siblings: it records text, never the
+    ``TextPart`` objects it came from, so it round-trips through the generic serializer
+    without any pydantic-ai type.
+
+    **One event type covers both outcomes of a strip decision**, discriminated by
+    ``budget_exhausted``: either the discardable output was dropped, or it was kept
+    because the per-run strip budget is spent. A second event class was the
+    alternative; a defaulted field wins because both facts are the same concern seen
+    from the same place, so a consumer counting strips and a consumer auditing the
+    ``output_tokens`` gap each read one type rather than two, and because the field is
+    additive on a frozen dataclass -- old streams deserialise unchanged, and neither
+    ``restore_context`` nor the frontend reducer gains a name to ignore.
+
+    Attributes:
+        run_id: ReactAgent run ID the discard belongs to; None if unset on the
+            originating response.
+        discarded_content: Text of each dropped part, in the order the model emitted
+            them. Emitters record a discard only when something was actually dropped,
+            so an empty tuple is not expected on a ``budget_exhausted=False`` event;
+            the event itself does not enforce that, and a consumer meeting one should
+            treat it as a no-op. It is empty by construction when ``budget_exhausted``
+            is True -- nothing was dropped there, and what the model emitted instead
+            survives in that response's own ``LlmMessageEvent``, so no diagnostic is
+            lost by leaving it out.
+        budget_exhausted: True on the one event that records the per-run strip budget
+            refusing a strip it would otherwise have made. False on every event that
+            records an actual drop. Emitted once per run: after it, that run's
+            responses pass through untested.
+    """
+
+    run_id: str | None
+    discarded_content: tuple[str, ...]
+    budget_exhausted: bool = False
+
+
 @runtime_checkable
 class ContextObserver(Protocol):
     """Observer protocol for LLM context changes."""
