@@ -275,6 +275,30 @@ async def test_merged_part_keeps_the_first_position() -> None:
     assert result.parts[1] is thinking
 
 
+async def test_the_merged_part_carries_the_first_parts_other_fields() -> None:
+    """Golden Rule 12: the merged part is *derived* from the first text part, never rebuilt.
+
+    ``_with_merged`` uses ``dataclasses.replace``, so every field it does not name survives —
+    ``id`` and ``provider_name`` today, and whatever upstream adds next. Without this spec the
+    enumerated form ``TextPart(content=...)`` passes the entire suite green, because every
+    other spec here builds its parts from content alone: it is correct on the day it is
+    written and silently drops the provider's part identity out of history and out of the
+    event stream. Pinning the fields that exist now is what makes that edit impossible, which
+    is the protection the rule is after.
+    """
+    _, _, capability = await _wired()
+    first = TextPart(FIRST, id="part-1", provider_name="openai")
+    response = _response(first, TextPart(SECOND))
+
+    result = await _hook(capability, response)
+
+    merged = next(p for p in result.parts if isinstance(p, TextPart))
+    assert merged.id == "part-1"
+    assert merged.provider_name == "openai"
+    assert merged.content != FIRST  # genuinely the merged part, not the original carried over
+    assert len(_Merging.model_validate_json(merged.content).messages) == 2
+
+
 async def test_non_text_parts_survive_the_merge() -> None:
     """AC 8: thinking parts and files are carried through untouched, in order."""
     thinking = ThinkingPart(content="weighing options")
