@@ -20,12 +20,13 @@ does.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any, Literal
+from typing import Any, Literal, TypedDict
 from unittest.mock import patch
 
 import pytest
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, TypeAdapter, field_validator
 from pydantic_ai import Agent, PromptedOutput
 from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.messages import (
@@ -51,7 +52,7 @@ from akgentic.llm import (
     ReactAgentConfig,
 )
 from akgentic.llm.capabilities import DEFAULT_STRIP_BUDGET
-from akgentic.llm.capabilities.discarded_output import _validates
+from akgentic.llm.capabilities.discarded_output import _is_decidable, _validates
 from akgentic.llm.event import LlmMessageEvent, LlmOutputDiscardedEvent, LlmUsageEvent
 
 # ---------------------------------------------------------------------------
@@ -461,10 +462,10 @@ class _Recursive(BaseModel):
     ],
 )
 def test_the_validator_decides_each_construct(
-    content: str, output_type: type[BaseModel], expected: bool
+    content: str, output_type: type[Any], expected: bool
 ) -> None:
-    """AC 5: the run's own class answers each construct, through pydantic."""
-    assert _validates(content, output_type) is expected
+    """AC 5: the run's own type answers each construct, through pydantic."""
+    assert _validates(content, TypeAdapter(output_type)) is expected
 
 
 def test_a_numeric_string_validates_because_validation_is_not_strict() -> None:
@@ -475,8 +476,8 @@ def test_a_numeric_string_validates_because_validation_is_not_strict() -> None:
     ``validator.validate_json`` with no strict flag. Validating strictly here would keep a
     part the graph discards anyway, which is the whole defect.
     """
-    assert _validates('{"a": "5"}', _Int) is True
-    assert _validates('{"a": 5}', _Int) is True
+    assert _validates('{"a": "5"}', TypeAdapter(_Int)) is True
+    assert _validates('{"a": 5}', TypeAdapter(_Int)) is True
 
 
 def test_a_self_referential_model_terminates() -> None:
@@ -491,12 +492,12 @@ def test_a_self_referential_model_terminates() -> None:
         deep += '"a": {'
     deep += '"a": null' + "}" * 40 + "}"
 
-    assert _validates(deep, _Recursive) is True
-    assert _validates('{"a": {"a": 1}}', _Recursive) is False
+    assert _validates(deep, TypeAdapter(_Recursive)) is True
+    assert _validates('{"a": {"a": 1}}', TypeAdapter(_Recursive)) is False
 
 
 class _Exploding(BaseModel):
-    """An output class whose validator raises something pydantic does not wrap."""
+    """An output type whose validator raises something pydantic does not wrap."""
 
     a: int
 
@@ -507,18 +508,18 @@ class _Exploding(BaseModel):
 
 
 def test_a_validator_that_raises_keeps_the_part() -> None:
-    """AC 5: a caller's output class must not end a run from this hook.
+    """AC 5: a caller's output type must not end a run from this hook.
 
     ``ValueError`` and ``AssertionError`` become ``ValidationError``; anything else
-    propagates out of ``model_validate_json``. This hook fires on every model response, so
+    propagates out of ``validate_json``. This hook fires on every model response, so
     that would turn an audit-only capability into a run-ending one. It is logged and read
     as "does not validate" — the direction that keeps the part.
     """
-    assert _validates('{"a": 1}', _Exploding) is False
+    assert _validates('{"a": 1}', TypeAdapter(_Exploding)) is False
 
 
 # ---------------------------------------------------------------------------
-# AC 5 — the output class comes from the host, once per run
+# AC 5 — the output type comes from the host, and only a model-like one decides
 # ---------------------------------------------------------------------------
 
 
@@ -538,26 +539,149 @@ async def test_no_op_when_the_host_declares_nothing() -> None:
     assert manager.messages == []
 
 
+@dataclass
+class _DataclassOut:
+    """A dataclass output type. pydantic-ai validates it as itself, so this must decide."""
+
+    recipient: str
+
+
+class _TypedDictOut(TypedDict):
+    """A ``TypedDict`` output type — model-like for the same reason."""
+
+    recipient: str
+
+
+@pytest.mark.parametrize(
+    ("declared", "decidable"),
+    [
+        (_Out, True),
+        (_DataclassOut, True),
+        (_TypedDictOut, True),
+        (str, False),
+        (None, False),
+        (int, False),
+        (list[int], False),
+        (str | int, False),
+    ],
+    ids=["model", "dataclass", "typeddict", "str", "none", "int", "list", "union"],
+)
+def test_only_a_model_like_type_is_decidable(declared: object, decidable: bool) -> None:
+    """AC 5: the line is pydantic-ai's own, and it is not "is it a ``BaseModel``".
+
+    ``ObjectOutputProcessor`` validates a *model-like* type — pydantic model, dataclass or
+    ``TypedDict`` — as itself, and wraps everything else in a ``{"response": ...}``
+    envelope validated as ``TypedDict{'response': T | Json[T]}``. So for a bare ``str``,
+    ``int``, ``list[X]`` or scalar union the text the model actually emits is the envelope,
+    and ``TypeAdapter`` on the naked type answers a different question — one that says True
+    for payloads the graph never treated as output, which deletes narration.
+    """
+    assert _is_decidable(declared) is decidable
+
+
+async def test_a_dataclass_output_type_is_stripped_like_a_model() -> None:
+    """AC 5: the swap to ``TypeAdapter`` is what makes this work at all.
+
+    ``model_validate_json`` does not exist on a dataclass, and ``result_type`` is
+    ``type[Any]`` — a dataclass is a legal output type and pydantic-ai validates it with a
+    plain ``TypeAdapter``, exactly as this does.
+    """
+    _, recorder, capability = await _wired(_DataclassOut)
+    response = _response(TextPart('{"recipient": "@Assistant"}'), TextPart(PROSE), _tool_call())
+
+    result = await capability.after_model_request(
+        _run_context(), request_context=_request_context(_output_object()), response=response
+    )
+
+    assert _texts(result) == [PROSE]
+    assert [e.discarded_content for e in _discards(recorder)] == [('{"recipient": "@Assistant"}',)]
+
+
 @pytest.mark.parametrize(
     "declared", [str, None, int, list[int]], ids=["str", "none", "int", "list"]
 )
-async def test_no_op_for_an_output_type_that_is_not_a_model(declared: object) -> None:
-    """AC 5: only a ``BaseModel`` subclass is decidable here.
-
-    ``str`` and ``None`` are the ordinary cases — no structured output to be an instance
-    of. A bare ``int`` or ``list[int]`` is refused for a sharper reason: pydantic-ai wraps
-    it in a ``{"response": ...}`` envelope before the model sees it, so validating the
-    naked type would answer a different question than the graph does, and in the direction
-    that strips.
-    """
+async def test_no_op_for_an_output_type_that_is_not_model_like(declared: object) -> None:
+    """AC 5: an enveloped output type is a no-op, never a validation of the naked type."""
     _, recorder, capability = await _wired(declared)
-    response = _response(TextPart(VALID_OUTPUT), TextPart("5"), _tool_call())
+    response = _response(TextPart(VALID_OUTPUT), TextPart('"5"'), _tool_call())
 
     result = await capability.after_model_request(
         _run_context(), request_context=_request_context(_output_object()), response=response
     )
 
     assert result is response
+    assert _discards(recorder) == []
+
+
+async def test_a_quoted_string_survives_under_the_default_str_output_type() -> None:
+    """AC 5: the single most important spec in this module.
+
+    ``ReactAgent.result_type`` DEFAULTS to ``str``, and every quoted string validates
+    against ``str``. Two independent gates keep that from turning this capability into
+    "delete any string co-emitted with a tool call": ``str`` is not model-like, so no
+    validator is built; and a ``str`` output type puts the request in ``text`` mode, where
+    ``output_object`` is ``None``. Either alone is sufficient. This asserts both, because
+    a future change that relaxes one must not be able to pass by leaning on the other.
+    """
+    _, recorder, capability = await _wired(str)
+    narration = '"I will look that up for you."'
+    response = _response(TextPart(narration), _tool_call())
+
+    # Gate one: str is not model-like, so this run has no validator at all.
+    assert capability._validator is None
+    kept = await capability.after_model_request(
+        _run_context(), request_context=_request_context(_output_object()), response=response
+    )
+
+    # Gate two: even handed a str validator outright, the text-mode request strips nothing.
+    _, _, forced = _mount()
+    forced._validator = TypeAdapter(str)
+    still_kept = await forced.after_model_request(
+        _run_context(), request_context=_request_context(None), response=response
+    )
+
+    assert _validates(narration, TypeAdapter(str)) is True
+    assert _texts(kept) == [narration]
+    assert _texts(still_kept) == [narration]
+    assert _discards(recorder) == []
+
+
+async def test_a_str_run_strips_nothing_end_to_end() -> None:
+    """AC 5: the same guarantee through a real run, where the gates are not hand-built.
+
+    A ``str``-output agent that co-emits a quoted string with a tool call must reach
+    history with the string intact. This is the regression the two gates exist to prevent,
+    proved against pydantic-ai's own request construction rather than a fixture.
+    """
+    manager = ContextManager()
+    recorder = _Recorder()
+    manager.subscribe(recorder)
+    strip = DiscardedOutputCapability(context=manager)
+    narration = '"I will look that up for you."'
+
+    agent: Agent[None, str] = Agent(
+        model=_scripted_model(
+            [
+                ModelResponse(
+                    parts=[TextPart(narration), ToolCallPart(tool_name="noop", args={})],
+                    usage=RequestUsage(input_tokens=7),
+                ),
+                ModelResponse(parts=[TextPart("done")], usage=RequestUsage(input_tokens=3)),
+            ]
+        ),
+        output_type=str,
+        end_strategy="exhaustive",
+        capabilities=[strip, EventSourcingCapability(context=manager)],
+    )
+
+    @agent.tool_plain
+    def noop() -> str:
+        return "ok"
+
+    strip.expect_output_type(str)
+    await agent.run("look this up")
+
+    assert narration in [t for r in _responses(manager.messages) for t in _texts(r)]
     assert _discards(recorder) == []
 
 
@@ -759,7 +883,7 @@ async def test_the_mounted_instance_holds_no_run_state() -> None:
 
     assert mounted._strips == 0
     assert mounted._exhausted is False
-    assert mounted._output_type is None
+    assert mounted._validator is None
     assert mounted._pending_output_type is None
 
 
