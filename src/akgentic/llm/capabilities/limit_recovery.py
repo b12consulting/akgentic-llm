@@ -36,7 +36,7 @@ class ConclusionDecision(BaseModel):
     """
 
     reason: str = DEFAULT_CONCLUSION_REASON
-    """The prompt the tool-free conclusion is started with, on top of the healed context."""
+    """The prompt the tool-free conclusion is started with, on top of the breached run's history."""
 
 
 @dataclass
@@ -48,24 +48,21 @@ class LimitRecoveryCapability(AbstractCapability[Any]):
     run driven by whoever mounted this — ``ReactAgent._run_with_limits`` in this package —
     so the recovery never nests a run inside a capability hook.
 
-    **``on_run_error``, never ``wrap_run``.** pydantic-ai gives error hooks their chance only
-    once the exception has escaped the entire ``wrap_run`` chain. A capability that caught the
-    breach in its own ``wrap_run`` and returned a recovery result would therefore stop
-    ``HealingCapability.on_run_error`` from ever running, and the conclusion would start from a
-    context still carrying a **dangling tool call** — the exact failure healing exists to
-    prevent. The ``wrap_run`` shape is simpler *and broken*, and the suite stays green while it
-    is. This class defines no ``wrap_run`` at all.
+    **``on_run_error``, never ``wrap_run``.** A ``wrap_run`` that caught the breach would have
+    to *return a result* to suppress it, which makes the run tier unobservable and hands the
+    mounter a result it never asked for, when what it needs is the *decision*. The ``wrap_run``
+    shape is simpler and wrong, and the suite would stay green while it is. This class defines
+    no ``wrap_run`` at all.
 
     **It always re-raises.** ``on_run_error`` may return an ``AgentRunResult`` to suppress the
     error; this one never does. Suppressing it here would make the run tier unobservable and
     would hand the mounter a result it never asked for, when what it needs is the *decision*.
 
-    **Mount it immediately before ``HealingCapability``.** ``CombinedCapability.on_run_error``
-    walks ``reversed(self.capabilities)``, so the **last** capability in the mount list fires
-    **first**: healing must sit *after* this one to write its ``ToolReturnPart`` before the
-    seam is consulted. A capability that raises does not stop the walk — its exception is
-    carried into the next capability as ``error`` — so both hooks run either way; only their
-    order depends on the list.
+    **What the seam sees.** By the time ``on_run_error`` fires, pydantic-ai has already appended
+    its interrupted-request marker to the run's history, so a policy that reads
+    ``ContextManager.messages`` finds the dangling ``ModelResponse`` followed by that empty
+    request, not a tool return. The dangling call is closed out with a synthesized tool return
+    only when the next run builds its first request.
 
     **No ``for_run`` override, deliberately.** pydantic-ai's default hands back ``self``, so
     the object whose hook records the decision **is** the object the mounter holds and reads
@@ -92,7 +89,7 @@ class LimitRecoveryCapability(AbstractCapability[Any]):
         path. Anything that is not a ``UsageLimitExceeded`` — including this package's own
         ``AgentUsageLimitError``, which is a different class — passes straight through
         without consulting the seam. The exception and its ``__traceback__`` reach the caller
-        untouched, exactly as ``HealingCapability``'s do.
+        untouched.
         """
         if not isinstance(error, UsageLimitExceeded):
             raise error

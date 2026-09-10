@@ -67,16 +67,14 @@ class MockReactAgent:
         Args:
             capabilities: Accepted and ignored — the mock never builds a
                 ``pydantic_ai.Agent``, so there is nothing to forward this to.
-                None of ``ReactAgent``'s five mounts has a client to be here —
+                None of ``ReactAgent``'s four mounts has a client to be here —
                 ``LimitRecoveryCapability`` for the reason given under
-                ``limit_recovery`` below, and for the other four:
+                ``limit_recovery`` below, and for the other three:
                 what ``EventSourcingCapability`` does for a real run — hand every
                 message to ``ContextManager.add_message()`` — this class already
                 does directly from ``_emit_request`` / ``_emit_tool_call`` /
                 ``_emit_tool_return`` / ``_emit_final_response``, so it is its own
-                event source rather than a client of one; ``HealingCapability``
-                has nothing to heal, a replayed turn never leaving a tool call
-                dangling; and ``CompactionCapability``'s gate reads
+                event source rather than a client of one; and ``CompactionCapability``'s gate reads
                 provider-reported input tokens, which every response emitted here
                 reports as ``RequestUsage()`` — zero, so the gate cannot arm.
                 ``LifetimeBudgetCapability`` is the one real divergence: no

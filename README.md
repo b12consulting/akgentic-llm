@@ -89,8 +89,7 @@ ReactAgent
   │     │     ├── CompactionCapability      # folds an over-long history before the run reads it
   │     │     ├── EventSourcingCapability, after each graph node:
   │     │     │     context.add_message()   # persists + notifies observers
-  │     │     ├── LimitRecoveryCapability   # on a run-tier breach, decides: conclude, or raise
-  │     │     └── HealingCapability         # closes out tool calls a failed run left dangling
+  │     │     └── LimitRecoveryCapability   # on a run-tier breach, decides: conclude, or raise
   │     │
   │     ├── on a run-tier breach the seam asked to conclude:
   │     │     conclude_without_tools(decision.reason)   # sibling run, no tools
@@ -419,13 +418,12 @@ all — or produces nothing usable (`None`, or a string that is empty or whitesp
 caller gets a `RunUsageLimitError` built from the breach that started it, never from the
 secondary failure. A "this turn ran out of budget" signal is never replaced by an unrelated one.
 
-After a run-tier breach the context is left runnable rather than diagnostic: the tool calls the
-aborted turn never answered are healed with a short **model-facing instruction** — it tells the
-model this turn's budget is spent, that no further tool call is possible, and to answer now with
-what it already has — so that sentence, not a traceback, is the tool result a follow-up run
-reasons from. That healing is what the recovery seam is consulted *after*: by the time the
-conclusion runs, the healed `ToolReturnPart` is already the last thing the model sees, and the
-conclusion's own prompt is layered on top of it. When the breach does surface, the operator still
+After a run-tier breach the context is left runnable rather than diagnostic: pydantic-ai (2.38+)
+appends an interrupted-request marker when the tool-call turn fails, and on the next run closes
+out every tool call the aborted turn never answered with a synthesized `ToolReturnPart` marked
+`outcome='interrupted'`. The model's cue that the turn is over is the conclusion prompt itself
+(`DEFAULT_CONCLUSION_REASON`) layered on top of that synthesized return, not a traceback: the
+conclusion reasons from a complete history. When the breach does surface, the operator still
 gets the stack: it leaves `run()` as a `RunUsageLimitError` chained from pydantic-ai's own
 `UsageLimitExceeded` (`raise ... from e`), and that exception's traceback is what reaches the
 event stream.
@@ -894,9 +892,10 @@ What the mechanism does, whether a caller invokes it or the seam asks for it:
 - **It emits an `LlmUsageEvent`** like any other run: it shares `run()`'s execution core, so the
   usage fold, the system-prompt recording and the persistence sweep are identical.
 
-`reason` reaches the model as the run's user prompt, layered on the healed context — so the
-healing instruction described under [Usage limits](#usage-limits) is already there as the tool
-result the model reasons from. `conclude_without_tools_sync()` is the synchronous bridge,
+`reason` reaches the model as the run's user prompt, on top of the breached run's history;
+pydantic-ai closes out the call that run left dangling with a synthesized tool return when it
+builds this run's first request, so the model reasons from a complete history (see
+[Usage limits](#usage-limits)). `conclude_without_tools_sync()` is the synchronous bridge,
 mirroring `run_sync()`: closed-agent guard, then the agent's own loop.
 
 `ReactAgent.__init__` creates that loop eagerly, so an agent built and discarded without
@@ -906,18 +905,18 @@ mirroring `run_sync()`: closed-agent guard, then the agent's own loop.
 
 `capabilities` is an optional constructor argument on `ReactAgent` (accepted-and-ignored on
 `MockReactAgent`) — a sequence of pydantic-ai `AgentCapability` instances. They are **not**
-forwarded unchanged: `ReactAgent` mounts five internal capabilities of its own first and appends
+forwarded unchanged: `ReactAgent` mounts four internal capabilities of its own first and appends
 yours after them, so the wrapped `Agent(...)` always receives
 
 ```python
 [LifetimeBudgetCapability, CompactionCapability, EventSourcingCapability,
- LimitRecoveryCapability, HealingCapability,
+ LimitRecoveryCapability,
  *(capabilities or [])]
 ```
 
-The stack is never `[]`, even when the argument is omitted — those five are how every run
-enforces the agent-lifetime budget, folds an over-long history, persists its messages, decides
-whether a run-tier breach degrades into an answer, and closes out its dangling tool calls. See
+The stack is never `[]`, even when the argument is omitted — those four are how every run
+enforces the agent-lifetime budget, folds an over-long history, persists its messages, and decides
+whether a run-tier breach degrades into an answer. See
 [Run-loop capabilities](#run-loop-capabilities) and [Run-tier recovery](#run-tier-recovery)
 below.
 
@@ -1011,11 +1010,10 @@ of your own:
 | `CompactionCapability(strategy=…, context=…, threshold_fn=…, event_factory=…)` | Folds the conversation when provider-reported input tokens cross the armed threshold, applying the result to `ContextManager` **and** to the run's own history | `wrap_run`'s head — once per run by construction: it keeps no per-run state and overrides no `for_run` |
 | `EventSourcingCapability(context=…)` | Hands every message a run produces to `ContextManager.add_message()`, exactly once, in run order; records the run's system-prompt rendering | `after_node_run` (steady state, keeps emission incremental), `before_node_run` (re-anchors the live history), `wrap_run`'s `finally` (closing sweep + system-prompt recording) |
 | `LimitRecoveryCapability()` | The run-tier recovery **policy** — on a `UsageLimitExceeded`, whether the turn degrades into a tool-free conclusion and with what prompt. It only *decides* and records; the conclusion is a sibling run driven by whoever mounted it. Anything that is not a `UsageLimitExceeded` passes straight through without consulting the seam | `on_run_error` — always re-raises, never returns a result to suppress the error |
-| `HealingCapability(context=…)` | Appends one `ToolReturnPart` per tool call left dangling by a failed run, so the *next* run is not rejected for unprocessed tool calls | `on_run_error` — it always re-raises the original exception, never returns to recover |
 
 **Ordering.** The stack is
 `[LifetimeBudgetCapability, CompactionCapability, EventSourcingCapability,
-LimitRecoveryCapability, HealingCapability, *yours]`, and the **first capability is the
+LimitRecoveryCapability, *yours]`, and the **first capability is the
 outermost**: `before_*` hooks fire in list order,
 `after_*` in reverse, and `wrap_run`s nest with the first wrapping all the rest. Each position
 earns its place, and they are not equally load-bearing:
@@ -1035,33 +1033,25 @@ earns its place, and they are not equally load-bearing:
 - **Internal before caller.** Because the chain unwinds in reverse, a caller capability's
   `after_*` hooks run *before* the persistence sweep, so its durable edits are the ones
   persisted.
-- **Limit recovery immediately before healing.** pydantic-ai walks the `on_run_error` chain in
-  **reverse**, so the *later* entry fires *first*: healing writes its `ToolReturnPart` before the
-  recovery seam is consulted, and a policy that reads the context to decide therefore sees the
-  **healed** one. That is the whole of the reason for this position. It is **not** what keeps a
-  dangling tool call out of the conclusion — the walk runs every hook and only then re-raises, so
-  healing has written its part before any conclusion is driven, whatever the order. What protects
-  the conclusion is that recovery uses `on_run_error` rather than `wrap_run`, which is a separate
-  statement; see [Run-tier recovery](#run-tier-recovery).
-- **Healing last of the internals.** Error hooks fire after `wrap_run` has unwound, so the
-  dangling `ModelResponse` is already persisted by the time the healer looks for it. That is
-  structural rather than positional.
+- **Limit recovery last of the internals.** Its position carries no coupling of its own: it
+  only records a decision in `on_run_error`, and what protects the conclusion from the breached
+  run's dangling tool call is pydantic-ai's own repair on the next run, not any neighbour in the
+  list; see [Run-tier recovery](#run-tier-recovery).
 
 **The order is a default, not a guarantee.** If **any** capability in the chain declares
 `get_ordering()` — a fixed `position`, or a `wraps=` / `wrapped_by=` constraint — pydantic-ai
 topologically re-sorts the whole chain to satisfy it, keeping the given order only as a
-tiebreaker. None of the five declares one, so the shipped stack is the list above; a caller
-capability that declares `position='outermost'` lands ahead of all five, whatever the list says.
+tiebreaker. None of the four declares one, so the shipped stack is the list above; a caller
+capability that declares `position='outermost'` lands ahead of all four, whatever the list says.
 What survives that and what does not:
 
 - **Persistence survives any ordering.** The closing sweep is in `wrap_run`'s `finally`, outside
   every capability's node hooks, so durable `after_*` edits are always the ones persisted.
 - **`on_run_error` precedence does not**, and is **deliberately uncontracted**. pydantic-ai walks
-  that hook from the innermost capability outwards, and this package states no contract about a
-  recovering capability pre-empting `HealingCapability`. That is exactly the "limit recovery
-  before healing" coupling above: it holds for the shipped list and is **not** guaranteed under a
-  re-sort. Pinning the budget outermost by declaring an ordering would be a behavioural change
-  owed its own decision, so none of the five does it.
+  that hook from the innermost capability outwards, and this package states no contract about
+  where a caller's recovering capability fires relative to `LimitRecoveryCapability`. Pinning the
+  budget outermost by declaring an ordering would be a behavioural change owed its own decision,
+  so none of the four does it.
 
 **Compaction writes twice, as one operation.** When the gate arms, `CompactionCapability` applies
 the fold to `ContextManager` *and* mirrors the result into the run's own history list, in one
@@ -1149,8 +1139,8 @@ a new prompt. Two consequences, before you assume this stream is byte-identical 
 
 - an event can appear on a failure or cancellation path where none appeared before — subject to
   the unchanged hash dedup, so an unchanged rendering still emits nothing; and
-- on a healed failure it lands **ahead of** the healing `LlmMessageEvent`, a relative position that
-  did not previously exist.
+- on a failure it lands **after** the failed run's last persisted message, a relative position
+  that did not previously exist.
 
 Group a trace by `run_id`, which every event carries, rather than by arrival order.
 
@@ -1208,8 +1198,7 @@ One run of `ReactAgent`, with two model requests and a tool call in between. Rea
      └ Compaction                        │  Compaction: fold history if input tokens crossed the
        └ EventSourcing                   │    armed threshold; write to ContextManager AND to the
          └ LimitRecovery                 │    run's own list, as one operation
-           └ Healing                     │  EventSourcing: open the persistence cursor
-             └ …yours                    │
+           └ …yours                      │  EventSourcing: open the persistence cursor
                                          │
  ┌─ UserPromptNode ──────────────────────┤
  │   ▼ before_node_run                   │  EventSourcing: re-anchor the live history
@@ -1267,9 +1256,10 @@ One run of `ReactAgent`, with two model requests and a tool call in between. Rea
  run ends                                │    lifetime total (in `finally`, so a FAILED run counts)
 
  on the error path instead:              │
-   ▲ on_run_error  (innermost first)     │  Healing fires BEFORE LimitRecovery — it is later in
-                                         │    the list, and this chain walks backwards. So a
-                                         │    recovery policy reading the context sees a HEALED one
+   ▲ on_run_error  (innermost first)     │  LimitRecovery: record the seam's decision, re-raise.
+                                         │    pydantic-ai has already appended its interrupted
+                                         │    marker; the dangling call is closed out on the
+                                         │    NEXT run's first request
 ```
 
 **Two consequences worth stating outright, because both have already cost a bug:**
@@ -1298,7 +1288,7 @@ async def handle_limit_exceeded(
 ```
 
 - **`ConclusionDecision(reason=…)`** asks for one tool-free conclusion, started with `reason` as
-  its prompt on top of the healed context. The default implementation returns
+  its prompt on top of the breached run's history. The default implementation returns
   `ConclusionDecision()`, whose `reason` is `DEFAULT_CONCLUSION_REASON` — **one string, used for
   every kind of run-tier breach.** There is no per-limit wording, and it is not exported from
   `akgentic.llm`: reach it as
@@ -1333,22 +1323,20 @@ Four more things worth knowing:
 - **The capability only decides.** It records the decision and re-raises; it never runs anything.
   The conclusion is a *sibling run* driven by `ReactAgent`, so a recovery never nests a run inside
   a capability hook. It uses `on_run_error` and defines **no `wrap_run` at all** — deliberately:
-  pydantic-ai gives error hooks their chance only once the exception has escaped the whole
-  `wrap_run` chain, so a capability that caught the breach in its own `wrap_run` would stop
-  `HealingCapability.on_run_error` from ever running and the conclusion would start from a context
-  still carrying a dangling tool call.
+  a `wrap_run` that caught the breach would have to return a result to suppress it, which makes
+  the run tier unobservable and hands the mounter a result it never asked for.
 - **A conclusion is never itself recovered.** It enters the shared run core with recovery off, so
   a breach *during* a conclusion raises instead of starting another one.
 - **A rescued turn costs two units of the agent-lifetime run budget** — see
   [AgentUsageLimits](#agentusagelimits--reactagentconfigagent_usage_limits).
 - **The event stream is unchanged by a rescue.** The outer run's events arrive under its own
-  `run_id`, then the healing `ToolReturnPart`, then the conclusion's events under a *second*
-  `run_id` — because the conclusion has always been an ordinary second run. No event type, shape
+  `run_id`, then the conclusion's events under a *second* `run_id` — because the conclusion has
+  always been an ordinary second run. No event type, shape
   or ordering changed; the frozen event API described above still applies unmodified.
 
 **This seam is the whole of the degradation policy, deliberately.** A consumer does not implement
 its own — `akgentic-agent` used to, and retired it. Whether to conclude, with what prompt, and
-against which output type all live here, where the healed context and the caller's `output_type`
+against which output type all live here, where the breached run's history and the caller's `output_type`
 are; the consumer is left with a single `except UsageLimitError`. Two things the seam cannot
 currently express are ADR-021 §Q1 and §Q2 — see
 [What a consumer has to handle](#what-a-consumer-has-to-handle).
@@ -1840,17 +1828,15 @@ blocked from merging until all steps are green.
 src/akgentic/llm/
     __init__.py     # Public API exports
     agent.py        # ReactAgent, ModelSwitchError, UserPrompt type alias; re-exports
-                    #   UsageLimitError, RunUsageLimitError, AgentUsageLimitError and
-                    #   RUN_LIMIT_HEALING_MESSAGE from capabilities/errors.py, so imports
-                    #   written against their old home keep working
+                    #   UsageLimitError, RunUsageLimitError and AgentUsageLimitError
+                    #   from capabilities/errors.py, so imports written against their
+                    #   old home keep working
     capabilities/   # The run-loop capabilities, one module each
         __init__.py      # Re-exports; holds the whole composition/cursor module docstring
         budget.py        # LifetimeBudgetCapability
         compaction.py    # CompactionCapability
-        errors.py        # UsageLimitError, RunUsageLimitError, AgentUsageLimitError,
-                         #   RUN_LIMIT_HEALING_MESSAGE
+        errors.py        # UsageLimitError, RunUsageLimitError, AgentUsageLimitError
         event_sourcing.py  # EventSourcingCapability
-        healing.py       # HealingCapability
         limit_recovery.py  # LimitRecoveryCapability, ConclusionDecision,
                          #   DEFAULT_CONCLUSION_REASON
     compaction.py   # COMPACTION_STRATEGIES, SUMMARY_INSTRUCTIONS, CompactionStrategy,

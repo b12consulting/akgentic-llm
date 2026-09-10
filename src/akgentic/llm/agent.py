@@ -10,13 +10,10 @@ from pydantic_ai import UsageLimits as PydanticUsageLimits
 from pydantic_ai.messages import ModelMessage
 from pydantic_ai.usage import RunUsage
 
-# Re-exported, not used here: healing moved into HealingCapability and the usage-limit
-# hierarchy moved next to the capability that raises the agent tier, but
-# `akgentic.llm.agent.<name>` stays importable for callers written against the old home.
-# The capabilities package holds the one definition of each.
-from .capabilities import (
-    RUN_LIMIT_HEALING_MESSAGE as RUN_LIMIT_HEALING_MESSAGE,
-)
+# Re-exported, not used here: the usage-limit hierarchy moved next to the capability
+# that raises the agent tier, but `akgentic.llm.agent.<name>` stays importable for
+# callers written against the old home. The capabilities package holds the one
+# definition of each.
 from .capabilities import (
     AgentUsageLimitError as AgentUsageLimitError,
 )
@@ -24,7 +21,6 @@ from .capabilities import (
     CompactionCapability,
     ConclusionDecision,
     EventSourcingCapability,
-    HealingCapability,
     LifetimeBudgetCapability,
     LimitRecoveryCapability,
 )
@@ -79,8 +75,9 @@ def _evict_anyio_run_vars(loop: asyncio.AbstractEventLoop) -> None:
     never clears and the loop leaks. Evicting our own loop's entry breaks that
     ``_root_task → loop`` anchor. Best-effort and version-guarded: anyio
     internals are private, and a missing/absent ``_run_vars`` (or no anyio) must
-    not break teardown. Local copy of ``akgentic.core.agent._evict_anyio_run_vars``
-    (NOT imported — ``akgentic-llm`` must not depend on a sibling package).
+    not break teardown. anyio 4.15 clears the ``_root_task`` entry itself through
+    a task done-callback; this pop remains because it clears the whole per-loop
+    entry, whatever other run-vars a run left in it.
     """
     try:
         from anyio.lowlevel import _run_vars  # noqa: PLC0415
@@ -140,24 +137,21 @@ class ReactAgent:
             result_type: Type for agent result validation (default: str)
             observer: Context observer to register automatically (optional)
             capabilities: Optional sequence of pydantic-ai AgentCapability instances.
-                They are NOT forwarded unchanged: five internal capabilities —
+                They are NOT forwarded unchanged: four internal capabilities —
                 LifetimeBudgetCapability, then CompactionCapability, then
-                EventSourcingCapability, then LimitRecoveryCapability, then
-                HealingCapability — are mounted ahead of them, because those five own
-                the agent-lifetime budget, auto-compaction, persistence, system-prompt
-                recording, the run-tier recovery decision (whether a breached turn
-                concludes instead of raising — see `limit_recovery` below) and
-                dangling-tool-call healing for every run this agent drives. The budget
-                is outermost so a run it refuses reaches none of the others — including
-                the summarizer LLM call. Limit recovery is immediately before healing so
-                that healing, the later entry, fires FIRST in the reversed on_run_error
-                walk and the seam is consulted against an already-healed context.
+                EventSourcingCapability, then LimitRecoveryCapability — are mounted
+                ahead of them, because those four own the agent-lifetime budget,
+                auto-compaction, persistence, system-prompt recording and the run-tier
+                recovery decision (whether a breached turn concludes instead of raising
+                — see `limit_recovery` below) for every run this agent drives. The
+                budget is outermost so a run it refuses reaches none of the others —
+                including the summarizer LLM call.
                 That is the MOUNT order, and it is a default rather than a guarantee:
                 pydantic-ai's CombinedCapability topologically re-sorts the whole chain
                 as soon as ANY capability declares get_ordering(), so a caller declaring
-                position='outermost' — or wraps=[...] naming one of the five — lands
-                ahead of them. None of the five declares an ordering, so a caller that
-                declares nothing does sit inside all five, and the two consequences below
+                position='outermost' — or wraps=[...] naming one of the four — lands
+                ahead of them. None of the four declares an ordering, so a caller that
+                declares nothing does sit inside all four, and the two consequences below
                 hold for that caller. A caller that re-sorts itself gets neither.
                 First: a capability sees only the POST-compaction history, never what
                 compaction folded away — the fold happens in CompactionCapability's
@@ -174,7 +168,10 @@ class ReactAgent:
                 repair (`_agent_graph._clean_message_history` with
                 `repair_last_response=True`) runs on the model request path, AFTER
                 the capability chain, and silently synthesizes a matching
-                ToolReturnPart before the request reaches the provider. One
+                ToolReturnPart before the request reaches the provider — and since
+                2.38 the same repair closes out a tool call a failed or cancelled run
+                left dangling, on the next run, through the `state='interrupted'`
+                request the graph appends. One
                 pydantic-ai path skips the repair: resuming a provider-suspended
                 response runs the capability chain without it. ReactAgent has no
                 deferred-tool or suspend flow, so every request ReactAgent itself
@@ -271,20 +268,14 @@ class ReactAgent:
         # cursor at the first node hook either way. The internal ones come first so the
         # caller's sit inside them: pydantic-ai unwinds the chain in reverse, so a caller
         # capability's after_* hooks run before the persistence sweep and its durable edits
-        # are what gets persisted. Limit recovery sits immediately BEFORE healing, and that
-        # position is load-bearing: pydantic-ai walks the on_run_error chain in REVERSE, so
-        # the later entry fires first — healing must write its ToolReturnPart before the
-        # recovery seam is consulted, so that a policy reading the context to decide sees the
-        # healed one. It is NOT what keeps a dangling tool call out of the conclusion: the
-        # walk runs every hook and only then re-raises, so healing has always written its
-        # part by the time `_run_with_limits` drives the conclusion, whatever the order.
-        # Using `on_run_error` rather than `wrap_run` is what protects the conclusion.
+        # are what gets persisted. pydantic-ai closes out a tool call the breached run left
+        # dangling when it builds the conclusion's first request, so the conclusion never
+        # starts from an unprocessed tool call.
         capability_stack: list[AgentCapability[Any]] = [
             self._budget,
             self._compactor,
             EventSourcingCapability(context=self._context),
             self._limit_recovery,
-            HealingCapability(context=self._context),
             *(capabilities or []),
         ]
 
@@ -509,9 +500,10 @@ class ReactAgent:
 
         Args:
             reason: Why the turn must conclude now. Reaches the model as the run's
-                user prompt, on top of the healed context — so the
-                ``ToolReturnPart`` written by ``HealingCapability`` is already there
-                as the tool result the model reasons from.
+                user prompt, on top of the breached run's history; pydantic-ai closes
+                out the call that run left dangling with a synthesized tool return
+                when it builds this run's first request, so the model reasons from a
+                complete history.
             deps: Optional dependency object (must match deps_type).
             output_type: Optional per-call output type override (see ``run()``). A
                 conclusion is a next run, so it is served the model and the output

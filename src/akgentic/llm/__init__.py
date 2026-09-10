@@ -25,10 +25,10 @@ Key Concepts:
       message text.
     - ContextManager: Message history tracking
     - LifetimeBudgetCapability / CompactionCapability / EventSourcingCapability /
-      LimitRecoveryCapability / HealingCapability: the run loop's agent-lifetime
-      budget, its auto-compaction, its persistence, its run-tier recovery policy
-      and its dangling-tool-call repair, each mountable a la carte on any bare
-      pydantic-ai Agent. That is also ReactAgent's mount order.
+      LimitRecoveryCapability: the run loop's agent-lifetime budget, its
+      auto-compaction, its persistence and its run-tier recovery policy, each
+      mountable a la carte on any bare pydantic-ai Agent. That is also
+      ReactAgent's mount order.
     - ConclusionDecision: what LimitRecoveryCapability's handle_limit_exceeded seam
       returns to ask for a tool-free conclusion; None asks for none
     - PromptTemplate: Template-based prompts with parameter substitution
@@ -48,7 +48,6 @@ from .capabilities import (
     CompactionCapability,
     ConclusionDecision,
     EventSourcingCapability,
-    HealingCapability,
     LifetimeBudgetCapability,
     LimitRecoveryCapability,
 )
@@ -134,7 +133,6 @@ __all__ = [
     "LifetimeBudgetCapability",
     "CompactionCapability",
     "EventSourcingCapability",
-    "HealingCapability",
     "LimitRecoveryCapability",
     "ConclusionDecision",
     # Compaction

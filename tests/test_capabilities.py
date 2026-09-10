@@ -1,4 +1,4 @@
-"""Tests for LifetimeBudget, EventSourcing and Healing capabilities, mounted standalone.
+"""Tests for LifetimeBudget, EventSourcing, Compaction and LimitRecovery, mounted standalone.
 
 Every run here is driven by a **bare pydantic-ai ``Agent``** — never a ``ReactAgent``. That is
 the point of the decomposition: each capability must be mountable and provable on its own, on
@@ -23,7 +23,6 @@ from pydantic_ai.messages import (
     ModelResponse,
     TextPart,
     ToolCallPart,
-    ToolReturnPart,
     UserPromptPart,
 )
 from pydantic_ai.models import ModelRequestContext
@@ -41,11 +40,10 @@ from akgentic.llm import (
     ConclusionDecision,
     ContextManager,
     EventSourcingCapability,
-    HealingCapability,
     LifetimeBudgetCapability,
     LimitRecoveryCapability,
 )
-from akgentic.llm.capabilities import DEFAULT_CONCLUSION_REASON, RUN_LIMIT_HEALING_MESSAGE
+from akgentic.llm.capabilities import DEFAULT_CONCLUSION_REASON
 from akgentic.llm.event import (
     LlmContextCompactedEvent,
     LlmMessageEvent,
@@ -89,15 +87,6 @@ def _persisted(capture: EventCapture) -> list[ModelMessage]:
     return [e.message for e in _message_events(capture)]
 
 
-def _healing_contents(capture: EventCapture) -> list[str]:
-    """The content of every ToolReturnPart persisted through a healing ModelRequest."""
-    contents: list[str] = []
-    for message in _persisted(capture):
-        if isinstance(message, ModelRequest):
-            contents.extend(str(p.content) for p in message.parts if isinstance(p, ToolReturnPart))
-    return contents
-
-
 def _tool_calling_model() -> FunctionModel:
     """A model that answers every request with the same single tool call."""
 
@@ -119,7 +108,7 @@ def _agent_with_tool(capabilities: list[Any]) -> Agent[None, str]:
 
 
 def _bare_run_context() -> RunContext[None]:
-    """A synthetic RunContext — the healing hooks never read it."""
+    """A synthetic RunContext — the recovery hook never reads it."""
     return RunContext[None](deps=None, model=TestModel(), usage=RunUsage())
 
 
@@ -453,169 +442,6 @@ async def test_for_run_returns_a_fresh_instance_on_the_same_context() -> None:
     assert bound is not capability
     assert isinstance(bound, EventSourcingCapability)
     assert bound.context is context
-
-
-# ---------------------------------------------------------------------------
-# AC #7 / #8 — healing re-raises, with the single-sourced wording
-# ---------------------------------------------------------------------------
-
-
-async def test_healing_completes_dangling_calls_and_re_raises_the_same_object() -> None:
-    """Every dangling call is closed out, then the original error re-raised (AC #7)."""
-    context, capture = _manager_with_capture()
-    context.add_message(ModelRequest(parts=[UserPromptPart(content="q")]))
-    context.add_message(
-        ModelResponse(
-            parts=[
-                ToolCallPart(tool_name="alpha", args={}, tool_call_id="c1"),
-                ToolCallPart(tool_name="beta", args={}, tool_call_id="c2"),
-            ]
-        )
-    )
-    error = RuntimeError("kaboom")
-
-    with pytest.raises(RuntimeError) as exc_info:
-        await HealingCapability(context).on_run_error(_bare_run_context(), error=error)
-
-    assert exc_info.value is error
-    healed = context.messages[-1]
-    assert isinstance(healed, ModelRequest)
-    returns = [p for p in healed.parts if isinstance(p, ToolReturnPart)]
-    assert [(p.tool_name, p.tool_call_id) for p in returns] == [("alpha", "c1"), ("beta", "c2")]
-    assert _healing_contents(capture) == [
-        "Tool call aborted: RuntimeError: kaboom",
-        "Tool call aborted: RuntimeError: kaboom",
-    ]
-
-
-async def test_run_tier_breach_heals_with_the_shared_constant() -> None:
-    """A ``UsageLimitExceeded`` heals with ``RUN_LIMIT_HEALING_MESSAGE`` (AC #8)."""
-    context, capture = _manager_with_capture()
-    context.add_message(
-        ModelResponse(parts=[ToolCallPart(tool_name="alpha", args={}, tool_call_id="c1")])
-    )
-    error = UsageLimitExceeded("budget spent")
-
-    with pytest.raises(UsageLimitExceeded) as exc_info:
-        await HealingCapability(context).on_run_error(_bare_run_context(), error=error)
-
-    assert exc_info.value is error
-    assert _healing_contents(capture) == [RUN_LIMIT_HEALING_MESSAGE]
-
-
-def test_the_healing_constant_has_one_definition_in_the_package() -> None:
-    """``agent.py`` imports the constant rather than forking a second wording (AC #8)."""
-    from akgentic.llm import agent as agent_module
-    from akgentic.llm import capabilities as capabilities_module
-
-    assert agent_module.RUN_LIMIT_HEALING_MESSAGE is capabilities_module.RUN_LIMIT_HEALING_MESSAGE
-
-
-async def test_healing_no_ops_on_an_empty_context_and_still_re_raises() -> None:
-    """Nothing to heal, error still propagates (AC #7)."""
-    context, capture = _manager_with_capture()
-    error = RuntimeError("kaboom")
-
-    with pytest.raises(RuntimeError) as exc_info:
-        await HealingCapability(context).on_run_error(_bare_run_context(), error=error)
-
-    assert exc_info.value is error
-    assert capture.events == []
-
-
-async def test_healing_no_ops_when_the_trailing_response_has_no_tool_calls() -> None:
-    """A trailing text-only response is not dangling (AC #7)."""
-    context, capture = _manager_with_capture()
-    context.add_message(ModelResponse(parts=[TextPart(content="done")]))
-    before = len(capture.events)
-    error = RuntimeError("kaboom")
-
-    with pytest.raises(RuntimeError) as exc_info:
-        await HealingCapability(context).on_run_error(_bare_run_context(), error=error)
-
-    assert exc_info.value is error
-    assert len(capture.events) == before
-    assert _healing_contents(capture) == []
-
-
-async def test_healing_no_ops_when_the_trailing_message_is_a_request() -> None:
-    """A trailing ModelRequest means the previous turn already closed out (AC #7)."""
-    context, capture = _manager_with_capture()
-    context.add_message(
-        ModelResponse(parts=[ToolCallPart(tool_name="alpha", args={}, tool_call_id="c1")])
-    )
-    context.add_message(
-        ModelRequest(parts=[ToolReturnPart(tool_name="alpha", content="ok", tool_call_id="c1")])
-    )
-    error = RuntimeError("kaboom")
-
-    with pytest.raises(RuntimeError):
-        await HealingCapability(context).on_run_error(_bare_run_context(), error=error)
-
-    assert _healing_contents(capture) == ["ok"]
-
-
-# ---------------------------------------------------------------------------
-# AC #9 — the composed pair, in production order (Trap 2)
-# ---------------------------------------------------------------------------
-
-
-async def test_composed_pair_persists_the_dangling_response_before_the_healing_request() -> None:
-    """Sweep before heal, and the original breach reaches the caller (AC #9)."""
-    context, capture = _manager_with_capture()
-    agent = _agent_with_tool([EventSourcingCapability(context), HealingCapability(context)])
-
-    with pytest.raises(UsageLimitExceeded) as exc_info:
-        await agent.run("hello", usage_limits=UsageLimits(tool_calls_limit=1))
-
-    persisted = _persisted(capture)
-    healing = persisted[-1]
-    dangling = persisted[-2]
-    assert isinstance(dangling, ModelResponse)
-    assert dangling.tool_calls, "the run must end with an unanswered tool call"
-    assert isinstance(healing, ModelRequest)
-    assert [str(p.content) for p in healing.parts if isinstance(p, ToolReturnPart)] == [
-        RUN_LIMIT_HEALING_MESSAGE
-    ]
-    # Ordering: the two assertions above read the last two persisted messages by position,
-    # so the dangling response reaching the observer *before* the healing request is what
-    # puts each of them where its isinstance check found it.
-    assert "tool_calls_limit" in str(exc_info.value)
-
-
-async def test_composed_pair_propagates_a_generic_exception_with_its_wording() -> None:
-    """Generic failures heal with type-and-message and propagate unchanged (AC #8, #9)."""
-    context, capture = _manager_with_capture()
-    agent: Agent[None, str] = Agent(
-        model=_tool_calling_model(),
-        capabilities=[EventSourcingCapability(context), HealingCapability(context)],
-    )
-
-    @agent.tool_plain
-    def noop() -> str:
-        raise RuntimeError("kaboom")
-
-    with pytest.raises(RuntimeError, match="kaboom"):
-        await agent.run("hello")
-
-    assert _healing_contents(capture) == ["Tool call aborted: RuntimeError: kaboom"]
-    persisted = _persisted(capture)
-    assert isinstance(persisted[-2], ModelResponse)
-    assert persisted[-2].tool_calls
-
-
-async def test_composed_pair_leaves_a_successful_run_unhealed() -> None:
-    """No error, no healing — the pair is inert on the happy path (AC #9)."""
-    context, capture = _manager_with_capture()
-    agent: Agent[None, str] = Agent(
-        model=TestModel(),
-        capabilities=[EventSourcingCapability(context), HealingCapability(context)],
-    )
-
-    result: AgentRunResult[str] = await agent.run("hello")
-
-    assert _persisted(capture) == list(result.all_messages())
-    assert _healing_contents(capture) == []
 
 
 # ---------------------------------------------------------------------------
@@ -1494,9 +1320,9 @@ async def test_the_breachs_traceback_reaches_the_caller_untouched() -> None:
 def test_it_defines_no_wrap_run() -> None:
     """The decision lives on ``on_run_error`` and nowhere else (AC #2).
 
-    Error hooks fire only once the exception has escaped the whole ``wrap_run`` chain, so a
-    ``wrap_run`` here would pre-empt ``HealingCapability.on_run_error`` and the conclusion
-    would start from a context still carrying a dangling tool call.
+    A ``wrap_run`` that caught the breach would have to return a result to suppress it,
+    which makes the run tier unobservable and hands the mounter a result it never asked
+    for, when what it needs is the decision.
     """
     assert "wrap_run" not in LimitRecoveryCapability.__dict__
     assert LimitRecoveryCapability.wrap_run is AbstractCapability.wrap_run
