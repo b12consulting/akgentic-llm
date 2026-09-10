@@ -22,6 +22,7 @@ import pytest
 from pydantic_ai import UsageLimitExceeded
 from pydantic_ai.messages import (
     ModelMessage,
+    ModelMessagesTypeAdapter,
     ModelRequest,
     ModelResponse,
     TextPart,
@@ -177,6 +178,30 @@ async def test_a_crashed_tool_call_is_closed_out_on_the_next_run() -> None:
     assert _prompt_present(last_received, "second")
 
 
+async def test_a_generic_failure_reaches_the_caller_as_the_same_object() -> None:
+    """A non-usage failure leaves ``run()`` as the same exception object, traceback intact.
+
+    The operator's stack is formatted off the object that leaves ``run()``, so a capability
+    on the error path that wrapped, replaced or suppressed it would break debugging without
+    any message-level check noticing. Asserted by identity, which ``match=`` cannot substitute
+    for: a re-raised copy matches the same text.
+    """
+    received: list[list[ModelMessage]] = []
+    agent = _agent()
+    sentinel = RuntimeError("sentinel failure")
+
+    @agent.pydantic_agent.tool_plain
+    def kaboom() -> str:
+        raise sentinel
+
+    with agent.pydantic_agent.override(model=_recording_model(received, "kaboom")):
+        with pytest.raises(RuntimeError) as exc_info:
+            await agent.run("first")
+
+    assert exc_info.value is sentinel
+    assert exc_info.value.__traceback__ is not None
+
+
 async def test_a_run_tier_breach_is_closed_out_on_the_next_run() -> None:
     """A tool-call-limit breach leaves a history the next run's model receives repaired (AC 3)."""
     received: list[list[ModelMessage]] = []
@@ -203,8 +228,13 @@ async def test_the_failure_survives_event_sourcing_and_restore() -> None:
     """The events a crashed run emitted restore into a history a fresh agent resumes (AC 5).
 
     The worker-restart path: whatever pydantic-ai appended to close out the failed turn is
-    persisted by ``EventSourcingCapability``, folded back by ``restore_context`` on a fresh
-    agent, and repaired by pydantic-ai on that agent's first run.
+    persisted by ``EventSourcingCapability``, serialized to the wire and back, folded by
+    ``restore_context`` on a fresh agent, and repaired by pydantic-ai on that agent's first run.
+
+    The repair keys on the marker request's ``state == "interrupted"``; a serializer that
+    dropped that field would turn every resumed agent into a hard error on its first prompt,
+    so the messages go through pydantic-ai's own JSON round-trip before being restored and the
+    marker's ``state`` is asserted on the restored side.
     """
     received: list[list[ModelMessage]] = []
     capture = _EventCapture()
@@ -219,8 +249,19 @@ async def test_the_failure_survives_event_sourcing_and_restore() -> None:
             await crashing.run("first")
     dangling_id = _dangling_call_id(crashing)
 
-    envelopes = [_EventEnvelope(event=e) for e in capture.events if isinstance(e, LlmMessageEvent)]
+    persisted = [e.message for e in capture.events if isinstance(e, LlmMessageEvent)]
+    wire = ModelMessagesTypeAdapter.dump_json(persisted)
+    restored = ModelMessagesTypeAdapter.validate_json(wire)
+    marker = restored[-1]
+    assert isinstance(marker, ModelRequest) and marker.state == "interrupted"
+
+    envelopes = [_EventEnvelope(event=LlmMessageEvent(message=m)) for m in restored]
     fresh = _agent()
+
+    @fresh.pydantic_agent.tool_plain
+    def kaboom_again() -> str:  # a real restart re-registers the tool
+        raise RuntimeError("kaboom")
+
     fresh.restore_context(envelopes)
 
     with fresh.pydantic_agent.override(model=_recording_model(received, "kaboom")):

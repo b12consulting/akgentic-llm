@@ -121,9 +121,12 @@ def test_eviction_removes_the_loops_run_vars_entry() -> None:
     if loop not in ll._run_vars:
         pytest.skip("anyio _run_vars anchor not populated on this version")
 
-    _evict_anyio_run_vars(loop)
-
-    assert loop not in ll._run_vars
+    try:
+        _evict_anyio_run_vars(loop)
+        assert loop not in ll._run_vars
+    finally:
+        # On failure, still evict so the pinned closed loop does not leak into the suite.
+        _evict_anyio_run_vars(loop)
 
 
 # ---------------------------------------------------------------------------

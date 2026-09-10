@@ -35,6 +35,7 @@ from akgentic.llm import (
     CompactionConfig,
     CompactionResult,
     ConclusionDecision,
+    ContextManager,
     EventSourcingCapability,
     LifetimeBudgetCapability,
     LimitRecoveryCapability,
@@ -1893,10 +1894,10 @@ class TestReactAgentConcludeWithoutTools:
             with pytest.raises(RunUsageLimitError):
                 await agent.run("do the thing")
 
-        dangling = agent.context.messages[-1]
-        if not isinstance(dangling, ModelResponse):
-            # pydantic-ai 2.38+ appends its interrupted marker after the dangling response.
-            dangling = agent.context.messages[-2]
+        # pydantic-ai 2.38+ appends its interrupted marker after the dangling response,
+        # unconditionally; the floor is 2.38, so this shape is the only one that can occur.
+        marker, dangling = agent.context.messages[-1], agent.context.messages[-2]
+        assert isinstance(marker, ModelRequest) and marker.state == "interrupted"
         assert isinstance(dangling, ModelResponse)
         dangling_id = dangling.tool_calls[0].tool_call_id
 
@@ -2071,15 +2072,19 @@ def _closes_out(received: list[ModelMessage], dangling_id: str) -> bool:
 
 @dataclass
 class _RecordingSeam(LimitRecoveryCapability):
-    """Records each consultation."""
+    """Records each consultation and the context as it stood at that moment."""
 
     consulted: list[UsageLimitExceeded] = field(default_factory=list)
+    context_seen: list[list[ModelMessage]] = field(default_factory=list)
+    context: ContextManager | None = None
 
     async def handle_limit_exceeded(
         self, ctx: RunContext[Any], *, error: UsageLimitExceeded
     ) -> ConclusionDecision | None:
-        """Record the consultation, then decide exactly as the base class would."""
+        """Snapshot the durable context, then decide exactly as the base class would."""
         self.consulted.append(error)
+        if self.context is not None:
+            self.context_seen.append(list(self.context.messages))
         return await super().handle_limit_exceeded(ctx, error=error)
 
 
@@ -2159,6 +2164,35 @@ class TestReactAgentLimitRecovery:
 
         conclude.assert_not_called()
         assert agent._limit_recovery.consume_decision() is None
+
+    async def test_the_seam_sees_the_dangling_response_and_the_interrupted_marker(self):
+        """What a policy reading the context finds when consulted (AC #6b).
+
+        Pins the shape ``LimitRecoveryCapability``'s docstring states: by the time
+        ``on_run_error`` fires, pydantic-ai has appended its empty interrupted-request marker
+        after the dangling ``ModelResponse``, and nothing has closed the call out yet. A
+        pydantic-ai release that appended the marker later, or a persistence change that
+        dropped empty requests, would make that docstring false — this is what would see it.
+        """
+        offered: list[list[str]] = []
+        seam = _RecordingSeam()
+        agent = ReactAgent(
+            config=_recovery_config(tool_calls_limit=1),
+            tools=[weather_lookup],
+            limit_recovery=seam,
+        )
+        seam.context = agent.context
+
+        with agent.pydantic_agent.override(model=_breaching_then_concluding_model(offered)):
+            result = await agent.run("do the thing")
+
+        assert result == "concluded"
+        assert len(seam.consulted) == 1, "the recovery hook ran exactly once"
+        seen = seam.context_seen[0]
+        marker, dangling = seen[-1], seen[-2]
+        assert isinstance(marker, ModelRequest) and marker.state == "interrupted"
+        assert marker.parts == []
+        assert isinstance(dangling, ModelResponse) and dangling.tool_calls
 
     async def test_the_conclusion_keeps_the_runs_output_type_and_deps(self):
         """Both are threaded verbatim from the breached call (AC #9).
