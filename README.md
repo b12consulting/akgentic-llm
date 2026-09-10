@@ -991,7 +991,7 @@ or does not end with a `ModelRequest`.
   This is pydantic-ai's internal pipeline behaviour, **not a documented public guarantee**, and
   it could change in a future release — a capability should still avoid orphaning tool calls on
   purpose.
-- Your capabilities sit **inside** the five internal ones — unless one of them declares its own
+- Your capabilities sit **inside** the four internal ones — unless one of them declares its own
   ordering constraints, see [Run-loop capabilities](#run-loop-capabilities) — so `before_*` hooks
   fire after theirs and `after_*` hooks before theirs. Your durable `after_*` edits are what gets
   persisted: `EventSourcingCapability`'s closing sweep lives in `wrap_run`'s `finally`, outside
@@ -999,8 +999,8 @@ or does not end with a `ModelRequest`.
 
 ### Run-loop capabilities
 
-`ReactAgent` does not implement the lifetime budget, compaction, persistence, the run-tier
-recovery decision or dangling-tool-call repair in its run method. All five are standalone
+`ReactAgent` does not implement the lifetime budget, compaction, persistence or the run-tier
+recovery decision in its run method. All four are standalone
 pydantic-ai capabilities, exported from `akgentic.llm`, and each is mountable on a bare `Agent`
 of your own:
 
@@ -1142,11 +1142,18 @@ a new prompt. Two consequences, before you assume this stream is byte-identical 
 - on a failure it lands **after** the failed run's last persisted message, a relative position
   that did not previously exist.
 
+One message shape is new in the stream since pydantic-ai 2.38: when a tool-call turn fails during
+tool execution, the graph appends an **empty** `ModelRequest(parts=[], state='interrupted')` after
+the dangling `ModelResponse`, and `EventSourcingCapability` persists it as an `LlmMessageEvent`
+like any other message. A consumer that renders or extracts parts must tolerate a part-less
+request. Its `state` field is what the next run's repair keys on, so anything that serializes
+messages must carry it through — `ModelMessagesTypeAdapter` does.
+
 Group a trace by `run_id`, which every event carries, rather than by arrival order.
 
 ### Hook timeline
 
-The five internal capabilities, `PendingMessageDrainCapability` (auto-injected by pydantic-ai)
+The four internal capabilities, `PendingMessageDrainCapability` (auto-injected by pydantic-ai)
 and any caller capability all hang off the **same** set of hooks. What separates them is *which*
 hook and *which direction the chain is walked* — and neither is guessable from a signature. This
 section is the map.
@@ -1331,8 +1338,9 @@ Four more things worth knowing:
   [AgentUsageLimits](#agentusagelimits--reactagentconfigagent_usage_limits).
 - **The event stream is unchanged by a rescue.** The outer run's events arrive under its own
   `run_id`, then the conclusion's events under a *second* `run_id` — because the conclusion has
-  always been an ordinary second run. No event type, shape
-  or ordering changed; the frozen event API described above still applies unmodified.
+  always been an ordinary second run. No event type or ordering changed by the rescue; the one
+  new message shape — the empty interrupted-request marker the breached run leaves behind, see
+  [Run-loop capabilities](#run-loop-capabilities) above — comes from pydantic-ai, not from recovery.
 
 **This seam is the whole of the degradation policy, deliberately.** A consumer does not implement
 its own — `akgentic-agent` used to, and retired it. Whether to conclude, with what prompt, and
