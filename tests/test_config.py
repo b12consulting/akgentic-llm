@@ -1,6 +1,7 @@
 """Tests for configuration models."""
 
 import copy
+from typing import get_args
 
 import pytest
 from pydantic import ValidationError
@@ -62,8 +63,9 @@ class TestModelConfig:
         assert config.reasoning_effort is None
 
     def test_all_providers(self):
-        """Test all supported providers."""
-        providers = ["openai", "azure", "nvidia", "google-gla", "mistral", "anthropic"]
+        """Every provider named by the literal constructs; the list is derived, not copied."""
+        providers = get_args(ModelConfig.model_fields["provider"].annotation)
+        assert "openrouter" in providers
         for provider in providers:
             config = ModelConfig(provider=provider, model="test-model")  # type: ignore
             assert config.provider == provider
@@ -306,6 +308,37 @@ class TestModelConfigFallbackModels:
             fallback_models=[ModelConfig(provider="nvidia", model="openai/gpt-oss-20b")],
         )
         assert config.fallback_models[0].model == "openai/gpt-oss-20b"
+
+    def test_openrouter_prompt_route_cannot_back_native_primary(self):
+        """openai (supports) + openrouter deepseek/* (does not) raises."""
+        with pytest.raises(ValidationError, match="supports_native_output=True"):
+            ModelConfig(
+                provider="openai",
+                model="gpt-4o",
+                fallback_models=[
+                    ModelConfig(provider="openrouter", model="deepseek/deepseek-chat")
+                ],
+            )
+
+    def test_openrouter_native_route_can_back_native_primary(self):
+        """openai (supports) + openrouter google/* (supports) constructs."""
+        config = ModelConfig(
+            provider="openai",
+            model="gpt-4o",
+            fallback_models=[
+                ModelConfig(provider="openrouter", model="google/gemini-2.5-flash")
+            ],
+        )
+        assert config.fallback_models[0].provider == "openrouter"
+
+    def test_openrouter_prompt_route_primary_with_prompt_fallback(self):
+        """openrouter deepseek/* (does not) + google-gla (does not) constructs."""
+        config = ModelConfig(
+            provider="openrouter",
+            model="deepseek/deepseek-chat",
+            fallback_models=[ModelConfig(provider="google-gla", model="gemini-2.0-flash")],
+        )
+        assert config.fallback_models[0].provider == "google-gla"
 
     # --- AC 8: both validators short-circuit on the empty default ---
 

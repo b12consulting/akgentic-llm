@@ -17,6 +17,7 @@ Supported LLM Providers:
     - Google Gemini (google-gla)
     - Mistral AI
     - NVIDIA NIM
+    - OpenRouter (vendor/model routes, e.g. deepseek/deepseek-v4-flash-0731)
 
 Example:
     >>> from akgentic.llm import ModelConfig, create_model
@@ -53,6 +54,7 @@ if TYPE_CHECKING:
         OpenAIResponsesModel,
         OpenAIResponsesModelSettings,
     )
+    from pydantic_ai.models.openrouter import OpenRouterModel
 
 logger = logging.getLogger(__name__)
 
@@ -94,11 +96,13 @@ def get_output_type[T](
     """Get the appropriate output type wrapper for structured output based on provider.
 
     For providers with native structured output support (OpenAI, Azure, Anthropic,
-    and NVIDIA OpenAI models), returns ``NativeOutput[T]`` to leverage the provider's
-    native function calling or tool use APIs for schema enforcement.
+    NVIDIA OpenAI models, and OpenRouter ``openai/``, ``google/`` and ``x-ai/``
+    routes), returns ``NativeOutput[T]`` to leverage the provider's native function
+    calling or tool use APIs for schema enforcement.
 
-    For other providers (Google Gemini, Mistral, and non-OpenAI NVIDIA models),
-    returns the raw type to use pydantic-ai's prompt-based extraction fallback.
+    For other providers (Google Gemini, Mistral, non-OpenAI NVIDIA models, and every
+    other OpenRouter route), returns the raw type to use pydantic-ai's prompt-based
+    extraction fallback.
 
     For ``str`` result types (default case), always returns the raw type since
     structured output wrapping is not needed.
@@ -173,8 +177,9 @@ def create_model_settings(config: ModelConfig) -> ModelSettings | None:
     Note:
         The parallel_tool_calls parameter is automatically set to False for
         providers that don't support native structured output (google-gla,
-        mistral, and non-OpenAI NVIDIA models). This ensures correct behavior
-        when using structured output via prompt-based extraction.
+        mistral, non-OpenAI NVIDIA models, and OpenRouter routes outside the
+        ``openai/``, ``google/`` and ``x-ai/`` vendors). This ensures correct
+        behavior when using structured output via prompt-based extraction.
     """
     kwargs: dict[str, Any] = dict(cast(dict[str, Any], _build_core_settings(config) or {}))
 
@@ -556,6 +561,37 @@ def _create_nvidia_model(
     )
 
 
+def _create_openrouter_model(
+    config: ModelConfig,
+    http_client: httpx2.AsyncClient,
+) -> "OpenRouterModel":
+    """Create OpenRouter model.
+
+    Routes ``config.model`` (an OpenRouter ``vendor/model`` id) through the
+    OpenRouter gateway. The API key comes from ``OPENROUTER_API_KEY``.
+
+    Args:
+        config: LLM model configuration.
+        http_client: Async HTTP client with retry logic.
+
+    Returns:
+        Configured OpenRouterModel instance.
+
+    Raises:
+        pydantic_ai.exceptions.UserError: If ``OPENROUTER_API_KEY`` is unset,
+            or if ``config.model`` is not a ``vendor/model`` id.
+    """
+    from pydantic_ai.models.openrouter import OpenRouterModel  # noqa: PLC0415
+    from pydantic_ai.providers.openrouter import OpenRouterProvider  # noqa: PLC0415
+
+    settings = _build_core_settings(config)
+    return OpenRouterModel(
+        model_name=config.model,
+        provider=OpenRouterProvider(http_client=http_client),
+        settings=settings,
+    )
+
+
 _PROVIDER_FACTORIES = {
     "openai": _create_openai_model,
     "openai-chat": _create_openai_chat_model,
@@ -565,6 +601,7 @@ _PROVIDER_FACTORIES = {
     "google-gla": _create_google_model,
     "mistral": _create_mistral_model,
     "nvidia": _create_nvidia_model,
+    "openrouter": _create_openrouter_model,
 }
 
 
@@ -586,6 +623,8 @@ def _build_single_model(
 
     Raises:
         ValueError: If provider is not supported.
+        pydantic_ai.exceptions.UserError: If an ``openrouter`` entry has no
+            ``OPENROUTER_API_KEY`` or a model id without a ``vendor/`` prefix.
     """
     factory = _PROVIDER_FACTORIES.get(config.provider)
     if factory is None:
@@ -618,6 +657,7 @@ def create_model(
         - google-gla: Google Gemini models
         - mistral: Mistral AI models
         - nvidia: NVIDIA NIM models
+        - openrouter: OpenRouter gateway (vendor/model ids, OPENROUTER_API_KEY)
 
     Fallback chain:
         When ``config.fallback_models`` is non-empty, the primary model and every
@@ -631,7 +671,8 @@ def create_model(
         Every entry is built eagerly here, not on the first primary failure, so a
         misconfigured entry fails at construction rather than mid-run. The cost is
         that each entry's environment must already be satisfied: an ``azure`` entry
-        needs ``AZURE_OPENAI_ENDPOINT`` even while the primary is healthy.
+        needs ``AZURE_OPENAI_ENDPOINT`` even while the primary is healthy, and an
+        ``openrouter`` entry needs ``OPENROUTER_API_KEY``.
 
     Args:
         config: LLM model configuration.
@@ -647,6 +688,8 @@ def create_model(
         ValueError: If the provider of the primary model or of any fallback
             entry is not supported, or if a provider factory rejects that
             entry's environment (for example a missing ``AZURE_OPENAI_ENDPOINT``).
+        pydantic_ai.exceptions.UserError: If an ``openrouter`` entry has no
+            ``OPENROUTER_API_KEY`` or a model id without a ``vendor/`` prefix.
 
     Example:
         >>> from akgentic.llm import ModelConfig, create_model
