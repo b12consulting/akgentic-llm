@@ -8,9 +8,11 @@ of being pinned forever by the ``_root_task`` ``RunVar`` that
 Unlike Story 11-4 (which stubbed ``run()`` and never drove the anyio path),
 these tests drive a **real** anyio path (``to_thread.run_sync`` / a task group)
 on the owned loop so the anchor actually forms, then assert via a ``weakref``
-after ``gc.collect()`` that the loop is freed once evicted — with a negative
-control (no eviction ⇒ survives) and a positive control (no anyio ⇒ freed
-regardless) to isolate the anchor as the cause.
+after ``gc.collect()`` that the loop is freed once evicted — with a positive
+control (no anyio ⇒ freed regardless). anyio 4.15 frees the ``_root_task``
+entry itself through a task done-callback, so the loop-survival negative
+control is gone; the eviction is instead pinned on what it removes — the
+loop's whole entry in ``_run_vars``.
 
 Zero-egress: the anyio drive uses a plain sync no-op via ``to_thread.run_sync``
 and a bare task group; no model is contacted and no request is sent.
@@ -62,8 +64,8 @@ def test_real_anyio_drive_populates_run_vars() -> None:
     loop = asyncio.new_event_loop()
     try:
         _drive_anyio_anchor(loop)
-        # Guard for a future anyio that changes this internal; on the locked
-        # anyio 4.14.0 the anchor MUST form, so this skip must NOT fire here.
+        # anyio is uncapped: the skip is the guard for a release that stops
+        # populating run-vars on this path, not an expected outcome today.
         if loop not in ll._run_vars:
             pytest.skip("anyio _run_vars anchor not populated on this version")
         assert ll._run_vars[loop]  # non-empty: the _root_task RunVar was set
@@ -100,40 +102,28 @@ def test_loop_freed_after_close_and_eviction(minimal_config: ReactAgentConfig) -
 
 
 # ---------------------------------------------------------------------------
-# AC #6 — negative control: WITHOUT the eviction the loop SURVIVES gc.collect()
+# AC #6 — the eviction removes the loop's whole entry from anyio's run-vars
 # ---------------------------------------------------------------------------
 
 
-def test_negative_control_no_eviction_loop_survives() -> None:
-    """Same drive, but skip the eviction ⇒ the closed loop is NOT collected (AC #6).
+def test_eviction_removes_the_loops_run_vars_entry() -> None:
+    """After ``loop.close()``, ``_evict_anyio_run_vars(loop)`` drops ``_run_vars[loop]``.
 
-    This is the test-of-the-test: it proves AC #5's pass is caused by the
-    eviction, not by something else freeing the loop. Cleans up in ``finally``
-    so the pinned loop does not leak into the rest of the suite.
+    Pinned on what the helper removes rather than on the loop surviving without it:
+    anyio 4.15 frees the ``_root_task`` key itself, so loop survival is no longer a
+    property of our eviction. The precondition is asserted immediately before evicting
+    and the test SKIPS rather than passes when the entry is already gone — a future
+    anyio could drop the whole entry on its own, and then there is nothing to evict.
     """
     loop = asyncio.new_event_loop()
     _drive_anyio_anchor(loop)
+    loop.close()
     if loop not in ll._run_vars:
-        loop.close()
-        _evict_anyio_run_vars(loop)
         pytest.skip("anyio _run_vars anchor not populated on this version")
 
-    wr = weakref.ref(loop)
-    try:
-        loop.close()  # close WITHOUT calling _evict_anyio_run_vars
-        del loop
-        gc.collect()
-        # The _root_task anchor in _run_vars still pins the closed loop.
-        assert wr() is not None
-    finally:
-        # Now evict and collect so the loop does not leak into the suite.
-        survivor = wr()
-        if survivor is not None:
-            _evict_anyio_run_vars(survivor)
-            del survivor
-        gc.collect()
-    # With the eviction applied, the loop is now collectable.
-    assert wr() is None
+    _evict_anyio_run_vars(loop)
+
+    assert loop not in ll._run_vars
 
 
 # ---------------------------------------------------------------------------
