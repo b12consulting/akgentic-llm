@@ -55,8 +55,8 @@ call any LLM without coupling to a specific vendor or framework primitive.
   default the breach **is** recovered: the turn degrades into one tool-free conclusion and
   `run()` returns its answer (see [Usage limits](#usage-limits) and
   [Run-tier recovery](#run-tier-recovery))
-- **Provider abstraction** — `create_model()` dispatches to one of six provider factories
-  (OpenAI, Azure, Anthropic, Google, Mistral, NVIDIA), wrapping the result in pydantic-ai's
+- **Provider abstraction** — `create_model()` dispatches to one of seven provider factories
+  (OpenAI, Azure, Anthropic, Google, Mistral, NVIDIA, OpenRouter), wrapping the result in pydantic-ai's
   `FallbackModel` when `ModelConfig.fallback_models` is non-empty; `get_output_type()` wraps
   output types with `NativeOutput` for providers that support structured output, falls back to
   prompt-based extraction for those that don't
@@ -745,6 +745,8 @@ a scenario bound to `model_cfg.model` at construction and builds no model at all
 | Anthropic | `"anthropic"` | `ANTHROPIC_API_KEY` | ✅ |
 | NVIDIA NIM (openai/* models) | `"nvidia"` | `OPENAI_API_KEY` | ✅ |
 | NVIDIA NIM (other models) | `"nvidia"` | `OPENAI_API_KEY` | ❌ |
+| OpenRouter (openai/*, google/*, x-ai/* routes) | `"openrouter"` | `OPENROUTER_API_KEY` | ✅ |
+| OpenRouter (other routes) | `"openrouter"` | `OPENROUTER_API_KEY` | ❌ |
 | Google Gemini | `"google-gla"` | `GOOGLE_API_KEY` **or** `GEMINI_API_KEY` (one is mandatory) | ❌ |
 | Mistral AI | `"mistral"` | `MISTRAL_API_KEY` | ❌ |
 
@@ -758,6 +760,19 @@ Providers without native structured output use pydantic-ai's prompt-based extrac
 > surfaces as a **401 at request time**, not as a configuration error. The endpoint comes from
 > `NVIDIA_BASE_URL`, defaulting to `https://integrate.api.nvidia.com/v1`.
 
+> **OpenRouter is a switchboard, so native output follows the route, not the provider.** Model ids
+> are OpenRouter `vendor/model` routes (`deepseek/deepseek-chat`), optionally an alias
+> (`~vendor/model-latest`) or tagged (`vendor/model:free`); the alias marker is stripped and the tag
+> ignored, so both classify like their vendor. Only `openai/`, `google/` and `x-ai/` routes get
+> native structured output. That allowlist is deliberately a subset of pydantic-ai's own route
+> profiles: a vendor listed here that pydantic-ai marks unsupported would fail every structured
+> request at request time, while a vendor omitted only degrades to prompt-based extraction. The
+> shared default model `gpt-5.2` has no vendor prefix and is rejected by pydantic-ai when the
+> model is built. A missing `OPENROUTER_API_KEY` fails at construction with pydantic-ai's
+> `UserError`, not at request time. genai-prices prices routes under the `openrouter` provider,
+> so cost accounting works unchanged; a route newer than the installed genai-prices snapshot
+> reports `0.0` until the library ships it (the dependency is uncapped, so this self-heals).
+
 > **Google is API-key only.** The provider factory reads `GOOGLE_API_KEY`, falling back to
 > `GEMINI_API_KEY`, and raises `ValueError` when neither is set. Application Default
 > Credentials are not consulted, so an ADC-only deployment does not work.
@@ -768,6 +783,12 @@ ModelConfig(provider="nvidia", model="openai/gpt-oss-120b")
 
 # NVIDIA NIM — non-OpenAI model (no native output)
 ModelConfig(provider="nvidia", model="meta/llama-3.1-8b-instruct")
+
+# OpenRouter — DeepSeek route (prompt-based output)
+ModelConfig(provider="openrouter", model="deepseek/deepseek-v4-flash-0731")
+
+# OpenRouter — Google route (native output)
+ModelConfig(provider="openrouter", model="google/gemini-2.5-flash")
 ```
 
 ### Fallback chain
@@ -783,8 +804,9 @@ support, because that wrapper is chosen once from the primary's provider before 
 Every entry is built eagerly, when the agent is constructed — not lazily, on the first failure. That
 is what makes a bad entry fail loudly and early, but it also means each entry's credentials and
 environment must be present up front: the example below does not construct without
-`AZURE_OPENAI_ENDPOINT`, even while the OpenAI primary is perfectly healthy. All entries share the
-one `http_client` passed to `create_model()`.
+`AZURE_OPENAI_ENDPOINT`, even while the OpenAI primary is perfectly healthy, and an `openrouter`
+entry needs `OPENROUTER_API_KEY` just the same. All entries share the one `http_client` passed to
+`create_model()`.
 
 ```python
 ModelConfig(
