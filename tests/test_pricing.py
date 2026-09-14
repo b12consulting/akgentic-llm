@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 
+import pytest
 from pydantic import BaseModel
 
 from akgentic.llm.event import LlmUsageEvent
@@ -14,6 +15,42 @@ from akgentic.llm.pricing import (
     RunUsageSummary,
     aggregate_usage,
 )
+
+# The OpenAI row the inclusive-cached-turn test prices against. Held in one place so
+# the model can be re-pointed in a single line when the table is refreshed.
+_OPENAI_MODEL = "gpt-4o"
+
+# The Anthropic row, whose cache_write rate (3.75) differs from its input rate (3.0).
+# On a row where cache_write == input the two cache_write contributions cancel and the
+# cache_write half of the subtraction is unobservable by construction.
+_ANTHROPIC_MODEL = "claude-sonnet-4-20250514"
+
+
+def _expected_cost(
+    model_key: str,
+    *,
+    input_tokens: int,
+    output_tokens: int,
+    cache_read_tokens: int = 0,
+    cache_write_tokens: int = 0,
+) -> float:
+    """Derive the expected cost from the PRICING row, independently of pricing.py.
+
+    Deliberately a transcription rather than a call into ``_compute_model_cost`` or
+    ``_resolve_pricing``: a helper that delegates to the code under test agrees with
+    whatever that code does, including a defect, and so asserts nothing.
+
+    ``input_tokens`` is inclusive of both cache figures, so the input rate applies to
+    the uncached remainder only.
+    """
+    rates = PRICING[model_key]
+    uncached = max(0, input_tokens - cache_read_tokens - cache_write_tokens)
+    return (
+        uncached * rates["input"]
+        + output_tokens * rates["output"]
+        + cache_read_tokens * rates["cache_read"]
+        + cache_write_tokens * rates["cache_write"]
+    ) / 1_000_000
 
 
 def _make_event(
@@ -336,24 +373,108 @@ class TestUnknownModel:
 
 
 class TestCacheTokenPricing:
-    """Cache token pricing included in cost calculation."""
+    """The input rate applies to the uncached remainder, not to every input token.
 
-    def test_cache_tokens_affect_cost(self) -> None:
+    Providers report ``input_tokens`` inclusive of the cached figures, so charging the
+    full input count at the input rate bills every cached token a second time.
+    """
+
+    def test_inclusive_cached_turn_prices_uncached_remainder(self) -> None:
+        """A realistic cached turn: 50k input of which 43k was served from cache."""
         events = [
             _make_event(
-                model_name="claude-sonnet-4-20250514",
-                input_tokens=0,
-                output_tokens=0,
-                cache_read_tokens=1_000_000,
-                cache_write_tokens=1_000_000,
+                model_name=_OPENAI_MODEL,
+                provider_name="openai",
+                input_tokens=50_000,
+                output_tokens=800,
+                cache_read_tokens=43_000,
+                cache_write_tokens=0,
             ),
         ]
         result = aggregate_usage(events)
-        model = result.by_model["claude-sonnet-4-20250514"]
-        expected_cost = (1_000_000 * 0.30 + 1_000_000 * 3.75) / 1_000_000
-        assert model.estimated_cost_usd == expected_cost
-        assert result.total_cache_read_tokens == 1_000_000
-        assert result.total_cache_write_tokens == 1_000_000
+        model = result.by_model[_OPENAI_MODEL]
+        assert model.estimated_cost_usd == pytest.approx(
+            _expected_cost(
+                _OPENAI_MODEL,
+                input_tokens=50_000,
+                output_tokens=800,
+                cache_read_tokens=43_000,
+            )
+        )
+
+    def test_cache_write_is_subtracted_as_well_as_cache_read(self) -> None:
+        """Both cache figures come out of the input term, not just cache_read.
+
+        Only observable on a row where cache_write != input, hence the Anthropic row.
+        Asserting inequality with the cache-read-only decomposition catches a partial
+        fix as well as no fix at all.
+        """
+        events = [
+            _make_event(
+                model_name=_ANTHROPIC_MODEL,
+                input_tokens=100_000,
+                output_tokens=2_000,
+                cache_read_tokens=40_000,
+                cache_write_tokens=25_000,
+            ),
+        ]
+        result = aggregate_usage(events)
+        model = result.by_model[_ANTHROPIC_MODEL]
+
+        both_subtracted = _expected_cost(
+            _ANTHROPIC_MODEL,
+            input_tokens=100_000,
+            output_tokens=2_000,
+            cache_read_tokens=40_000,
+            cache_write_tokens=25_000,
+        )
+        assert model.estimated_cost_usd == pytest.approx(both_subtracted)
+
+        # Same tokens, but with only cache_read taken out of the input term: the
+        # cache_write tokens are still priced, they are just not removed from input.
+        rates = PRICING[_ANTHROPIC_MODEL]
+        cache_read_only = (
+            (100_000 - 40_000) * rates["input"]
+            + 2_000 * rates["output"]
+            + 40_000 * rates["cache_read"]
+            + 25_000 * rates["cache_write"]
+        ) / 1_000_000
+        neither_subtracted = (
+            100_000 * rates["input"]
+            + 2_000 * rates["output"]
+            + 40_000 * rates["cache_read"]
+            + 25_000 * rates["cache_write"]
+        ) / 1_000_000
+
+        assert model.estimated_cost_usd != pytest.approx(cache_read_only)
+        assert model.estimated_cost_usd != pytest.approx(neither_subtracted)
+
+    def test_cache_tokens_exceeding_input_clamp_to_non_negative(self) -> None:
+        """A malformed row under-reports rather than producing a negative cost."""
+        events = [
+            _make_event(
+                model_name=_ANTHROPIC_MODEL,
+                input_tokens=1_000,
+                output_tokens=100,
+                cache_read_tokens=5_000,
+                cache_write_tokens=2_000,
+            ),
+        ]
+        result = aggregate_usage(events)
+        model = result.by_model[_ANTHROPIC_MODEL]
+        assert model.estimated_cost_usd >= 0.0
+        assert model.estimated_cost_usd == pytest.approx(
+            _expected_cost(
+                _ANTHROPIC_MODEL,
+                input_tokens=1_000,
+                output_tokens=100,
+                cache_read_tokens=5_000,
+                cache_write_tokens=2_000,
+            )
+        )
+        assert result.total_input_tokens == 1_000
+        assert result.total_cache_read_tokens == 5_000
+        assert result.total_cache_write_tokens == 2_000
 
 
 class TestTotalRequestsAccumulation:
