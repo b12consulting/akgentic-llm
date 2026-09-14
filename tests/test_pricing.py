@@ -13,12 +13,14 @@ from akgentic.llm.pricing import (
     AgentUsageSummary,
     ModelUsage,
     RunUsageSummary,
+    _resolve_pricing,
     aggregate_usage,
 )
 
-# The OpenAI row the inclusive-cached-turn test prices against. Held in one place so
-# the model can be re-pointed in a single line when the table is refreshed.
-_OPENAI_MODEL = "gpt-4o"
+# The OpenAI row the inclusive-cached-turn test prices against: the model the measured
+# over-billing was found on. Held in one place so the row can be re-pointed in a single
+# line when a later table refresh moves the deployment on again.
+_OPENAI_MODEL = "gpt-5.4"
 
 # The Anthropic row, whose cache_write rate (3.75) differs from its input rate (3.0).
 # On a row where cache_write == input the two cache_write contributions cancel and the
@@ -181,6 +183,8 @@ class TestPricingTable:
             "claude-opus-4-20250514",
             "gpt-4o",
             "gpt-5.2",
+            "gpt-5.4",
+            "gpt-5.6-terra",
         ]
         for model in required:
             assert model in PRICING, f"{model} missing from PRICING"
@@ -196,6 +200,46 @@ class TestPricingTable:
         for model, rates in PRICING.items():
             for key, val in rates.items():
                 assert isinstance(val, (int, float)), f"{model}.{key} is not numeric"
+
+
+class TestPricingResolution:
+    """A model name resolves to its own row, never to a pricier relative's.
+
+    ``_resolve_pricing`` scans keys longest-first and tests substring containment, so a
+    flagship row present without its cheaper siblings captures them and overcharges them
+    silently — a row *was* found, so nothing signals an unknown model.
+
+    Every assertion here is an identity check against the very dict stored in ``PRICING``.
+    Equality cannot do this job: the table carries four groups of value-identical rows,
+    including a three-way collision between ``gpt-5-mini``, ``gpt-5.1-mini`` and
+    ``gpt-5.1-codex-mini``, so ``==`` would pass against a genuine mis-resolution.
+    """
+
+    def test_flagship_resolves_to_its_own_row(self) -> None:
+        """The current flagship no longer falls through to the gpt-5 row by substring."""
+        assert _resolve_pricing("gpt-5.4") is PRICING["gpt-5.4"]
+        assert _resolve_pricing("gpt-5.4") is not PRICING["gpt-5"]
+
+    def test_mini_sibling_does_not_capture_its_flagship_row(self) -> None:
+        """gpt-5.4-mini contains gpt-5.4, so a missing sibling row bills it at 3.3x."""
+        assert _resolve_pricing("gpt-5.4-mini") is PRICING["gpt-5.4-mini"]
+        assert _resolve_pricing("gpt-5.4-mini") is not PRICING["gpt-5.4"]
+
+    def test_dotted_mini_sibling_does_not_capture_its_flagship_row(self) -> None:
+        """The sharper case: gpt-5.1-mini contains no other -mini key.
+
+        The ".1" breaks the "gpt-5-mini" substring, so without a row of its own this model
+        matches the gpt-5.1 flagship and bills at 5.00x on input, output and cache_read
+        alike. The row it must resolve to is value-identical to two others, so only an
+        identity assertion pins the resolution to the right key.
+        """
+        assert _resolve_pricing("gpt-5.1-mini") is PRICING["gpt-5.1-mini"]
+        assert _resolve_pricing("gpt-5.1-mini") is not PRICING["gpt-5.1"]
+        assert _resolve_pricing("gpt-5.1-mini") is not PRICING["gpt-5-mini"]
+
+    def test_versioned_deployment_name_resolves_to_its_base_row(self) -> None:
+        """Azure deployment names carry a date suffix and must still match."""
+        assert _resolve_pricing("gpt-5.4-2026-03-05") is PRICING["gpt-5.4"]
 
 
 class TestAggregateUsageEmpty:
