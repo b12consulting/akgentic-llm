@@ -6,6 +6,7 @@ import httpx2
 import pytest
 from pydantic import BaseModel
 from pydantic_ai import NativeOutput
+from pydantic_ai.exceptions import UserError
 from pydantic_ai.models import Model
 from pydantic_ai.models.fallback import FallbackModel
 from pydantic_ai.retries import AsyncHTTPX2TenacityTransport
@@ -87,6 +88,61 @@ class TestSupportsNativeOutput:
         config = ModelConfig(provider="nvidia", model="meta/llama-3.1-70b-instruct")
         assert _supports_native_output(config) is False
 
+    def test_openrouter_openai_route_supports_native_output(self) -> None:
+        """OpenRouter openai/* route supports native output."""
+        config = ModelConfig(provider="openrouter", model="openai/gpt-4o")
+        assert _supports_native_output(config) is True
+
+    def test_openrouter_google_route_supports_native_output(self) -> None:
+        """OpenRouter google/* route supports native output."""
+        config = ModelConfig(provider="openrouter", model="google/gemini-2.5-flash")
+        assert _supports_native_output(config) is True
+
+    def test_openrouter_xai_route_supports_native_output(self) -> None:
+        """OpenRouter x-ai/* route supports native output."""
+        config = ModelConfig(provider="openrouter", model="x-ai/grok-4")
+        assert _supports_native_output(config) is True
+
+    def test_openrouter_alias_marker_is_stripped(self) -> None:
+        """A leading ~ alias marker does not hide the vendor prefix."""
+        config = ModelConfig(provider="openrouter", model="~openai/gpt-4o-latest")
+        assert _supports_native_output(config) is True
+
+    def test_openrouter_tag_suffix_is_ignored(self) -> None:
+        """A :tag suffix never affects the decision."""
+        config = ModelConfig(provider="openrouter", model="openai/gpt-oss-120b:free")
+        assert _supports_native_output(config) is True
+
+    def test_openrouter_aliased_deepseek_route_no_native_output(self) -> None:
+        """An aliased non-listed vendor classifies like its vendor."""
+        config = ModelConfig(provider="openrouter", model="~deepseek/deepseek-v4-flash-latest")
+        assert _supports_native_output(config) is False
+
+    def test_openrouter_deepseek_route_no_native_output(self) -> None:
+        """OpenRouter deepseek/* route does not support native output."""
+        config = ModelConfig(provider="openrouter", model="deepseek/deepseek-chat")
+        assert _supports_native_output(config) is False
+
+    def test_openrouter_anthropic_route_no_native_output(self) -> None:
+        """OpenRouter anthropic/* route does not support native output."""
+        config = ModelConfig(provider="openrouter", model="anthropic/claude-sonnet-4")
+        assert _supports_native_output(config) is False
+
+    def test_openrouter_qwen_route_no_native_output(self) -> None:
+        """OpenRouter qwen/* route does not support native output."""
+        config = ModelConfig(provider="openrouter", model="qwen/qwen3.8-flash")
+        assert _supports_native_output(config) is False
+
+    def test_openrouter_meta_route_no_native_output(self) -> None:
+        """OpenRouter openrouter/* meta-routes do not support native output."""
+        config = ModelConfig(provider="openrouter", model="openrouter/auto")
+        assert _supports_native_output(config) is False
+
+    def test_openrouter_unprefixed_model_no_native_output(self) -> None:
+        """A model id without a vendor/ prefix has no known vendor."""
+        config = ModelConfig(provider="openrouter", model="gpt-4o")
+        assert _supports_native_output(config) is False
+
     def test_google_gla_no_native_output(self) -> None:
         """Google GLA provider does not support native output."""
         config = ModelConfig(provider="google-gla", model="gemini-2.0-flash")
@@ -158,6 +214,18 @@ class TestGetOutputType:
         result = get_output_type(config, _TestModel)
         assert result is _TestModel
 
+    def test_openrouter_google_route_wraps_with_native_output(self) -> None:
+        """OpenRouter google/* route returns NativeOutput wrapper."""
+        config = ModelConfig(provider="openrouter", model="google/gemini-2.5-flash")
+        result = get_output_type(config, _TestModel)
+        assert isinstance(result, NativeOutput)
+
+    def test_openrouter_deepseek_route_returns_raw_type(self) -> None:
+        """OpenRouter deepseek/* route returns raw type."""
+        config = ModelConfig(provider="openrouter", model="deepseek/deepseek-chat")
+        result = get_output_type(config, _TestModel)
+        assert result is _TestModel
+
 
 # ---------------------------------------------------------------------------
 # create_model_settings unit tests
@@ -198,6 +266,22 @@ class TestCreateModelSettings:
         settings = create_model_settings(config)
         assert settings is not None
         assert settings["parallel_tool_calls"] is False
+        assert settings["max_tokens"] == 1000
+
+    def test_openrouter_deepseek_route_disables_parallel_tool_calls(self) -> None:
+        """OpenRouter deepseek/* route gets parallel_tool_calls=False."""
+        config = ModelConfig(provider="openrouter", model="deepseek/deepseek-chat", max_tokens=1000)
+        settings = create_model_settings(config)
+        assert settings is not None
+        assert settings["parallel_tool_calls"] is False
+        assert settings["max_tokens"] == 1000
+
+    def test_openrouter_openai_route_no_parallel_tool_calls_override(self) -> None:
+        """OpenRouter openai/* route keeps parallel tool calls enabled."""
+        config = ModelConfig(provider="openrouter", model="openai/gpt-4o", max_tokens=1000)
+        settings = create_model_settings(config)
+        assert settings is not None
+        assert "parallel_tool_calls" not in settings
         assert settings["max_tokens"] == 1000
 
     def test_preserves_temperature(self) -> None:
@@ -872,6 +956,92 @@ class TestCreateModel:
         assert call_kwargs["base_url"] == "https://integrate.api.nvidia.com/v1"
 
     # ------------------------------------------------------------------
+    # OpenRouter
+    # ------------------------------------------------------------------
+
+    @patch("pydantic_ai.providers.openrouter.OpenRouterProvider")
+    @patch("pydantic_ai.models.openrouter.OpenRouterModel")
+    def test_create_openrouter_model(self, mock_model_cls, mock_provider_cls) -> None:
+        """create_model returns an OpenRouterModel for provider='openrouter'."""
+        mock_client = MagicMock(spec=httpx2.AsyncClient)
+        config = ModelConfig(provider="openrouter", model="deepseek/deepseek-v4-flash-0731")
+
+        result = create_model(config, http_client=mock_client)
+
+        mock_model_cls.assert_called_once()
+        assert mock_model_cls.call_args.kwargs["model_name"] == "deepseek/deepseek-v4-flash-0731"
+        assert result is mock_model_cls.return_value
+
+    @patch("pydantic_ai.providers.openrouter.OpenRouterProvider")
+    @patch("pydantic_ai.models.openrouter.OpenRouterModel")
+    def test_openrouter_http_client_passed_to_provider(
+        self, mock_model_cls, mock_provider_cls
+    ) -> None:
+        """The shared http client reaches OpenRouterProvider and the provider reaches the model."""
+        mock_client = MagicMock(spec=httpx2.AsyncClient)
+        config = ModelConfig(provider="openrouter", model="deepseek/deepseek-chat")
+
+        create_model(config, http_client=mock_client)
+
+        assert mock_provider_cls.call_args.kwargs["http_client"] is mock_client
+        assert mock_model_cls.call_args.kwargs["provider"] is mock_provider_cls.return_value
+
+    @patch("pydantic_ai.providers.openrouter.OpenRouterProvider")
+    @patch("pydantic_ai.models.openrouter.OpenRouterModel")
+    def test_openrouter_settings_pass_through(self, mock_model_cls, mock_provider_cls) -> None:
+        """Core settings reach the model as plain ModelSettings."""
+        mock_client = MagicMock(spec=httpx2.AsyncClient)
+        config = ModelConfig(
+            provider="openrouter",
+            model="deepseek/deepseek-chat",
+            temperature=0.2,
+            max_tokens=500,
+            seed=7,
+        )
+
+        create_model(config, http_client=mock_client)
+
+        settings = mock_model_cls.call_args.kwargs["settings"]
+        assert settings == {"temperature": 0.2, "max_tokens": 500, "seed": 7}
+
+    @patch("pydantic_ai.providers.openrouter.OpenRouterProvider")
+    @patch("pydantic_ai.models.openrouter.OpenRouterModel")
+    def test_openrouter_reasoning_effort_ignored(self, mock_model_cls, mock_provider_cls) -> None:
+        """reasoning_effort is not mapped for OpenRouter, so settings stay None."""
+        mock_client = MagicMock(spec=httpx2.AsyncClient)
+        config = ModelConfig(
+            provider="openrouter", model="deepseek/deepseek-chat", reasoning_effort="high"
+        )
+
+        create_model(config, http_client=mock_client)
+
+        assert mock_model_cls.call_args.kwargs["settings"] is None
+
+    @patch.dict("os.environ", {}, clear=False)
+    def test_openrouter_missing_api_key_raises(self) -> None:
+        """Without OPENROUTER_API_KEY the real provider fails at construction."""
+        import os
+
+        os.environ.pop("OPENROUTER_API_KEY", None)
+        mock_client = MagicMock(spec=httpx2.AsyncClient)
+        config = ModelConfig(provider="openrouter", model="deepseek/deepseek-chat")
+
+        with pytest.raises(UserError, match="OPENROUTER_API_KEY"):
+            create_model(config, http_client=mock_client)
+
+    @patch.dict("os.environ", {}, clear=False)
+    def test_openrouter_default_model_is_rejected(self) -> None:
+        """The shared default model has no vendor/ prefix and is rejected at construction."""
+        import os
+
+        os.environ["OPENROUTER_API_KEY"] = "test-key"
+        mock_client = MagicMock(spec=httpx2.AsyncClient)
+        config = ModelConfig(provider="openrouter")
+
+        with pytest.raises(UserError, match="prefixed"):
+            create_model(config, http_client=mock_client)
+
+    # ------------------------------------------------------------------
     # Error handling
     # ------------------------------------------------------------------
 
@@ -887,6 +1057,7 @@ class TestCreateModel:
 
         assert "Unsupported provider: unknown-provider" in str(exc_info.value)
         assert "Supported providers:" in str(exc_info.value)
+        assert "openrouter" in str(exc_info.value)
 
     # ------------------------------------------------------------------
     # HTTP client auto-creation

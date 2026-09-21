@@ -387,6 +387,65 @@ class TestComputeCost:
         )
         assert cost > 0.0
 
+    def test_openrouter_route_resolves_under_openrouter_provider(self) -> None:
+        cost = _compute_cost(
+            model_name="deepseek/deepseek-chat",
+            provider_name="openrouter",
+            input_tokens=1000,
+            output_tokens=1000,
+            cache_read_tokens=0,
+            cache_write_tokens=0,
+        )
+        assert cost > 0.0
+        assert cost == pytest.approx(
+            _expected_cost("deepseek/deepseek-chat", "openrouter", 1000, 1000)
+        )
+
+    def test_openrouter_route_without_provider_is_unknown(self) -> None:
+        # Slash-prefixed route names only resolve under the openrouter provider id,
+        # which is why the provider label stamped on the response matters.
+        cost = _compute_cost(
+            model_name="deepseek/deepseek-chat",
+            provider_name="",
+            input_tokens=1000,
+            output_tokens=1000,
+            cache_read_tokens=0,
+            cache_write_tokens=0,
+        )
+        assert cost == 0.0
+
+    def test_openrouter_unknown_route_returns_zero(self) -> None:
+        cost = _compute_cost(
+            model_name="acme/not-a-model",
+            provider_name="openrouter",
+            input_tokens=1000,
+            output_tokens=1000,
+            cache_read_tokens=0,
+            cache_write_tokens=0,
+        )
+        assert cost == 0.0
+
+
+class TestAggregateUsageOpenRouter:
+    """An OpenRouter usage event keeps its provider label and prices through it."""
+
+    def test_openrouter_event_priced_under_openrouter(self) -> None:
+        events = [
+            _make_event(
+                model_name="deepseek/deepseek-chat",
+                provider_name="openrouter",
+                input_tokens=1000,
+                output_tokens=1000,
+            )
+        ]
+        summary = aggregate_usage(events)
+        assert len(summary.by_model) == 1
+        model = summary.by_model["deepseek/deepseek-chat"]
+        assert model.provider_name == "openrouter"
+        assert model.estimated_cost_usd == pytest.approx(
+            _expected_cost("deepseek/deepseek-chat", "openrouter", 1000, 1000)
+        )
+
 
 class TestCacheTokenPricing:
     """Cache tokens affect cost, priced without double-counting cached reads."""

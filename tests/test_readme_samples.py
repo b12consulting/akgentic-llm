@@ -519,6 +519,17 @@ def test_nvidia_provider_samples() -> None:
     assert _supports_native_output(prompt_based) is False
 
 
+def test_openrouter_provider_samples() -> None:
+    """§Providers — the two OpenRouter samples differ on native structured output."""
+    from akgentic.llm.config import _supports_native_output
+
+    prompt_based = ModelConfig(provider="openrouter", model="deepseek/deepseek-v4-flash-0731")
+    assert _supports_native_output(prompt_based) is False
+
+    native = ModelConfig(provider="openrouter", model="google/gemini-2.5-flash")
+    assert _supports_native_output(native) is True
+
+
 def test_provider_table_native_output_column() -> None:
     """§Providers — the ✅/❌ column, verified per row against the predicate."""
     from akgentic.llm.config import _supports_native_output
@@ -526,6 +537,10 @@ def test_provider_table_native_output_column() -> None:
     assert _supports_native_output(ModelConfig(provider="openai", model="gpt-4o"))
     assert _supports_native_output(ModelConfig(provider="azure", model="gpt-4o"))
     assert _supports_native_output(ModelConfig(provider="anthropic", model="claude-x"))
+    assert _supports_native_output(ModelConfig(provider="openrouter", model="openai/gpt-4o"))
+    assert not _supports_native_output(
+        ModelConfig(provider="openrouter", model="deepseek/deepseek-chat")
+    )
     assert not _supports_native_output(ModelConfig(provider="google-gla", model="gemini-2.0"))
     assert not _supports_native_output(ModelConfig(provider="mistral", model="mistral-large"))
 

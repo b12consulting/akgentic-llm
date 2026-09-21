@@ -53,6 +53,9 @@ class ModelConfig(BaseModel):
       OPENAI_API_KEY fallback applies; a missing key surfaces as a 401 at request
       time, not at construction). Endpoint from NVIDIA_BASE_URL, which defaults to
       https://integrate.api.nvidia.com/v1
+    - OpenRouter: OPENROUTER_API_KEY. ``model`` must be an OpenRouter ``vendor/model``
+      id (e.g. ``deepseek/deepseek-chat``); the shared default ``gpt-5.2`` has no
+      vendor prefix and is rejected at ``create_model()`` time, not at construction.
 
     Attributes:
         provider: LLM provider name
@@ -121,6 +124,7 @@ class ModelConfig(BaseModel):
         "google-gla",
         "mistral",
         "anthropic",
+        "openrouter",
     ] = Field(default="openai", description="Model provider")
 
     model: str = Field(
@@ -198,6 +202,15 @@ class ModelConfig(BaseModel):
         return self
 
 
+# OpenRouter vendor prefixes whose pydantic-ai route profile has
+# supports_json_schema_output=True. This set MUST stay a subset of that profile table:
+# pydantic-ai raises UserError at request time when native output is requested on a
+# route it does not support, whereas a vendor missing here only falls back to
+# prompt-based extraction. Re-verify against OpenRouterModel(name).profile whenever
+# pydantic-ai is bumped.
+_OPENROUTER_NATIVE_VENDORS: frozenset[str] = frozenset({"openai", "google", "x-ai"})
+
+
 def _supports_native_output(config: ModelConfig) -> bool:
     """Check if provider supports native structured output via NativeOutput wrapper.
 
@@ -208,11 +221,25 @@ def _supports_native_output(config: ModelConfig) -> bool:
     - azure-chat: Azure OpenAI Service via the legacy Chat Completions API
     - anthropic: Claude 3.5 Sonnet, etc.
     - nvidia: Only for models with "openai" prefix (e.g., "openai/gpt-oss-120b")
+    - openrouter: Only for routes whose vendor prefix is ``openai/``, ``google/`` or
+      ``x-ai/`` (e.g., "openai/gpt-4o")
 
     Providers without native support (use prompt-based extraction):
     - google-gla: Google Gemini models
     - mistral: Mistral AI models
     - nvidia: Non-OpenAI models (e.g., "meta/llama-3.1-70b-instruct")
+    - openrouter: Every other route, including ``deepseek/``, ``anthropic/``, ``qwen/``,
+      ``openrouter/*`` meta-routes and unknown vendors
+
+    OpenRouter is a switchboard, so support is decided per route from the vendor
+    prefix, not per provider. The prefix is read after stripping a leading ``~`` alias
+    marker (``~openai/gpt-4o-latest``) and before any ``:tag`` suffix (``:free``,
+    ``:nitro``), so aliases and tags classify like their vendor. The allowlist is
+    deliberately a subset of pydantic-ai's own route profiles: a vendor listed here that
+    pydantic-ai marks unsupported fails every structured request at run time, while a
+    vendor omitted here only degrades to prompt-based extraction. A model with no ``/``
+    yields no known vendor and returns False; pydantic-ai rejects such a name when the
+    model is constructed.
 
     Defined here rather than in providers.py so ModelConfig's fallback-chain validator can
     call it: providers.py already imports ModelConfig from this module, so importing the
@@ -234,11 +261,20 @@ def _supports_native_output(config: ModelConfig) -> bool:
         >>> config = ModelConfig(provider="nvidia", model="openai/gpt-oss-120b")
         >>> _supports_native_output(config)
         True
+        >>> config = ModelConfig(provider="openrouter", model="openai/gpt-4o")
+        >>> _supports_native_output(config)
+        True
+        >>> config = ModelConfig(provider="openrouter", model="deepseek/deepseek-chat")
+        >>> _supports_native_output(config)
+        False
     """
     if config.provider in ("openai", "openai-chat", "azure", "azure-chat", "anthropic"):
         return True
     if config.provider == "nvidia":
         return config.model.startswith("openai")
+    if config.provider == "openrouter":
+        vendor = config.model.removeprefix("~").split("/", 1)[0]
+        return vendor in _OPENROUTER_NATIVE_VENDORS
     return False
 
 
