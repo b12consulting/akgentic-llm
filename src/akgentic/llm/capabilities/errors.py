@@ -1,20 +1,10 @@
-"""Names shared by more than one capability: the usage-limit hierarchy and the healing message.
+"""Names shared by more than one capability: the usage-limit hierarchy.
 
 Imports nothing, so any sibling may import from it. See the package docstring for how the
 capabilities compose.
 """
 
 from __future__ import annotations
-
-# What the MODEL reads as the tool result of the call the run-tier breach aborted.
-# Not a diagnostic: the operator's traceback travels the other channel
-# (``ErrorMessage.traceback``, formatted by ``Akgent._handle_failure``). Defined once
-# here so the call site and its test never drift into two wordings (ADR-016 §D2).
-RUN_LIMIT_HEALING_MESSAGE = (
-    "This turn's tool and request budget is exhausted, so this tool call was "
-    "aborted and no further tool calls are possible. Answer now using what you "
-    "already have, and say plainly what you could not verify."
-)
 
 
 class UsageLimitError(Exception):

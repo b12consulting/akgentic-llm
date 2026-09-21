@@ -32,11 +32,9 @@ last recorded message on every pass, with the cursor kept only as the fallback.
 list order, ``after_*`` in reverse, and ``wrap_run``s nest with the first one wrapping all the
 rest (pydantic-ai 2.27.1 — ``capabilities/combined.py`` builds each chain over
 ``reversed(self.capabilities)``). ``ReactAgent`` mounts ``[LifetimeBudgetCapability,
-CompactionCapability, EventSourcingCapability, LimitRecoveryCapability, HealingCapability,
-*yours]``. Two couplings ride on exactly that order and nothing else: the budget refuses a spent
-agent **before** compaction pays for a summarizer, and limit recovery sits immediately *before*
-healing so that healing — the later entry, and therefore the first to fire in the **reversed**
-``on_run_error`` walk — has written its ``ToolReturnPart`` before the recovery seam is consulted.
+CompactionCapability, EventSourcingCapability, LimitRecoveryCapability, *yours]``. One coupling
+rides on exactly that order and nothing else: the budget refuses a spent agent **before**
+compaction pays for a summarizer.
 Compaction sitting ahead of persistence also puts the cursor on the
 post-fold history, which is where it belongs — but that one is belt-and-braces, not the
 mechanism: ``_anchor`` re-opens the cursor against the normalised list at the first node hook,
@@ -44,7 +42,7 @@ which absorbs a fold performed anywhere before it (verified by swapping the two)
 That list order is not final, though: if **any** capability in the chain
 declares ``get_ordering()`` (a fixed ``position``, or a ``wraps=`` / ``wrapped_by=`` constraint)
 pydantic-ai topologically re-sorts the whole chain to satisfy it, so a caller capability can
-legitimately end up outside these five. None of the classes here declares one, and the budget
+legitimately end up outside these four. None of the classes here declares one, and the budget
 deliberately does not declare one to pin itself outermost — that would be a behavioural change
 owed its own decision. What a co-mounted capability needs from the order does **not** depend on
 where it sits: the closing sweep is in ``wrap_run``'s ``finally``, outside every capability's
@@ -80,13 +78,11 @@ in silence. Two back-to-back ``append_user_prompt`` calls are enough to trigger 
 from .budget import LifetimeBudgetCapability
 from .compaction import CompactionCapability
 from .errors import (
-    RUN_LIMIT_HEALING_MESSAGE,
     AgentUsageLimitError,
     RunUsageLimitError,
     UsageLimitError,
 )
 from .event_sourcing import EventSourcingCapability
-from .healing import HealingCapability
 from .limit_recovery import (
     DEFAULT_CONCLUSION_REASON,
     ConclusionDecision,
@@ -95,12 +91,10 @@ from .limit_recovery import (
 
 __all__ = [
     "DEFAULT_CONCLUSION_REASON",
-    "RUN_LIMIT_HEALING_MESSAGE",
     "AgentUsageLimitError",
     "CompactionCapability",
     "ConclusionDecision",
     "EventSourcingCapability",
-    "HealingCapability",
     "LifetimeBudgetCapability",
     "LimitRecoveryCapability",
     "RunUsageLimitError",

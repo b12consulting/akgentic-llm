@@ -70,9 +70,10 @@ def test_key_exports_present():
     assert hasattr(akgentic.llm, "LifetimeBudgetCapability")
     assert hasattr(akgentic.llm, "CompactionCapability")
     assert hasattr(akgentic.llm, "EventSourcingCapability")
-    assert hasattr(akgentic.llm, "HealingCapability")
     assert hasattr(akgentic.llm, "LimitRecoveryCapability")
     assert hasattr(akgentic.llm, "ConclusionDecision")
+    # Removed with #155 — pydantic-ai 2.38 repairs dangling tool calls itself; must not reappear.
+    assert not hasattr(akgentic.llm, "HealingCapability")
 
     # Prompts
     assert hasattr(akgentic.llm, "PromptTemplate")
@@ -156,7 +157,7 @@ def test_the_usage_limit_hierarchy_is_importable_from_both_modules():
 
 
 def test_every_public_capability_name_still_resolves_from_the_package():
-    """The eleven public names stay importable from ``akgentic.llm.capabilities``.
+    """The nine public names stay importable from ``akgentic.llm.capabilities``.
 
     ``capabilities`` is a package of one module per capability, so each name now reaches
     callers through a re-export in ``capabilities/__init__.py``. Dropping one of those lines
@@ -188,26 +189,23 @@ def test_every_public_capability_name_still_resolves_from_the_package():
         compaction,
         errors,
         event_sourcing,
-        healing,
         limit_recovery,
     )
 
     one_definition_of = (
-        ("RUN_LIMIT_HEALING_MESSAGE", errors),
         ("UsageLimitError", errors),
         ("RunUsageLimitError", errors),
         ("AgentUsageLimitError", errors),
         ("LifetimeBudgetCapability", budget),
         ("CompactionCapability", compaction),
         ("EventSourcingCapability", event_sourcing),
-        ("HealingCapability", healing),
         ("LimitRecoveryCapability", limit_recovery),
         ("ConclusionDecision", limit_recovery),
         ("DEFAULT_CONCLUSION_REASON", limit_recovery),
     )
 
     # Also reached through akgentic.llm: every capability class, plus the exception
-    # hierarchy. The two wording constants are deliberately absent — neither ever was there.
+    # hierarchy. The wording constant is deliberately absent — it never was there.
     reaches_the_package = {
         "UsageLimitError",
         "RunUsageLimitError",
@@ -215,7 +213,6 @@ def test_every_public_capability_name_still_resolves_from_the_package():
         "LifetimeBudgetCapability",
         "CompactionCapability",
         "EventSourcingCapability",
-        "HealingCapability",
         "LimitRecoveryCapability",
         "ConclusionDecision",
     }
@@ -223,7 +220,6 @@ def test_every_public_capability_name_still_resolves_from_the_package():
     # home. The recovery names are NEW rather than moved, so they get no such re-export: the
     # ``X as X`` block in agent.py exists for names that used to live there.
     reaches_the_agent_module = {
-        "RUN_LIMIT_HEALING_MESSAGE",
         "UsageLimitError",
         "RunUsageLimitError",
         "AgentUsageLimitError",
