@@ -1,8 +1,8 @@
 """Claude Code CLI as a pydantic-ai model.
 
 ``ClaudeCodeModel`` answers a model request by running the Claude Code CLI in
-print mode (``claude --print --output-format json``) and reading the JSON result
-it prints. The CLI brings its own authentication, so the provider works with a
+print mode (``claude --print --output-format stream-json``) and reading the
+events it prints. The CLI brings its own authentication, so the provider works with a
 Claude subscription (``claude login`` or ``CLAUDE_CODE_OAUTH_TOKEN`` from
 ``claude setup-token``) as well as with ``ANTHROPIC_API_KEY``.
 
@@ -14,8 +14,10 @@ provider, in the calling process.
 Function calling is emulated, because the CLI takes one prompt and returns one
 answer. The function tools and output tools of the request are described in the
 system prompt, and the CLI is asked for structured output (``--json-schema``)
-that either carries a text answer or names the calls the model wants made.
-Those calls come back as ordinary ``ToolCallPart``s, so the agent loop cannot
+that either carries a text answer or names the calls the model wants made. A
+model that calls one of those functions as a tool of its own instead is taken at
+its word: the call is read from the event stream and the CLI is stopped. Either
+way the calls come back as ordinary ``ToolCallPart``s, so the agent loop cannot
 tell the difference. The conversation so far is replayed as a transcript in the
 prompt on every request.
 
@@ -75,6 +77,9 @@ CLAUDE_CODE_CLI_ENV = "CLAUDE_CODE_CLI"
 
 DEFAULT_TIMEOUT_S = 300.0
 
+# One event is one line, and an event holding a long answer is a long line.
+_MAX_EVENT_BYTES = 32 * 1024 * 1024
+
 type Effort = Literal["low", "medium", "high"]
 
 # Without a system prompt the CLI falls back to its own, which describes a coding
@@ -86,18 +91,34 @@ _FUNCTION_CALLING_PROMPT = """\
 
 You are connected to an application that runs functions on your behalf. You cannot
 run them yourself: you name the calls you want, the application runs them and sends
-you the results in a later message. These functions are available and working:
-
-<functions>
-{functions}
-</functions>
-
+you the results in a later message. Every function listed here is available and
+working.
+{functions}{final_answer}
 Answer through the structured output:
 - to call functions, list them in `tool_calls` with `arguments` matching the
   function's `parameters` schema, and leave `content` empty;
 - to answer in text, put the answer in `content` and leave `tool_calls` empty.
 {rules}
-Never invent a function result and never claim a function is unavailable."""
+Whatever a function can tell you, you get from that function: call it and wait for
+its result. Never answer from an assumption in its place, never invent a function
+result and never claim a function is unavailable."""
+
+_FUNCTIONS_SECTION = """
+<functions>
+{functions}
+</functions>
+"""
+
+# Output tools are not work to be done but the way to hand in the result. Listed among
+# the functions, a smaller model picks one straight away and skips the work.
+_FINAL_ANSWER_SECTION = """
+These deliver your final answer and end your turn. Call one only once you hold the
+results of every function call the answer depends on:
+
+<final_answer_functions>
+{functions}
+</final_answer_functions>
+"""
 
 # Settings the CLI has no flag for. They are dropped, not rejected, so a ModelConfig
 # written for another provider keeps working when its provider is switched.
@@ -182,25 +203,25 @@ class ClaudeCodeModel(Model[None]):
         )
         _warn_about_ignored_settings(model_settings)
 
-        tools = [
-            *model_request_parameters.declared_function_tools,
-            *model_request_parameters.output_tools,
-        ]
+        function_tools = model_request_parameters.declared_function_tools
+        output_tools = model_request_parameters.output_tools
         system_prompt = _system_prompt(
             messages, self._get_instruction_parts(messages, model_request_parameters)
         )
         schema: dict[str, Any] | None = None
-        if tools:
-            parallel = (model_settings or {}).get("parallel_tool_calls", True)
+        parallel = (model_settings or {}).get("parallel_tool_calls", True) is not False
+        if function_tools or output_tools:
             section, schema = _function_calling(
-                tools,
+                function_tools,
+                output_tools,
                 allow_text=model_request_parameters.allow_text_output,
-                parallel=parallel is not False,
+                parallel=parallel,
             )
             system_prompt = f"{system_prompt}\n\n{section}"
 
-        result = await self._run_cli(system_prompt, _render_prompt(messages), schema)
-        return self._to_response(result, expects_calls=bool(tools))
+        tool_names = frozenset(tool.name for tool in [*function_tools, *output_tools])
+        result = await self._run_cli(system_prompt, _render_prompt(messages), schema, tool_names)
+        return self._to_response(result, expects_calls=schema is not None, parallel=parallel)
 
     @asynccontextmanager
     async def request_stream(
@@ -226,8 +247,10 @@ class ClaudeCodeModel(Model[None]):
         command = [
             self._cli_path,
             "--print",
+            # The event stream, not just the result: see _outcome.
             "--output-format",
-            "json",
+            "stream-json",
+            "--verbose",
             "--model",
             self._model_name,
             "--system-prompt-file",
@@ -249,9 +272,13 @@ class ClaudeCodeModel(Model[None]):
         return command
 
     async def _run_cli(
-        self, system_prompt: str, prompt: str, schema: dict[str, Any] | None
+        self,
+        system_prompt: str,
+        prompt: str,
+        schema: dict[str, Any] | None,
+        tool_names: frozenset[str],
     ) -> dict[str, Any]:
-        """Run the CLI in an empty directory and return the result object it printed."""
+        """Run the CLI in an empty directory and return the outcome of the run."""
         with tempfile.TemporaryDirectory(prefix="akgentic-claude-code-") as workdir:
             # A file, not an argument: system prompts outgrow the argument size limit.
             system_prompt_file = Path(workdir) / "system-prompt.txt"
@@ -263,31 +290,40 @@ class ClaudeCodeModel(Model[None]):
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     cwd=workdir,
+                    limit=_MAX_EVENT_BYTES,
                 )
             except OSError as exc:
                 raise ModelAPIError(
                     self._model_name, f"Claude Code CLI could not be started: {exc}"
                 ) from exc
-            stdout, stderr = await self._communicate(process, prompt)
+            outcome, output, stderr = await self._converse(process, prompt, tool_names)
 
-        if not stdout.strip():
-            detail = stderr.decode("utf-8", errors="replace").strip()[:1000]
+        if outcome is None:
+            detail = (stderr or output).decode("utf-8", errors="replace").strip()[:1000]
             raise ModelAPIError(
                 self._model_name,
-                f"Claude Code CLI exited with code {process.returncode} and no output: {detail}",
+                f"Claude Code CLI exited with code {process.returncode} and no result: {detail}",
             )
-        result = _parse_result(self._model_name, stdout)
-        if result.get("is_error") or process.returncode != 0:
-            self._raise_for_error(result)
-        return result
+        # An intercepted call ends with the CLI killed: its exit code says nothing.
+        failed = outcome.get("is_error") or process.returncode != 0
+        if outcome.get("type") == "result" and failed:
+            self._raise_for_error(outcome)
+        return outcome
 
-    async def _communicate(
-        self, process: asyncio.subprocess.Process, prompt: str
-    ) -> tuple[bytes, bytes]:
+    async def _converse(
+        self, process: asyncio.subprocess.Process, prompt: str, tool_names: frozenset[str]
+    ) -> tuple[dict[str, Any] | None, bytes, bytes]:
+        """Send the prompt and read events until the run has an outcome or is over."""
+        assert process.stderr is not None
+        stderr = asyncio.ensure_future(process.stderr.read())
         try:
-            return await asyncio.wait_for(
-                process.communicate(prompt.encode("utf-8")), timeout=self._timeout_s
-            )
+            async with asyncio.timeout(self._timeout_s):
+                outcome, output = await _read_outcome(process, prompt, tool_names)
+                if outcome is not None and outcome.get("type") != "result":
+                    await _kill(process)
+                else:
+                    await process.wait()
+                return outcome, output, await stderr
         except TimeoutError as exc:
             await _kill(process)
             raise ModelAPIError(
@@ -298,6 +334,8 @@ class ClaudeCodeModel(Model[None]):
             # The run was cancelled: do not leave the CLI running.
             await _kill(process)
             raise
+        finally:
+            stderr.cancel()
 
     def _raise_for_error(self, result: dict[str, Any]) -> None:
         detail = str(result.get("result") or result.get("subtype") or "unknown error")
@@ -306,7 +344,9 @@ class ClaudeCodeModel(Model[None]):
             raise ModelHTTPError(status_code=status, model_name=self._model_name, body=detail)
         raise ModelAPIError(self._model_name, f"Claude Code CLI failed: {detail}")
 
-    def _to_response(self, result: dict[str, Any], *, expects_calls: bool) -> ModelResponse:
+    def _to_response(
+        self, result: dict[str, Any], *, expects_calls: bool, parallel: bool = True
+    ) -> ModelResponse:
         parts: list[ModelResponsePart] = []
         if expects_calls:
             structured = result.get("structured_output")
@@ -315,7 +355,7 @@ class ClaudeCodeModel(Model[None]):
                     "Claude Code CLI returned no structured output",
                     body=str(result.get("result"))[:1000],
                 )
-            parts = _call_parts(structured)
+            parts = _call_parts(structured) if parallel else _call_parts(structured)[:1]
             if not parts and (content := structured.get("content")):
                 parts = [TextPart(content=str(content))]
         elif text := result.get("result"):
@@ -429,10 +469,9 @@ def _render_prompt(messages: Sequence[ModelMessage]) -> str:
     )
 
 
-def _function_calling(
-    tools: Sequence[ToolDefinition], *, allow_text: bool, parallel: bool
-) -> tuple[str, dict[str, Any]]:
-    """Build the system prompt section and the output schema that emulate function calling."""
+def _describe(tools: Sequence[ToolDefinition], section: str) -> str:
+    if not tools:
+        return ""
     functions = [
         {
             "name": tool.name,
@@ -441,6 +480,18 @@ def _function_calling(
         }
         for tool in tools
     ]
+    return section.format(functions=json.dumps(functions, indent=1))
+
+
+def _function_calling(
+    function_tools: Sequence[ToolDefinition],
+    output_tools: Sequence[ToolDefinition],
+    *,
+    allow_text: bool,
+    parallel: bool,
+) -> tuple[str, dict[str, Any]]:
+    """Build the system prompt section and the output schema that emulate function calling."""
+    tools = [*function_tools, *output_tools]
     calls_schema: dict[str, Any] = {
         "type": "array",
         "items": {
@@ -466,7 +517,9 @@ def _function_calling(
         "required": ["content", "tool_calls"],
     }
     section = _FUNCTION_CALLING_PROMPT.format(
-        functions=json.dumps(functions, indent=1), rules=rules
+        functions=_describe(function_tools, _FUNCTIONS_SECTION),
+        final_answer=_describe(output_tools, _FINAL_ANSWER_SECTION),
+        rules=rules,
     )
     return section, schema
 
@@ -487,30 +540,75 @@ def _call_parts(structured: dict[str, Any]) -> list[ModelResponsePart]:
     return parts
 
 
-def _parse_result(model_name: str, stdout: bytes) -> dict[str, Any]:
-    """Read the result object the CLI printed; tolerate stray lines around it."""
-    text = stdout.decode("utf-8", errors="replace").strip()
-    parsed: Any = None
+def _events(line: bytes) -> list[dict[str, Any]]:
+    """The events on one line of output; a line that is no JSON carries none."""
     try:
-        parsed = json.loads(text)
-    except json.JSONDecodeError:
-        for line in reversed(text.splitlines()):
-            try:
-                parsed = json.loads(line)
-                break
-            except json.JSONDecodeError:
-                continue
-    # Some CLI versions print the full event list instead of the single result.
-    if isinstance(parsed, list):
-        parsed = next(
-            (e for e in reversed(parsed) if isinstance(e, dict) and e.get("type") == "result"),
-            None,
-        )
-    if not isinstance(parsed, dict):
-        raise ModelAPIError(
-            model_name, f"Claude Code CLI printed no readable result: {text[:500]!r}"
-        )
-    return parsed
+        parsed = json.loads(line)
+    except ValueError:
+        return []
+    # Some CLI versions print the events as one list instead of one per line.
+    events = parsed if isinstance(parsed, list) else [parsed]
+    return [event for event in events if isinstance(event, dict)]
+
+
+def _outcome(event: dict[str, Any], tool_names: frozenset[str]) -> dict[str, Any] | None:
+    """What an event says about how the run ends, if anything.
+
+    A run ends with its ``result`` event. It also ends, early, when the model calls
+    one of the functions of the request as a tool of its own rather than through
+    the structured output. The CLI has no such tool and would answer the call with
+    an error, after which the model reports the function as unavailable. The call
+    is exactly what the request is after, so it is taken as the outcome and the
+    CLI is stopped.
+    """
+    if event.get("type") == "result":
+        return event
+    message = event.get("message")
+    if event.get("type") != "assistant" or not isinstance(message, dict):
+        return None
+    content = message.get("content")
+    calls = [
+        {"name": block["name"], "arguments": block.get("input")}
+        for block in (content if isinstance(content, list) else [])
+        if isinstance(block, dict)
+        and block.get("type") == "tool_use"
+        and block.get("name") in tool_names
+    ]
+    if not calls:
+        return None
+    usage = message.get("usage")
+    output_tokens = usage.get("output_tokens", 0) if isinstance(usage, dict) else 0
+    return {
+        "type": "intercepted_calls",
+        "structured_output": {"content": "", "tool_calls": calls},
+        "usage": usage,
+        "modelUsage": {message.get("model"): {"outputTokens": output_tokens}}
+        if message.get("model")
+        else {},
+        "session_id": event.get("session_id"),
+    }
+
+
+async def _read_outcome(
+    process: asyncio.subprocess.Process, prompt: str, tool_names: frozenset[str]
+) -> tuple[dict[str, Any] | None, bytes]:
+    """Send the prompt, then read the output up to the first event that ends the run."""
+    assert process.stdin is not None and process.stdout is not None
+    try:
+        process.stdin.write(prompt.encode("utf-8"))
+        await process.stdin.drain()
+        process.stdin.close()
+    except (BrokenPipeError, ConnectionResetError):
+        pass  # The CLI is gone already; what it printed says why.
+
+    output = b""
+    async for line in process.stdout:
+        output += line
+        for event in _events(line):
+            outcome = _outcome(event, tool_names)
+            if outcome is not None:
+                return outcome, output
+    return None, output
 
 
 def _resolved_model_name(result: dict[str, Any]) -> str | None:

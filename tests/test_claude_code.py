@@ -64,7 +64,9 @@ if "--system-prompt-file" in args:
 behaviour = json.loads((here / "behaviour.json").read_text())
 time.sleep(behaviour.get("sleep", 0))
 sys.stdout.write(behaviour.get("stdout", ""))
+sys.stdout.flush()
 sys.stderr.write(behaviour.get("stderr", ""))
+time.sleep(behaviour.get("sleep_after", 0))
 sys.exit(behaviour.get("exit_code", 0))
 """
 
@@ -80,7 +82,7 @@ _WEATHER_TOOL = ToolDefinition(
 
 
 def _result(**overrides: Any) -> dict[str, Any]:
-    """A CLI result object, shaped like ``claude --print --output-format json`` prints it."""
+    """A result event, shaped like ``claude --print --output-format stream-json`` prints it."""
     result: dict[str, Any] = {
         "type": "result",
         "subtype": "success",
@@ -98,6 +100,24 @@ def _result(**overrides: Any) -> dict[str, Any]:
     }
     result.update(overrides)
     return result
+
+
+def _assistant(*blocks: dict[str, Any]) -> dict[str, Any]:
+    """An assistant event of the stream, carrying the given content blocks."""
+    return {
+        "type": "assistant",
+        "session_id": "15e36173-70ea-46cc-b871-a9a1104a8f83",
+        "message": {
+            "model": "claude-haiku-4-5-20251001",
+            "content": list(blocks),
+            "usage": {
+                "input_tokens": 9,
+                "cache_creation_input_tokens": 100,
+                "cache_read_input_tokens": 1000,
+                "output_tokens": 17,
+            },
+        },
+    }
 
 
 class FakeCli:
@@ -185,7 +205,7 @@ class TestCommand:
         await _request(ClaudeCodeModel("sonnet"), [_user("hello")])
 
         args = fake_cli.invocation["args"]
-        assert args[:3] == ["--print", "--output-format", "json"]
+        assert args[:4] == ["--print", "--output-format", "stream-json", "--verbose"]
         assert fake_cli.option("--model") == "sonnet"
         assert fake_cli.option("--tools") == ""
         for flag in (
@@ -302,9 +322,7 @@ class TestPrompt:
     def test_non_text_user_content_is_rejected(self) -> None:
         messages = [
             ModelRequest(
-                parts=[
-                    UserPromptPart(content=["look", ImageUrl(url="https://example.com/a.png")])
-                ]
+                parts=[UserPromptPart(content=["look", ImageUrl(url="https://example.com/a.png")])]
             )
         ]
         with pytest.raises(UserError, match="text prompts only"):
@@ -354,8 +372,14 @@ class TestResponse:
         assert _resolved_model_name(result) == "claude-sonnet-5-5"
         assert _resolved_model_name({}) is None
 
-    async def test_result_is_found_among_stray_lines(self, fake_cli: FakeCli) -> None:
-        fake_cli.behaves(stdout=f"warning: something\n{json.dumps(_result())}\n")
+    async def test_result_is_found_among_other_events(self, fake_cli: FakeCli) -> None:
+        events = [
+            "warning: something",
+            json.dumps({"type": "system", "subtype": "init"}),
+            json.dumps(_assistant({"type": "text", "text": "pong"})),
+            json.dumps(_result()),
+        ]
+        fake_cli.behaves(stdout="\n".join(events) + "\n")
         response = await _request(ClaudeCodeModel("haiku"), [_user("ping")])
         assert response.parts == [TextPart(content="pong")]
 
@@ -366,9 +390,7 @@ class TestResponse:
 
     async def test_stream_replays_the_complete_response(self, fake_cli: FakeCli) -> None:
         model = ClaudeCodeModel("haiku")
-        async with model.request_stream(
-            [_user("ping")], None, ModelRequestParameters()
-        ) as stream:
+        async with model.request_stream([_user("ping")], None, ModelRequestParameters()) as stream:
             events = [event async for event in stream]
             response = stream.get()
 
@@ -382,9 +404,7 @@ class TestResponse:
 
 
 class TestFunctionCalling:
-    async def test_functions_are_described_and_a_schema_requested(
-        self, fake_cli: FakeCli
-    ) -> None:
+    async def test_functions_are_described_and_a_schema_requested(self, fake_cli: FakeCli) -> None:
         fake_cli.answers(_result(structured_output={"content": "hi", "tool_calls": []}))
         await _request(
             ClaudeCodeModel("haiku"),
@@ -476,9 +496,7 @@ class TestFunctionCalling:
         assert calls["items"]["properties"]["name"]["enum"] == ["final_result"]
         assert "You must call at least one function" in fake_cli.invocation["system_prompt"]
 
-    async def test_one_call_at_a_time_without_parallel_tool_calls(
-        self, fake_cli: FakeCli
-    ) -> None:
+    async def test_one_call_at_a_time_without_parallel_tool_calls(self, fake_cli: FakeCli) -> None:
         fake_cli.answers(_result(structured_output={"content": "", "tool_calls": []}))
         await _request(
             ClaudeCodeModel("haiku"),
@@ -488,6 +506,88 @@ class TestFunctionCalling:
         )
         schema = json.loads(fake_cli.option("--json-schema"))
         assert schema["properties"]["tool_calls"]["maxItems"] == 1
+
+    async def test_call_made_as_a_tool_is_intercepted(self, fake_cli: FakeCli) -> None:
+        """The model calls the function as a tool of its own: the call is the outcome.
+
+        The fake CLI then hangs, like the real one carrying on with the run, so
+        the request only returns in time when the CLI is stopped at the call.
+        """
+        call = _assistant(
+            {"type": "thinking", "thinking": ""},
+            {
+                "type": "tool_use",
+                "id": "toolu_1",
+                "name": "get_weather",
+                "input": {"city": "Ghent"},
+            },
+        )
+        fake_cli.behaves(stdout=json.dumps(call) + "\n", sleep_after=30)
+
+        response = await _request(
+            ClaudeCodeModel("haiku", timeout_s=10),
+            [_user("Weather in Ghent?")],
+            ModelRequestParameters(function_tools=[_WEATHER_TOOL]),
+        )
+
+        assert len(response.parts) == 1
+        part = response.parts[0]
+        assert isinstance(part, ToolCallPart)
+        assert (part.tool_name, part.args) == ("get_weather", {"city": "Ghent"})
+        assert response.finish_reason == "tool_call"
+        assert response.model_name == "claude-haiku-4-5-20251001"
+        assert response.usage.input_tokens == 9 + 100 + 1000
+        assert response.usage.output_tokens == 17
+
+    async def test_call_of_the_clis_own_tool_is_not_intercepted(self, fake_cli: FakeCli) -> None:
+        """StructuredOutput is how the CLI collects the answer, not a function of ours."""
+        structured = {"content": "Hello!", "tool_calls": []}
+        events = [
+            _assistant(
+                {
+                    "type": "tool_use",
+                    "id": "toolu_1",
+                    "name": "StructuredOutput",
+                    "input": structured,
+                }
+            ),
+            _result(structured_output=structured),
+        ]
+        fake_cli.behaves(stdout="\n".join(json.dumps(event) for event in events) + "\n")
+
+        response = await _request(
+            ClaudeCodeModel("haiku"),
+            [_user("hello")],
+            ModelRequestParameters(function_tools=[_WEATHER_TOOL]),
+        )
+        assert response.parts == [TextPart(content="Hello!")]
+
+    async def test_only_the_first_call_without_parallel_tool_calls(self, fake_cli: FakeCli) -> None:
+        call = _assistant(
+            {
+                "type": "tool_use",
+                "id": "toolu_1",
+                "name": "get_weather",
+                "input": {"city": "Ghent"},
+            },
+            {
+                "type": "tool_use",
+                "id": "toolu_2",
+                "name": "get_weather",
+                "input": {"city": "Liege"},
+            },
+        )
+        fake_cli.behaves(stdout=json.dumps(call) + "\n")
+
+        response = await _request(
+            ClaudeCodeModel("haiku"),
+            [_user("Weather?")],
+            ModelRequestParameters(function_tools=[_WEATHER_TOOL]),
+            settings={"parallel_tool_calls": False},
+        )
+        assert [part.args for part in response.parts if isinstance(part, ToolCallPart)] == [
+            {"city": "Ghent"}
+        ]
 
     async def test_missing_structured_output_is_unexpected_behaviour(
         self, fake_cli: FakeCli
@@ -536,7 +636,7 @@ class TestFailures:
 
     async def test_unreadable_output(self, fake_cli: FakeCli) -> None:
         fake_cli.behaves(stdout="this is not json")
-        with pytest.raises(ModelAPIError, match="no readable result"):
+        with pytest.raises(ModelAPIError, match="no result: this is not json"):
             await _request(ClaudeCodeModel("haiku"), [_user("ping")])
 
     async def test_timeout_kills_the_cli(self, fake_cli: FakeCli) -> None:

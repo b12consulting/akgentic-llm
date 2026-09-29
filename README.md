@@ -776,7 +776,7 @@ Providers without native structured output use pydantic-ai's prompt-based extrac
 
 > **Claude Code runs a local executable, not an HTTP API.** `ClaudeCodeModel`
 > (`akgentic.llm.claude_code`) answers each request by running the
-> [Claude Code CLI](https://claude.com/claude-code) in print mode and reading the JSON result it
+> [Claude Code CLI](https://claude.com/claude-code) in print mode and reading the events it
 > prints, so the model authenticates the way the CLI does: a Claude subscription (`claude login`,
 > or `CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token` on a server) or `ANTHROPIC_API_KEY`.
 > Which of those you may use for your workload is governed by Anthropic's terms for that
@@ -791,8 +791,10 @@ Providers without native structured output use pydantic-ai's prompt-based extrac
 > from the HTTP providers:
 >
 > - **Function calling is emulated.** Function tools and output tools are described in the system
->   prompt and the CLI is asked for structured output naming the calls it wants. They come back as
->   ordinary `ToolCallPart`s. Native structured output is therefore off and typed results travel
+>   prompt and the CLI is asked for structured output naming the calls it wants. A model that
+>   calls such a function as a tool of its own instead is taken at its word: the call is read from
+>   the event stream and the CLI is stopped. Either way the calls come back as ordinary
+>   `ToolCallPart`s. Native structured output is therefore off and typed results travel
 >   through the output tool.
 > - **The conversation is replayed as a transcript** in the prompt on every request, which costs
 >   more input tokens than a provider that takes a message list. Prompts are text only.
