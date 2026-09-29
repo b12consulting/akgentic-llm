@@ -138,6 +138,11 @@ class TestSupportsNativeOutput:
         config = ModelConfig(provider="openrouter", model="openrouter/auto")
         assert _supports_native_output(config) is False
 
+    def test_claude_code_no_native_output(self) -> None:
+        """Claude Code emulates tool calls, so it has no native structured output."""
+        config = ModelConfig(provider="claude-code", model="sonnet")
+        assert _supports_native_output(config) is False
+
     def test_openrouter_unprefixed_model_no_native_output(self) -> None:
         """A model id without a vendor/ prefix has no known vendor."""
         config = ModelConfig(provider="openrouter", model="gpt-4o")

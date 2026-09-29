@@ -18,6 +18,8 @@ def test_no_unexpected_exports():
     submodules = {
         "agent",
         "capabilities",
+        # Imported on demand by the provider factory, never by the package itself.
+        "claude_code",
         "compaction",
         "config",
         "context",

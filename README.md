@@ -55,8 +55,8 @@ call any LLM without coupling to a specific vendor or framework primitive.
   default the breach **is** recovered: the turn degrades into one tool-free conclusion and
   `run()` returns its answer (see [Usage limits](#usage-limits) and
   [Run-tier recovery](#run-tier-recovery))
-- **Provider abstraction** — `create_model()` dispatches to one of seven provider factories
-  (OpenAI, Azure, Anthropic, Google, Mistral, NVIDIA, OpenRouter), wrapping the result in pydantic-ai's
+- **Provider abstraction** — `create_model()` dispatches to one of eight provider factories
+  (OpenAI, Azure, Anthropic, Google, Mistral, NVIDIA, OpenRouter, Claude Code), wrapping the result in pydantic-ai's
   `FallbackModel` when `ModelConfig.fallback_models` is non-empty; `get_output_type()` wraps
   output types with `NativeOutput` for providers that support structured output, falls back to
   prompt-based extraction for those that don't
@@ -749,6 +749,7 @@ a scenario bound to `model_cfg.model` at construction and builds no model at all
 | OpenRouter (other routes) | `"openrouter"` | `OPENROUTER_API_KEY` | ❌ |
 | Google Gemini | `"google-gla"` | `GOOGLE_API_KEY` **or** `GEMINI_API_KEY` (one is mandatory) | ❌ |
 | Mistral AI | `"mistral"` | `MISTRAL_API_KEY` | ❌ |
+| Claude Code CLI | `"claude-code"` | none of its own — the CLI's login, `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY` | ❌ |
 
 Providers without native structured output use pydantic-ai's prompt-based extraction fallback.
 
@@ -773,6 +774,38 @@ Providers without native structured output use pydantic-ai's prompt-based extrac
 > so cost accounting works unchanged; a route newer than the installed genai-prices snapshot
 > reports `0.0` until the library ships it (the dependency is uncapped, so this self-heals).
 
+> **Claude Code runs a local executable, not an HTTP API.** `ClaudeCodeModel`
+> (`akgentic.llm.claude_code`) answers each request by running the
+> [Claude Code CLI](https://claude.com/claude-code) in print mode and reading the events it
+> prints, so the model authenticates the way the CLI does: a Claude subscription (`claude login`,
+> or `CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token` on a server) or `ANTHROPIC_API_KEY`.
+> Which of those you may use for your workload is governed by Anthropic's terms for that
+> credential. `model` is a CLI alias (`sonnet`, `opus`, `haiku`) or a full model id. The executable
+> comes from `CLAUDE_CODE_CLI`, defaulting to `claude` on the `PATH`, and a missing executable
+> fails at construction with pydantic-ai's `UserError`. The provider was written against CLI
+> 2.1; an older CLI that lacks one of the flags it passes fails on the first request.
+>
+> The CLI is used as a plain model. Its built-in tools, MCP servers, hooks, skills and `CLAUDE.md`
+> discovery are switched off and it runs in an empty temporary directory; your tools keep running
+> in your process. Because the CLI takes one prompt and returns one answer, three things differ
+> from the HTTP providers:
+>
+> - **Function calling is emulated.** Function tools and output tools are described in the system
+>   prompt and the CLI is asked for structured output naming the calls it wants. A model that
+>   calls such a function as a tool of its own instead is taken at its word: the call is read from
+>   the event stream and the CLI is stopped. Either way the calls come back as ordinary
+>   `ToolCallPart`s. Native structured output is therefore off and typed results travel
+>   through the output tool.
+> - **The conversation is replayed as a transcript** in the prompt on every request, which costs
+>   more input tokens than a provider that takes a message list. Prompts are text only.
+> - **`temperature`, `max_tokens` and `seed` are ignored**, as the CLI has no flag for them;
+>   `reasoning_effort` is passed on as `--effort`. The shared `http_client` is not used, so
+>   `HttpClientConfig` does not apply either: a run is bounded by the model's own 300-second
+>   timeout, and retrying is left to the CLI.
+>
+> Responses carry the model id the CLI resolved the alias to and the provider name `anthropic`,
+> so genai-prices estimates the cost at API rates, also when a subscription is what pays.
+
 > **Google is API-key only.** The provider factory reads `GOOGLE_API_KEY`, falling back to
 > `GEMINI_API_KEY`, and raises `ValueError` when neither is set. Application Default
 > Credentials are not consulted, so an ADC-only deployment does not work.
@@ -789,6 +822,12 @@ ModelConfig(provider="openrouter", model="deepseek/deepseek-v4-flash-0731")
 
 # OpenRouter — Google route (native output)
 ModelConfig(provider="openrouter", model="google/gemini-2.5-flash")
+
+# Claude Code CLI — alias, authenticated by the CLI itself
+ModelConfig(provider="claude-code", model="sonnet")
+
+# Claude Code CLI — reasoning effort is passed on as --effort
+ModelConfig(provider="claude-code", model="opus", reasoning_effort="high")
 ```
 
 ### Fallback chain
@@ -804,8 +843,9 @@ support, because that wrapper is chosen once from the primary's provider before 
 Every entry is built eagerly, when the agent is constructed — not lazily, on the first failure. That
 is what makes a bad entry fail loudly and early, but it also means each entry's credentials and
 environment must be present up front: the example below does not construct without
-`AZURE_OPENAI_ENDPOINT`, even while the OpenAI primary is perfectly healthy, and an `openrouter`
-entry needs `OPENROUTER_API_KEY` just the same. All entries share the one `http_client` passed to
+`AZURE_OPENAI_ENDPOINT`, even while the OpenAI primary is perfectly healthy, an `openrouter`
+entry needs `OPENROUTER_API_KEY` just the same, and a `claude-code` entry needs the CLI
+installed. All entries share the one `http_client` passed to
 `create_model()`.
 
 ```python
