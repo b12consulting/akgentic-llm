@@ -219,9 +219,13 @@ class ClaudeCodeModel(Model[None]):
             )
             system_prompt = f"{system_prompt}\n\n{section}"
 
-        tool_names = frozenset(tool.name for tool in [*function_tools, *output_tools])
-        result = await self._run_cli(system_prompt, _render_prompt(messages), schema, tool_names)
-        return self._to_response(result, expects_calls=schema is not None, parallel=parallel)
+        schemas = {
+            tool.name: tool.parameters_json_schema for tool in [*function_tools, *output_tools]
+        }
+        result = await self._run_cli(
+            system_prompt, _render_prompt(messages), schema, frozenset(schemas)
+        )
+        return self._to_response(result, schemas if schema is not None else None, parallel=parallel)
 
     @asynccontextmanager
     async def request_stream(
@@ -345,17 +349,22 @@ class ClaudeCodeModel(Model[None]):
         raise ModelAPIError(self._model_name, f"Claude Code CLI failed: {detail}")
 
     def _to_response(
-        self, result: dict[str, Any], *, expects_calls: bool, parallel: bool = True
+        self,
+        result: dict[str, Any],
+        schemas: dict[str, dict[str, Any]] | None,
+        *,
+        parallel: bool = True,
     ) -> ModelResponse:
+        """Build the response; ``schemas`` holds the functions a call may name, if any."""
         parts: list[ModelResponsePart] = []
-        if expects_calls:
+        if schemas is not None:
             structured = result.get("structured_output")
             if not isinstance(structured, dict):
                 raise UnexpectedModelBehavior(
                     "Claude Code CLI returned no structured output",
                     body=str(result.get("result"))[:1000],
                 )
-            parts = _call_parts(structured) if parallel else _call_parts(structured)[:1]
+            parts = _call_parts(structured, schemas)[: None if parallel else 1]
             if not parts and (content := structured.get("content")):
                 parts = [TextPart(content=str(content))]
         elif text := result.get("result"):
@@ -524,15 +533,85 @@ def _function_calling(
     return section, schema
 
 
-def _call_parts(structured: dict[str, Any]) -> list[ModelResponsePart]:
+_JSON_TYPES: dict[type, str] = {
+    dict: "object",
+    list: "array",
+    bool: "boolean",
+    int: "number",
+    float: "number",
+}
+
+
+def _resolve(schema: Any, root: dict[str, Any]) -> dict[str, Any]:
+    """Follow a local ``$ref`` of a schema; anything else is returned as it is."""
+    seen = 0
+    while isinstance(schema, dict) and isinstance(schema.get("$ref"), str) and seen < 10:
+        target: Any = root
+        for key in schema["$ref"].removeprefix("#/").split("/"):
+            target = target.get(key) if isinstance(target, dict) else None
+        schema, seen = target, seen + 1
+    return schema if isinstance(schema, dict) else {}
+
+
+def _accepted_types(schema: dict[str, Any], root: dict[str, Any]) -> set[str]:
+    """The JSON types a schema accepts; empty when it does not say."""
+    declared = schema.get("type")
+    types = {declared} if isinstance(declared, str) else set(declared or [])
+    for keyword in ("anyOf", "oneOf"):
+        for option in schema.get(keyword) or []:
+            types |= _accepted_types(_resolve(option, root), root)
+    return {"number" if name == "integer" else name for name in types}
+
+
+def _decoded(value: str, accepted: set[str]) -> Any:
+    """A string holding the JSON of a value the schema asks for, as that value."""
+    if not accepted or "string" in accepted:
+        return value
+    try:
+        decoded = json.loads(value)
+    except ValueError:
+        return value
+    return decoded if _JSON_TYPES.get(type(decoded)) in accepted else value
+
+
+def _conform(value: Any, schema: Any, root: dict[str, Any]) -> Any:
+    """Undo the JSON-in-a-string encoding of arguments, guided by their schema.
+
+    A model that calls a function the API holds no schema for tends to pass a
+    list or an object as a string of JSON. Where the schema asks for such a value
+    and rules a string out, the string is decoded. Nothing else is touched:
+    judging the arguments stays with the validation of the tool.
+    """
+    schema = _resolve(schema, root)
+    if isinstance(value, str):
+        decoded = _decoded(value, _accepted_types(schema, root))
+        return value if decoded is value else _conform(decoded, schema, root)
+    options = [_resolve(o, root) for k in ("anyOf", "oneOf") for o in schema.get(k) or []]
+    if isinstance(value, dict):
+        properties: dict[str, Any] = next(
+            (s["properties"] for s in [schema, *options] if isinstance(s.get("properties"), dict)),
+            {},
+        )
+        return {k: _conform(v, properties.get(k), root) for k, v in value.items()}
+    if isinstance(value, list):
+        items = next((s["items"] for s in [schema, *options] if "items" in s), None)
+        return [_conform(item, items, root) for item in value]
+    return value
+
+
+def _call_parts(
+    structured: dict[str, Any], schemas: dict[str, dict[str, Any]]
+) -> list[ModelResponsePart]:
     parts: list[ModelResponsePart] = []
     for call in structured.get("tool_calls") or []:
         if not isinstance(call, dict) or not call.get("name"):
             continue
-        arguments = call.get("arguments")
+        name = str(call["name"])
+        schema = schemas.get(name, {})
+        arguments = _conform(call.get("arguments"), schema, schema)
         parts.append(
             ToolCallPart(
-                tool_name=str(call["name"]),
+                tool_name=name,
                 args=arguments if isinstance(arguments, dict) else {},
                 tool_call_id=f"call_{uuid.uuid4().hex[:24]}",
             )

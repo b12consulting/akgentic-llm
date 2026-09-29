@@ -39,6 +39,7 @@ from akgentic.llm import ModelConfig, create_model, create_model_settings, get_o
 from akgentic.llm.claude_code import (
     CLAUDE_CODE_CLI_ENV,
     ClaudeCodeModel,
+    _conform,
     _render_prompt,
     _resolved_model_name,
     _usage,
@@ -599,6 +600,85 @@ class TestFunctionCalling:
                 [_user("go")],
                 ModelRequestParameters(function_tools=[_WEATHER_TOOL]),
             )
+
+
+# ---------------------------------------------------------------------------
+# Arguments passed as JSON in a string
+# ---------------------------------------------------------------------------
+
+_PLANNING_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "create_tasks": {"type": "array", "items": {"$ref": "#/$defs/Task"}},
+        "note": {"type": "string"},
+        "limit": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
+        "anything": {},
+    },
+    "$defs": {
+        "Task": {
+            "type": "object",
+            "properties": {"id": {"type": "integer"}, "tags": {"type": "array"}},
+        }
+    },
+}
+
+
+def _conformed(arguments: Any) -> Any:
+    return _conform(arguments, _PLANNING_SCHEMA, _PLANNING_SCHEMA)
+
+
+class TestConform:
+    def test_list_in_a_string_is_decoded(self) -> None:
+        arguments = {"create_tasks": '[{"id": 1, "tags": ["a"]}]'}
+        assert _conformed(arguments) == {"create_tasks": [{"id": 1, "tags": ["a"]}]}
+
+    def test_whole_arguments_in_a_string_are_decoded(self) -> None:
+        assert _conformed('{"note": "hi"}') == {"note": "hi"}
+
+    def test_nested_values_are_decoded_through_a_ref(self) -> None:
+        arguments = {"create_tasks": [{"id": "1", "tags": '["a", "b"]'}]}
+        assert _conformed(arguments) == {"create_tasks": [{"id": 1, "tags": ["a", "b"]}]}
+
+    def test_option_of_a_union_is_decoded(self) -> None:
+        assert _conformed({"limit": "3"}) == {"limit": 3}
+
+    def test_string_stays_a_string_where_a_string_is_asked(self) -> None:
+        arguments = {"note": '["not", "a", "list"]'}
+        assert _conformed(arguments) == arguments
+
+    def test_string_stays_where_the_schema_does_not_say(self) -> None:
+        arguments = {"anything": "[1]", "unknown": "{}"}
+        assert _conformed(arguments) == arguments
+
+    def test_string_that_is_no_json_stays(self) -> None:
+        arguments = {"create_tasks": "first do this, then that"}
+        assert _conformed(arguments) == arguments
+
+    def test_json_of_another_type_stays(self) -> None:
+        arguments = {"create_tasks": "42"}
+        assert _conformed(arguments) == arguments
+
+    async def test_intercepted_call_is_conformed(self, fake_cli: FakeCli) -> None:
+        call = _assistant(
+            {
+                "type": "tool_use",
+                "id": "toolu_1",
+                "name": "update_planning",
+                "input": {"create_tasks": '[{"id": 1}]'},
+            }
+        )
+        fake_cli.behaves(stdout=json.dumps(call) + "\n")
+        tool = ToolDefinition(name="update_planning", parameters_json_schema=_PLANNING_SCHEMA)
+
+        response = await _request(
+            ClaudeCodeModel("sonnet"),
+            [_user("plan")],
+            ModelRequestParameters(function_tools=[tool]),
+        )
+
+        part = response.parts[0]
+        assert isinstance(part, ToolCallPart)
+        assert part.args == {"create_tasks": [{"id": 1}]}
 
 
 # ---------------------------------------------------------------------------
