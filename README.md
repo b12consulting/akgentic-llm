@@ -1732,9 +1732,9 @@ stamps.
 > bucket at the first provider seen. This is a correction, not a regression. A team whose history
 > spans the upgrade has one bucket mixing stamped and unstamped events; that bucket is **not**
 > recomputed and under-reports by the pre-upgrade portion — accepted, bounded by that one team's
-> pre-upgrade history, and not backfilled. Historical events are never re-priced: an event
-> persisted before the field existed keeps `0.0` on the event and is priced through the
-> aggregation fallback described below, exactly as before.
+> pre-upgrade history, and not backfilled. Historical events are never stamped after the fact:
+> an event persisted before the field existed keeps `0.0` on the event and is priced through the
+> aggregation fallback described below, at the installed price snapshot, exactly as before.
 
 `akgentic-frontend` displays this value and never computes a price — no price table ships to the
 browser; its epic is authored after this package releases, against the released field.
@@ -1758,7 +1758,8 @@ the installed `genai-prices` release (no live/auto-update is wired into this pac
 dependency therefore carries **no upper bound** — capping it would freeze the price table
 and make this package report stale costs. Refreshing prices means resolving a newer
 `genai-prices`, not editing a pin. A stamped event keeps the price of the day it was emitted, so
-a newer `genai-prices` moves only new events and fallback recomputes — never history.
+a newer `genai-prices` moves only new events and the fallback recompute of unstamped buckets —
+never a stamped event.
 
 ### Aggregation
 

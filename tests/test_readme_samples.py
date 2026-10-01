@@ -136,7 +136,7 @@ def _tool_names(agent: ReactAgent) -> set[str]:
 
 
 def _usage_event(run_id: str, model_name: str = "gpt-4o") -> LlmUsageEvent:
-    """One usage event, the shape ``ContextManager._emit_usage_event`` produces."""
+    """One unstamped usage event, the shape persisted before ``estimated_cost_usd`` existed."""
     return LlmUsageEvent(
         run_id=run_id,
         model_name=model_name,
