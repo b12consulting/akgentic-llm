@@ -770,8 +770,10 @@ Providers without native structured output use pydantic-ai's prompt-based extrac
 > shared default model `gpt-5.2` has no vendor prefix and is rejected by pydantic-ai when the
 > model is built. A missing `OPENROUTER_API_KEY` fails at construction with pydantic-ai's
 > `UserError`, not at request time. genai-prices prices routes under the `openrouter` provider,
-> so cost accounting works unchanged; a route newer than the installed genai-prices snapshot
-> reports `0.0` until the library ships it (the dependency is uncapped, so this self-heals).
+> so cost accounting works unchanged; a response on a route newer than the installed genai-prices
+> snapshot is **stamped** `0.0`, and an all-zero bucket is recomputed at aggregation from the
+> installed snapshot, so totals self-heal once the library ships the route (the dependency is
+> uncapped) while the events themselves keep their `0.0`.
 
 > **Google is API-key only.** The provider factory reads `GOOGLE_API_KEY`, falling back to
 > `GEMINI_API_KEY`, and raises `ValueError` when neither is set. Application Default
@@ -1143,8 +1145,10 @@ to the list you were handed, do not rebuild it.
 the lifetime budget and compaction into capabilities. Those changed *where* the concerns live,
 not what a run emits: the same seven event types (`LlmMessageEvent`, `ToolCallEvent`,
 `ToolReturnEvent`, `LlmUsageEvent`, `LlmSystemPromptEvent`, `LlmContextCompactedEvent`,
-`LlmContextClearedEvent`), the same payload shapes, the same per-message ordering
-(`LlmMessageEvent` → tool events → `LlmUsageEvent`), the same run-id correlation. **No consumer
+`LlmContextClearedEvent`), the same payload shapes (`LlmUsageEvent` has since gained one
+defaulted field, `estimated_cost_usd`, which old readers ignore and new readers default), the same
+per-message ordering (`LlmMessageEvent` → tool events → `LlmUsageEvent`), the same run-id
+correlation. **No consumer
 needs a schema change.** Two paths do emit *more* than they used to, both described below.
 
 **Two behavioural differences, and both are the fix working.**
@@ -1715,25 +1719,54 @@ config that never enters the per-agent event stream.
 ## Cost Tracking and Aggregation
 
 `akgentic-llm` emits an `LlmUsageEvent` for every `ModelResponse` received from a provider.
-These events carry per-request token counts and can be aggregated into hierarchical cost
-summaries using `aggregate_usage()`.
+Each event carries that response's per-request token counts **and** its `estimated_cost_usd`,
+priced once at emission by the public `estimate_cost()` from the response's own tokens and
+provider. `aggregate_usage()` folds the events into hierarchical cost summaries by summing those
+stamps.
+
+> **Upgrade note — reported totals move.** The first time a team's events are aggregated under
+> the stamping code, totals for models with tiered rates, or for buckets that mixed providers
+> under one model name, change — **downward, toward what the provider actually charged**. The
+> previous aggregate-then-price arithmetic summed every response into one token total and priced
+> that, so it could land a bucket in a long-context tier none of its requests hit, or price a whole
+> bucket at the first provider seen. This is a correction, not a regression. A team whose history
+> spans the upgrade has one bucket mixing stamped and unstamped events; that bucket is **not**
+> recomputed and under-reports by the pre-upgrade portion — accepted, bounded by that one team's
+> pre-upgrade history, and not backfilled. Historical events are never re-priced: an event
+> persisted before the field existed keeps `0.0` on the event and is priced through the
+> aggregation fallback described below, exactly as before.
+
+`akgentic-frontend` displays this value and never computes a price — no price table ships to the
+browser; its epic is authored after this package releases, against the released field.
 
 ### Pricing
 
 Model pricing is resolved via the [`genai-prices`](https://github.com/pydantic/genai-prices)
 library against its bundled offline snapshot — there is no pricing table maintained in
-this package. For each model, `_compute_cost()` builds a `genai_prices.Usage` from the
-aggregated token counts and calls `calc_price(usage, model_ref=model_name,
-provider_id=provider_name or None)`. An unmatched `model_ref` raises `LookupError`, which
-is caught and mapped to `0.0` — unpriced models still have their tokens aggregated.
+this package. `estimate_cost()` — public, exported from `akgentic.llm` — is the single pricer.
+`ContextManager` stamps every `LlmUsageEvent` with it, once, per `ModelResponse` (the unit the
+provider bills), from that response's own `model_name` and `provider_name` and its four token
+counts: it builds a `genai_prices.Usage` and calls `calc_price(usage, model_ref=model_name,
+provider_id=provider_name or None)`. `aggregate_usage()` falls back to the same function for a
+bucket whose events carry no stamp (see §Aggregation). An unmatched `model_ref` raises
+`LookupError`, which is caught and mapped to `0.0` — unpriced models still have their tokens
+aggregated. On the event, `0.0` also means "persisted before the field existed": the absence of a
+stamp is the only version marker.
 
 Because pricing comes from `genai-prices`' bundled snapshot, prices are only as current as
 the installed `genai-prices` release (no live/auto-update is wired into this package). The
 dependency therefore carries **no upper bound** — capping it would freeze the price table
 and make this package report stale costs. Refreshing prices means resolving a newer
-`genai-prices`, not editing a pin.
+`genai-prices`, not editing a pin. A stamped event keeps the price of the day it was emitted, so
+a newer `genai-prices` moves only new events and fallback recomputes — never history.
 
 ### Aggregation
+
+Per-model cost is the **sum of the bucket's stamps**. Only if that sum is `0.0` and the bucket
+has tokens — a bucket of events persisted before the stamp existed, or a model `genai-prices`
+does not know — is it recomputed from the bucket's aggregate tokens through `estimate_cost()`. A
+bucket that mixes stamped and unstamped events is not recomputed. `RunUsageSummary.total_cost_usd`
+and `AgentUsageSummary.total_cost_usd` are sums over those per-model values.
 
 ```python
 from akgentic.llm import LlmUsageEvent, aggregate_usage
@@ -1754,11 +1787,39 @@ for run in summary.runs:
     print(f"Run {run.run_id}: ${run.total_cost_usd:.4f}")
 ```
 
+The stamp is already on the event, so an observer can keep a running ledger without pricing
+anything itself. `estimate_cost()` is the same pricer the stamp uses; derive any expectation
+through it and never hardcode a price — `genai-prices` ships the price table and it moves:
+
+```python
+from akgentic.llm import LlmUsageEvent, aggregate_usage, estimate_cost
+
+class CostLedger:
+    def __init__(self) -> None:
+        self.total_usd = 0.0
+
+    def notify_event(self, event: object) -> None:
+        if isinstance(event, LlmUsageEvent):
+            self.total_usd += event.estimated_cost_usd  # already priced; never re-price
+
+# The same pricer the stamp uses — derive expectations through it, never hardcode a price.
+priced = estimate_cost("gpt-4o", "openai", input_tokens=100, output_tokens=50,
+                       cache_read_tokens=0, cache_write_tokens=0)
+assert priced > 0.0
+assert estimate_cost("not-a-real-model", "", 100, 50, 0, 0) == 0.0
+
+# A ledger that only reads stamps agrees with aggregate_usage(), which sums the same stamps.
+ledger = CostLedger()
+for event in events:   # the stamped events your observer collected
+    ledger.notify_event(event)
+print(f"Ledger ${ledger.total_usd:.4f} / aggregate ${aggregate_usage(events).total_cost_usd:.4f}")
+```
+
 ### Data Models
 
 | Model | Description |
 |-------|-------------|
-| `LlmUsageEvent` | Frozen dataclass emitted per `ModelResponse` — carries `run_id`, `model_name`, `provider_name`, token counts, and `requests` |
+| `LlmUsageEvent` | Frozen dataclass emitted per `ModelResponse` — carries `run_id`, `model_name`, `provider_name`, token counts, `requests`, and `estimated_cost_usd` (priced at emission; `0.0` = unpriced model or pre-stamp event) |
 | `ModelUsage` | Aggregated tokens and estimated cost for a single model |
 | `RunUsageSummary` | Per-run summary with per-model breakdown |
 | `AgentUsageSummary` | Top-level summary with `by_model`, optional `runs`, and grand totals |
@@ -1881,7 +1942,7 @@ src/akgentic/llm/
                     #   SystemPromptPartSnapshot, LlmContextCompactedEvent,
                     #   LlmContextClearedEvent, ToolCallEvent, ToolReturnEvent,
                     #   ContextObserver and EventMessage protocols
-    pricing.py      # _compute_cost() (genai-prices), ModelUsage, RunUsageSummary,
+    pricing.py      # estimate_cost() (genai-prices), ModelUsage, RunUsageSummary,
                     #   AgentUsageSummary, aggregate_usage()
     prompts.py      # PromptTemplate, current_datetime_prompt, json_output_reminder_prompt
     providers.py    # create_model(), create_http_client(), get_output_type(),

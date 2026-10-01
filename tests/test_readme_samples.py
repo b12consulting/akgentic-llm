@@ -27,7 +27,6 @@ Zero egress: no sample issues a model request. Provider credentials are faked in
 ``_fake_provider_env`` purely so the provider factories construct.
 """
 
-import asyncio
 import inspect
 from typing import Any
 
@@ -71,6 +70,7 @@ from akgentic.llm import (
     aggregate_usage,
     create_compaction,
     current_datetime_prompt,
+    estimate_cost,
     get_output_type,
     json_output_reminder_prompt,
     model_roster_key,
@@ -146,6 +146,23 @@ def _usage_event(run_id: str, model_name: str = "gpt-4o") -> LlmUsageEvent:
         cache_read_tokens=0,
         cache_write_tokens=0,
         requests=1,
+    )
+
+
+def _stamped_usage_event(
+    run_id: str, input_tokens: int, output_tokens: int, model_name: str = "gpt-4o"
+) -> LlmUsageEvent:
+    """One usage event, stamped through ``estimate_cost`` as ``_emit_usage_event`` does."""
+    return LlmUsageEvent(
+        run_id=run_id,
+        model_name=model_name,
+        provider_name="openai",
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cache_read_tokens=0,
+        cache_write_tokens=0,
+        requests=1,
+        estimated_cost_usd=estimate_cost(model_name, "openai", input_tokens, output_tokens, 0, 0),
     )
 
 
@@ -763,7 +780,7 @@ async def test_run_tier_recovery_opt_out_sample(agents: Any) -> None:
     class NeverConcludes(LimitRecoveryCapability):
         """Restore the pre-recovery contract: a run-tier breach simply raises."""
 
-        async def handle_limit_exceeded(self, ctx, *, error):  # noqa: ANN001, ANN201
+        async def handle_limit_exceeded(self, ctx, *, error) -> None:  # noqa: ANN001
             return None
 
     policy = NeverConcludes()
@@ -784,7 +801,7 @@ async def test_run_tier_recovery_house_style_sample(agents: Any) -> None:
     class HouseStyle(LimitRecoveryCapability):
         """Conclude with a deployment's own wording instead of the default prompt."""
 
-        async def handle_limit_exceeded(self, ctx, *, error):  # noqa: ANN001, ANN201
+        async def handle_limit_exceeded(self, ctx, *, error) -> ConclusionDecision:  # noqa: ANN001
             return ConclusionDecision(reason="Budget spent — answer now with what you have.")
 
     policy = HouseStyle()
@@ -1279,6 +1296,48 @@ def test_unpriced_model_aggregates_tokens_at_zero_cost() -> None:
     summary = aggregate_usage([_usage_event("run-1", "not-a-real-model-xyz")])
     assert summary.total_input_tokens == 100
     assert summary.total_cost_usd == 0.0
+
+
+def test_estimate_cost_sample() -> None:
+    """§Aggregation — the stamp and the public pricer, asserted as relationships only.
+
+    Two stamped events feed the documented ledger. The expected total is derived
+    through ``estimate_cost`` -- the same call the stamp makes -- never from a USD
+    literal, because genai-prices ships the price table and it moves (Golden
+    Rule #13). The ledger's sum is compared to ``aggregate_usage``'s total, never
+    to an aggregate recompute: under tiered pricing those two legitimately differ.
+    """
+
+    class CostLedger:
+        def __init__(self) -> None:
+            self.total_usd = 0.0
+
+        def notify_event(self, event: object) -> None:
+            if isinstance(event, LlmUsageEvent):
+                self.total_usd += event.estimated_cost_usd  # already priced; never re-price
+
+    # The same pricer the stamp uses — derive expectations through it, never hardcode a price.
+    priced = estimate_cost(
+        "gpt-4o",
+        "openai",
+        input_tokens=100,
+        output_tokens=50,
+        cache_read_tokens=0,
+        cache_write_tokens=0,
+    )
+    assert priced > 0.0
+    assert estimate_cost("not-a-real-model", "", 100, 50, 0, 0) == 0.0
+
+    events = [
+        _stamped_usage_event("run-1", input_tokens=100, output_tokens=50),
+        _stamped_usage_event("run-2", input_tokens=4_000, output_tokens=800),
+    ]
+    ledger = CostLedger()
+    for event in events:
+        ledger.notify_event(event)
+    assert ledger.total_usd > 0.0
+    assert ledger.total_usd == pytest.approx(sum(ev.estimated_cost_usd for ev in events))
+    assert aggregate_usage(events).total_cost_usd == pytest.approx(ledger.total_usd)
 
 
 # ---------------------------------------------------------------------------

@@ -240,6 +240,11 @@ def aggregate_usage(
     Always aggregates totals and by-model breakdown.
     When by_run=True, also provides per-run detail.
 
+    Per-model cost is the sum of the events' ``estimated_cost_usd`` stamps. It is
+    recomputed from the bucket's aggregate tokens via ``estimate_cost`` only when
+    that sum is ``0.0`` and the bucket has tokens — the path pre-stamp (replayed)
+    events take. A bucket mixing stamped and unstamped events is not recomputed.
+
     Args:
         events: List of LlmUsageEvent (typically for one agent).
         by_run: Include per-run breakdown (default: False).
