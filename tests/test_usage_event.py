@@ -36,6 +36,7 @@ from akgentic.llm.event import (  # noqa: E402, I001
     LlmUsageEvent,
     ToolCallEvent,
 )
+from akgentic.llm.pricing import estimate_cost  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -113,6 +114,8 @@ class TestLlmUsageEventDataclass:
         )
         with pytest.raises(dataclasses.FrozenInstanceError):
             event.run_id = "other"  # type: ignore[misc]
+        # The eight-kwarg construction still works and yields an unstamped event.
+        assert event.estimated_cost_usd == 0.0
 
     def test_correct_fields(self) -> None:
         """LlmUsageEvent must have exactly the specified fields."""
@@ -126,8 +129,19 @@ class TestLlmUsageEventDataclass:
             "cache_read_tokens",
             "cache_write_tokens",
             "requests",
+            "estimated_cost_usd",
         }
         assert field_names == expected
+
+    def test_stamp_is_last_and_only_defaulted_field(self) -> None:
+        """estimated_cost_usd is the ninth and last field; every other field has no default."""
+        fields = dataclasses.fields(LlmUsageEvent)
+        names = [f.name for f in fields]
+        assert len(names) == 9
+        assert names[-1] == "estimated_cost_usd"
+        assert fields[-1].default == 0.0
+        for field in fields[:-1]:
+            assert field.default is dataclasses.MISSING, f"{field.name} must have no default"
 
     def test_field_types(self) -> None:
         """LlmUsageEvent fields must have correct types."""
@@ -140,6 +154,7 @@ class TestLlmUsageEventDataclass:
         assert fields["cache_read_tokens"] == "int"
         assert fields["cache_write_tokens"] == "int"
         assert fields["requests"] == "int"
+        assert fields["estimated_cost_usd"] == "float"
 
 
 # ---------------------------------------------------------------------------
@@ -269,6 +284,73 @@ class TestDefaultUsageStillEmits:
         assert event.cache_read_tokens == 0
         assert event.cache_write_tokens == 0
         assert event.requests == 1
+        assert event.estimated_cost_usd == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Story 30-1 AC-3: the stamp — priced once at emission with the response's own
+# model, provider and token counts
+# ---------------------------------------------------------------------------
+
+
+def _emitted_usage_event(msg: ModelResponse) -> LlmUsageEvent:
+    manager, capture = _make_manager_with_capture()
+    manager.add_message(msg)
+    usage_events = [e for e in capture.events if isinstance(e, LlmUsageEvent)]
+    assert len(usage_events) == 1
+    return usage_events[0]
+
+
+class TestUsageEventStamp:
+    """AC-3: estimated_cost_usd is stamped from the response's own fields at emission."""
+
+    def test_known_model_stamps_its_own_price(self) -> None:
+        event = _emitted_usage_event(_response_with_usage())
+        expected = estimate_cost("claude-sonnet-4-20250514", "anthropic", 100, 50, 10, 20)
+        assert expected > 0.0
+        assert event.estimated_cost_usd == pytest.approx(expected)
+
+    def test_unknown_model_stamps_zero(self) -> None:
+        event = _emitted_usage_event(
+            _response_with_usage(model_name="test-model", provider_name="test-provider")
+        )
+        assert event.estimated_cost_usd == 0.0
+
+    def test_openrouter_route_stamps_under_its_own_provider(self) -> None:
+        event = _emitted_usage_event(
+            _response_with_usage(
+                model_name="deepseek/deepseek-chat",
+                provider_name="openrouter",
+                input_tokens=1000,
+                output_tokens=1000,
+                cache_read_tokens=0,
+                cache_write_tokens=0,
+            )
+        )
+        expected = estimate_cost("deepseek/deepseek-chat", "openrouter", 1000, 1000, 0, 0)
+        assert event.estimated_cost_usd > 0.0
+        assert event.estimated_cost_usd == pytest.approx(expected)
+
+    def test_openrouter_route_without_provider_stamps_zero(self) -> None:
+        event = _emitted_usage_event(
+            _response_with_usage(
+                model_name="deepseek/deepseek-chat",
+                provider_name=None,
+                input_tokens=1000,
+                output_tokens=1000,
+                cache_read_tokens=0,
+                cache_write_tokens=0,
+            )
+        )
+        assert event.provider_name == ""
+        assert event.estimated_cost_usd == 0.0
+
+    def test_stamp_does_not_change_ordering_or_last_input_tokens(self) -> None:
+        manager, capture = _make_manager_with_capture()
+        manager.add_message(_response_with_usage(input_tokens=321))
+        assert isinstance(capture.events[0], LlmMessageEvent)
+        assert isinstance(capture.events[1], LlmUsageEvent)
+        assert manager.last_input_tokens == 321
 
 
 # ---------------------------------------------------------------------------

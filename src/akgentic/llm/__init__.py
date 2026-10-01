@@ -88,6 +88,7 @@ from .pricing import (
     ModelUsage,
     RunUsageSummary,
     aggregate_usage,
+    estimate_cost,
 )
 from .prompts import (
     PromptTemplate,
@@ -152,6 +153,7 @@ __all__ = [
     "ModelUsage",
     "RunUsageSummary",
     "aggregate_usage",
+    "estimate_cost",
     # Providers
     "create_model",
     "create_http_client",

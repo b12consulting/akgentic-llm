@@ -1,9 +1,14 @@
-"""Aggregation models and aggregate_usage() with genai-prices cost estimation.
+"""Aggregation models, the public pricer, and aggregate_usage().
 
-Aggregates ``LlmUsageEvent`` lists into hierarchical cost summaries. Per-model
-cost is estimated with the ``genai-prices`` library (offline bundled price
-snapshot), so provider rates stay current without a hand-maintained table and
-cached tokens are priced without double-counting.
+``estimate_cost`` prices one response with the ``genai-prices`` library (offline
+bundled price snapshot), so provider rates stay current without a hand-maintained
+table and cached tokens are priced without double-counting. ``ContextManager``
+stamps every ``LlmUsageEvent`` with it at emission.
+
+``aggregate_usage`` folds ``LlmUsageEvent`` lists into hierarchical cost
+summaries. Per-model cost is the **sum of the events' stamps**; it is recomputed
+from the bucket's aggregate tokens only when that sum is ``0.0`` and the bucket
+has tokens — the path a pre-stamp (replayed) bucket takes.
 """
 
 from __future__ import annotations
@@ -27,6 +32,7 @@ class _ModelAccum(TypedDict):
     cache_read_tokens: int
     cache_write_tokens: int
     requests: int
+    estimated_cost_usd: float
 
 
 @dataclass(frozen=True)
@@ -41,8 +47,10 @@ class ModelUsage:
         cache_read_tokens: Total tokens read from provider cache.
         cache_write_tokens: Total tokens written to provider cache.
         requests: Total HTTP requests.
-        estimated_cost_usd: Estimated cost in USD computed via genai-prices
-            (0.0 when the model is not resolvable by genai-prices).
+        estimated_cost_usd: Sum of the events' ``estimated_cost_usd`` stamps.
+            Recomputed from the aggregate tokens via ``estimate_cost`` only when
+            that sum is ``0.0`` and the bucket has tokens (pre-stamp events);
+            ``0.0`` when the model is not resolvable by genai-prices.
     """
 
     model_name: str
@@ -101,7 +109,7 @@ class AgentUsageSummary(BaseModel):
     total_cost_usd: float = 0.0
 
 
-def _compute_cost(
+def estimate_cost(
     model_name: str,
     provider_name: str,
     input_tokens: int,
@@ -109,16 +117,32 @@ def _compute_cost(
     cache_read_tokens: int,
     cache_write_tokens: int,
 ) -> float:
-    """Estimate USD cost for a model via genai-prices (offline snapshot).
+    """Estimate the USD cost of one model response via genai-prices (offline snapshot).
+
+    This is the single pricer in the framework: ``ContextManager`` stamps every
+    ``LlmUsageEvent`` with it at emission, and ``aggregate_usage`` falls back to
+    it for buckets whose events carry no stamp.
 
     ``input_tokens`` already includes cached tokens; genai-prices splits the
     total internally (cached portion at the cheaper cache-read rate, remainder
     at the input rate), so cache reads are never double-charged.
 
-    An unknown ``model_ref`` makes ``calc_price`` raise ``LookupError``; that is
-    mapped to ``0.0`` so an unpriced model still aggregates its token counts.
-    ``provider_id`` is passed as ``None`` when empty so the lookup matches by
-    ``model_ref`` across providers instead of scoping to a non-existent one.
+    Args:
+        model_name: Model identifier as reported by the provider; genai-prices'
+            ``model_ref``.
+        provider_name: Provider identifier (e.g. ``"anthropic"``, ``"openrouter"``).
+            An empty string is passed as ``provider_id=None`` so the lookup
+            matches by ``model_ref`` across providers instead of scoping to a
+            non-existent one.
+        input_tokens: Prompt tokens, cached reads included.
+        output_tokens: Response tokens.
+        cache_read_tokens: Tokens read from provider cache.
+        cache_write_tokens: Tokens written to provider cache.
+
+    Returns:
+        The estimated cost in USD, or ``0.0`` when genai-prices cannot resolve
+        ``model_name`` (``calc_price`` raises ``LookupError``), so an unpriced
+        model still aggregates its token counts.
     """
     usage = Usage(
         input_tokens=input_tokens,
@@ -133,32 +157,43 @@ def _compute_cost(
     return float(price.total_price)
 
 
-def _build_model_usage(
-    model_name: str,
-    provider_name: str,
-    input_tokens: int,
-    output_tokens: int,
-    cache_read_tokens: int,
-    cache_write_tokens: int,
-    requests: int,
-) -> ModelUsage:
-    """Build a ModelUsage with computed cost."""
-    cost = _compute_cost(
-        model_name,
-        provider_name,
-        input_tokens,
-        output_tokens,
-        cache_read_tokens,
-        cache_write_tokens,
+def _build_model_usage(model_name: str, bucket: _ModelAccum) -> ModelUsage:
+    """Build a ModelUsage from an accumulator bucket, deriving its cost.
+
+    The cost is the sum of the bucket's stamps; it is recomputed from the
+    aggregate tokens only when that sum is ``0.0`` and the bucket has tokens.
+    Unstamped events contribute exactly ``0.0`` and a sum of exact zeros is
+    exactly ``0.0``, so the comparison is deliberately exact — no epsilon. A
+    bucket with neither stamps nor tokens is ``0.0`` without a price lookup.
+    ``estimate_cost`` is called by its module-global name so the fallback can be
+    observed by patching ``akgentic.llm.pricing.estimate_cost``.
+    """
+    stamped = bucket["estimated_cost_usd"]
+    tokens = (
+        bucket["input_tokens"]
+        + bucket["output_tokens"]
+        + bucket["cache_read_tokens"]
+        + bucket["cache_write_tokens"]
     )
+    if stamped == 0.0 and tokens > 0:
+        cost = estimate_cost(
+            model_name,
+            bucket["provider_name"],
+            bucket["input_tokens"],
+            bucket["output_tokens"],
+            bucket["cache_read_tokens"],
+            bucket["cache_write_tokens"],
+        )
+    else:
+        cost = stamped
     return ModelUsage(
         model_name=model_name,
-        provider_name=provider_name,
-        input_tokens=input_tokens,
-        output_tokens=output_tokens,
-        cache_read_tokens=cache_read_tokens,
-        cache_write_tokens=cache_write_tokens,
-        requests=requests,
+        provider_name=bucket["provider_name"],
+        input_tokens=bucket["input_tokens"],
+        output_tokens=bucket["output_tokens"],
+        cache_read_tokens=bucket["cache_read_tokens"],
+        cache_write_tokens=bucket["cache_write_tokens"],
+        requests=bucket["requests"],
         estimated_cost_usd=cost,
     )
 
@@ -172,16 +207,18 @@ def _new_accum() -> _ModelAccum:
         cache_read_tokens=0,
         cache_write_tokens=0,
         requests=0,
+        estimated_cost_usd=0.0,
     )
 
 
 def _aggregate_events(
     events: list[LlmUsageEvent],
 ) -> dict[str, _ModelAccum]:
-    """Group events by model_name and accumulate token counts."""
+    """Group events by model_name and accumulate token counts and cost stamps."""
     accum: dict[str, _ModelAccum] = defaultdict(_new_accum)
     for ev in events:
         bucket = accum[ev.model_name]
+        # First provider wins: the fallback recompute still needs a provider.
         if not bucket["provider_name"]:
             bucket["provider_name"] = ev.provider_name
         bucket["input_tokens"] += ev.input_tokens
@@ -189,6 +226,7 @@ def _aggregate_events(
         bucket["cache_read_tokens"] += ev.cache_read_tokens
         bucket["cache_write_tokens"] += ev.cache_write_tokens
         bucket["requests"] += ev.requests
+        bucket["estimated_cost_usd"] += ev.estimated_cost_usd
     return accum
 
 
@@ -202,6 +240,11 @@ def aggregate_usage(
     Always aggregates totals and by-model breakdown.
     When by_run=True, also provides per-run detail.
 
+    Per-model cost is the sum of the events' ``estimated_cost_usd`` stamps. It is
+    recomputed from the bucket's aggregate tokens via ``estimate_cost`` only when
+    that sum is ``0.0`` and the bucket has tokens — the path pre-stamp (replayed)
+    events take. A bucket mixing stamped and unstamped events is not recomputed.
+
     Args:
         events: List of LlmUsageEvent (typically for one agent).
         by_run: Include per-run breakdown (default: False).
@@ -214,17 +257,10 @@ def aggregate_usage(
 
     model_accum = _aggregate_events(events)
 
-    by_model: dict[str, ModelUsage] = {}
-    for model_name, bucket in model_accum.items():
-        by_model[model_name] = _build_model_usage(
-            model_name=model_name,
-            provider_name=bucket["provider_name"],
-            input_tokens=bucket["input_tokens"],
-            output_tokens=bucket["output_tokens"],
-            cache_read_tokens=bucket["cache_read_tokens"],
-            cache_write_tokens=bucket["cache_write_tokens"],
-            requests=bucket["requests"],
-        )
+    by_model: dict[str, ModelUsage] = {
+        model_name: _build_model_usage(model_name, bucket)
+        for model_name, bucket in model_accum.items()
+    }
 
     runs: list[RunUsageSummary] = []
     if by_run:
@@ -234,16 +270,7 @@ def aggregate_usage(
         for run_id, run_events in run_groups.items():
             run_accum = _aggregate_events(run_events)
             run_models = [
-                _build_model_usage(
-                    model_name=mn,
-                    provider_name=b["provider_name"],
-                    input_tokens=b["input_tokens"],
-                    output_tokens=b["output_tokens"],
-                    cache_read_tokens=b["cache_read_tokens"],
-                    cache_write_tokens=b["cache_write_tokens"],
-                    requests=b["requests"],
-                )
-                for mn, b in run_accum.items()
+                _build_model_usage(model_name, bucket) for model_name, bucket in run_accum.items()
             ]
             runs.append(
                 RunUsageSummary(
