@@ -154,6 +154,11 @@ class LlmUsageEvent:
         cache_read_tokens: Tokens read from provider cache.
         cache_write_tokens: Tokens written to provider cache.
         requests: Number of HTTP requests for this response.
+        estimated_cost_usd: USD cost of this response, priced once at emission
+            from its own token counts and ``provider_name`` via
+            ``akgentic.llm.pricing.estimate_cost``. ``0.0`` means either an
+            unpriced model or an event persisted before this field existed;
+            the absence of a stamp is the only version marker.
     """
 
     run_id: str
@@ -164,6 +169,7 @@ class LlmUsageEvent:
     cache_read_tokens: int
     cache_write_tokens: int
     requests: int
+    estimated_cost_usd: float = 0.0
 
 
 @dataclass(frozen=True)

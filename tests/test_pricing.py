@@ -5,16 +5,18 @@ from __future__ import annotations
 import dataclasses
 
 import pytest
+from akgentic.core.utils.deserializer import deserialize_object
 from genai_prices import Usage, calc_price
 from pydantic import BaseModel
 
+import akgentic.llm.pricing
 from akgentic.llm.event import LlmUsageEvent
 from akgentic.llm.pricing import (
     AgentUsageSummary,
     ModelUsage,
     RunUsageSummary,
-    _compute_cost,
     aggregate_usage,
+    estimate_cost,
 )
 
 
@@ -27,7 +29,10 @@ def _make_event(
     cache_read_tokens: int = 0,
     cache_write_tokens: int = 0,
     requests: int = 1,
+    estimated_cost_usd: float = 0.0,
 ) -> LlmUsageEvent:
+    # Deliberately unstamped by default: every pre-existing caller exercises the
+    # fallback path, so only the explicitly stamped specs below prove the feature.
     return LlmUsageEvent(
         run_id=run_id,
         model_name=model_name,
@@ -37,6 +42,7 @@ def _make_event(
         cache_read_tokens=cache_read_tokens,
         cache_write_tokens=cache_write_tokens,
         requests=requests,
+        estimated_cost_usd=estimated_cost_usd,
     )
 
 
@@ -349,11 +355,11 @@ class TestUnknownModel:
         )
 
 
-class TestComputeCost:
-    """NFR5: _compute_cost maps genai-prices LookupError to 0.0 (unknown model)."""
+class TestEstimateCost:
+    """NFR5: estimate_cost maps genai-prices LookupError to 0.0 (unknown model)."""
 
     def test_unknown_model_returns_zero(self) -> None:
-        cost = _compute_cost(
+        cost = estimate_cost(
             model_name="definitely-not-a-real-model-xyz",
             provider_name="anthropic",
             input_tokens=1000,
@@ -364,7 +370,7 @@ class TestComputeCost:
         assert cost == 0.0
 
     def test_known_model_returns_positive(self) -> None:
-        cost = _compute_cost(
+        cost = estimate_cost(
             model_name="claude-sonnet-4-20250514",
             provider_name="anthropic",
             input_tokens=1000,
@@ -377,7 +383,7 @@ class TestComputeCost:
     def test_empty_provider_still_resolves(self) -> None:
         # provider_name="" must be passed as provider_id=None so genai-prices
         # matches by model_ref across providers instead of a non-existent one.
-        cost = _compute_cost(
+        cost = estimate_cost(
             model_name="claude-sonnet-4-20250514",
             provider_name="",
             input_tokens=1000,
@@ -388,7 +394,7 @@ class TestComputeCost:
         assert cost > 0.0
 
     def test_openrouter_route_resolves_under_openrouter_provider(self) -> None:
-        cost = _compute_cost(
+        cost = estimate_cost(
             model_name="deepseek/deepseek-chat",
             provider_name="openrouter",
             input_tokens=1000,
@@ -404,7 +410,7 @@ class TestComputeCost:
     def test_openrouter_route_without_provider_is_unknown(self) -> None:
         # Slash-prefixed route names only resolve under the openrouter provider id,
         # which is why the provider label stamped on the response matters.
-        cost = _compute_cost(
+        cost = estimate_cost(
             model_name="deepseek/deepseek-chat",
             provider_name="",
             input_tokens=1000,
@@ -415,7 +421,7 @@ class TestComputeCost:
         assert cost == 0.0
 
     def test_openrouter_unknown_route_returns_zero(self) -> None:
-        cost = _compute_cost(
+        cost = estimate_cost(
             model_name="acme/not-a-model",
             provider_name="openrouter",
             input_tokens=1000,
@@ -503,35 +509,222 @@ class TestTotalRequestsAccumulation:
 
 
 class TestTotalCostConsistency:
-    """AC-5: total_cost_usd equals sum of all model costs (unknown contributes 0.0)."""
+    """AC-7: total_cost_usd equals the sum of the events' stamps (unknown stamps 0.0)."""
 
     def test_total_equals_sum(self) -> None:
+        stamp_sonnet = _expected_cost("claude-sonnet-4-20250514", "anthropic", 1000, 500)
+        stamp_gpt = _expected_cost("gpt-4o", "openai", 2000, 1000)
+        stamp_unknown = estimate_cost("unknown-model", "anthropic", 500, 250, 0, 0)
+        assert stamp_unknown == 0.0
         events = [
             _make_event(
                 model_name="claude-sonnet-4-20250514",
                 input_tokens=1000,
                 output_tokens=500,
+                estimated_cost_usd=stamp_sonnet,
             ),
             _make_event(
                 model_name="gpt-4o",
                 provider_name="openai",
                 input_tokens=2000,
                 output_tokens=1000,
+                estimated_cost_usd=stamp_gpt,
             ),
             _make_event(
                 model_name="unknown-model",
                 input_tokens=500,
                 output_tokens=250,
+                estimated_cost_usd=stamp_unknown,
             ),
         ]
         result = aggregate_usage(events)
-        expected_total = sum(m.estimated_cost_usd for m in result.by_model.values())
-        assert result.total_cost_usd == expected_total
+        assert result.by_model["claude-sonnet-4-20250514"].estimated_cost_usd == pytest.approx(
+            stamp_sonnet
+        )
+        assert result.by_model["gpt-4o"].estimated_cost_usd == pytest.approx(stamp_gpt)
         assert result.by_model["unknown-model"].estimated_cost_usd == 0.0
+        assert result.total_cost_usd == pytest.approx(stamp_sonnet + stamp_gpt + stamp_unknown)
+
+
+class TestStampedAggregation:
+    """AC-4: a bucket's cost is the sum of its events' stamps; the pricer is not consulted."""
+
+    def test_synthetic_stamps_are_summed(self) -> None:
+        # Inputs, not price expectations: pure arithmetic over whatever is stamped.
+        events = [
+            _make_event(estimated_cost_usd=0.25),
+            _make_event(estimated_cost_usd=0.5),
+        ]
+        result = aggregate_usage(events)
+        bucket = result.by_model["claude-sonnet-4-20250514"]
+        assert bucket.estimated_cost_usd == pytest.approx(sum(e.estimated_cost_usd for e in events))
+        assert result.total_cost_usd == pytest.approx(bucket.estimated_cost_usd)
+
+    def test_single_provider_realistic_stamps(self) -> None:
+        stamp_a = _expected_cost("claude-sonnet-4-20250514", "anthropic", 100, 50)
+        stamp_b = _expected_cost("claude-sonnet-4-20250514", "anthropic", 200, 100)
+        events = [
+            _make_event(input_tokens=100, output_tokens=50, estimated_cost_usd=stamp_a),
+            _make_event(input_tokens=200, output_tokens=100, estimated_cost_usd=stamp_b),
+        ]
+        result = aggregate_usage(events)
+        bucket = result.by_model["claude-sonnet-4-20250514"]
+        assert bucket.estimated_cost_usd == pytest.approx(stamp_a + stamp_b)
+        assert bucket.input_tokens == 300
+        assert bucket.requests == 2
+
+    @pytest.mark.parametrize("openrouter_first", [True, False])
+    def test_mixed_providers_each_stamp_uses_its_own_provider(self, openrouter_first: bool) -> None:
+        # The same model_name under two providers: one resolves, the other does not.
+        # A forced recompute would price 2000/2000 tokens at the first-seen provider,
+        # which differs from the stamped sum in either order.
+        stamp_routed = _expected_cost("deepseek/deepseek-chat", "openrouter", 1000, 1000)
+        stamp_bare = estimate_cost("deepseek/deepseek-chat", "", 1000, 1000, 0, 0)
+        assert stamp_routed > 0.0
+        assert stamp_bare == 0.0
+        routed = _make_event(
+            model_name="deepseek/deepseek-chat",
+            provider_name="openrouter",
+            input_tokens=1000,
+            output_tokens=1000,
+            estimated_cost_usd=stamp_routed,
+        )
+        bare = _make_event(
+            model_name="deepseek/deepseek-chat",
+            provider_name="",
+            input_tokens=1000,
+            output_tokens=1000,
+            estimated_cost_usd=stamp_bare,
+        )
+        events = [routed, bare] if openrouter_first else [bare, routed]
+        result = aggregate_usage(events)
+        bucket = result.by_model["deepseek/deepseek-chat"]
+        assert bucket.estimated_cost_usd == pytest.approx(stamp_routed + stamp_bare)
+        assert bucket.input_tokens == 2000
+
+    def test_per_run_buckets_sum_their_own_stamps(self) -> None:
+        events = [
+            _make_event(run_id="run-1", estimated_cost_usd=0.1),
+            _make_event(run_id="run-1", estimated_cost_usd=0.2),
+            _make_event(
+                run_id="run-1",
+                model_name="gpt-4o",
+                provider_name="openai",
+                estimated_cost_usd=0.7,
+            ),
+            _make_event(run_id="run-2", estimated_cost_usd=0.4),
+        ]
+        result = aggregate_usage(events, by_run=True)
+        assert len(result.runs) == 2
+        for run in result.runs:
+            run_events = [e for e in events if e.run_id == run.run_id]
+            for model in run.models:
+                expected = sum(
+                    e.estimated_cost_usd for e in run_events if e.model_name == model.model_name
+                )
+                assert model.estimated_cost_usd == pytest.approx(expected)
+            assert run.total_cost_usd == pytest.approx(
+                sum(m.estimated_cost_usd for m in run.models)
+            )
+        run1 = next(r for r in result.runs if r.run_id == "run-1")
+        assert run1.total_cost_usd == pytest.approx(1.0)
+        run2 = next(r for r in result.runs if r.run_id == "run-2")
+        assert run2.total_cost_usd == pytest.approx(0.4)
+
+
+class TestFallbackRecompute:
+    """AC-5: a zero-stamp bucket with tokens is repriced from its aggregate; no tokens, no call."""
+
+    def test_all_unstamped_bucket_is_repriced_from_aggregate_tokens(self) -> None:
+        events = [
+            _make_event(input_tokens=100, output_tokens=50),
+            _make_event(input_tokens=200, output_tokens=100),
+        ]
+        result = aggregate_usage(events)
+        bucket = result.by_model["claude-sonnet-4-20250514"]
+        assert bucket.estimated_cost_usd == pytest.approx(
+            _expected_cost("claude-sonnet-4-20250514", "anthropic", 300, 150)
+        )
+        assert bucket.estimated_cost_usd > 0.0
+
+    def test_zero_token_zero_stamp_bucket_does_not_price(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls: list[tuple[object, ...]] = []
+
+        def spy(*args: object) -> float:
+            calls.append(args)
+            return 123.0
+
+        monkeypatch.setattr(akgentic.llm.pricing, "estimate_cost", spy)
+        result = aggregate_usage([_make_event(input_tokens=0, output_tokens=0)])
+        bucket = result.by_model["claude-sonnet-4-20250514"]
+        assert bucket.estimated_cost_usd == 0.0
+        assert calls == []
+        assert bucket.requests == 1
+        assert result.total_requests == 1
+        assert result.total_input_tokens == 0
+
+    def test_unknown_model_bucket_falls_back_to_zero(self) -> None:
+        result = aggregate_usage(
+            [_make_event(model_name="unknown-model-xyz", input_tokens=5000, output_tokens=2000)]
+        )
+        assert result.by_model["unknown-model-xyz"].estimated_cost_usd == 0.0
+        assert result.by_model["unknown-model-xyz"].input_tokens == 5000
+
+
+_STORED_PRE_STAMP_EVENT = {
+    "__model__": "akgentic.llm.event.LlmUsageEvent",
+    "run_id": "run-1",
+    "model_name": "claude-sonnet-4-20250514",
+    "provider_name": "anthropic",
+    "input_tokens": 1000,
+    "output_tokens": 500,
+    "cache_read_tokens": 0,
+    "cache_write_tokens": 0,
+    "requests": 1,
+}
+
+
+class TestReplayGuard:
+    """AC-6: a stored event without the stamp key replays at 0.0 and prices via the fallback."""
+
+    def test_stored_dict_without_stamp_key_replays_unstamped(self) -> None:
+        restored = deserialize_object(dict(_STORED_PRE_STAMP_EVENT))
+        assert isinstance(restored, LlmUsageEvent)
+        assert restored.estimated_cost_usd == 0.0
+        assert restored.input_tokens == 1000
+
+        result = aggregate_usage([restored])
+        assert result.total_input_tokens == 1000
+        assert result.by_model["claude-sonnet-4-20250514"].estimated_cost_usd == pytest.approx(
+            _expected_cost("claude-sonnet-4-20250514", "anthropic", 1000, 500)
+        )
+
+    def test_stored_dict_with_stamp_key_round_trips_the_stamp(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        stamp = 0.375
+        restored = deserialize_object({**_STORED_PRE_STAMP_EVENT, "estimated_cost_usd": stamp})
+        assert isinstance(restored, LlmUsageEvent)
+        assert restored.estimated_cost_usd == pytest.approx(stamp)
+
+        calls: list[tuple[object, ...]] = []
+
+        def spy(*args: object) -> float:
+            calls.append(args)
+            return 999.0
+
+        monkeypatch.setattr(akgentic.llm.pricing, "estimate_cost", spy)
+        result = aggregate_usage([restored])
+        assert result.by_model["claude-sonnet-4-20250514"].estimated_cost_usd == pytest.approx(
+            stamp
+        )
+        assert calls == []
 
 
 class TestPublicApiExport:
-    """AC-1: Aggregation exports importable from akgentic.llm and present in __all__."""
+    """AC-2: pricing exports importable from akgentic.llm and present in __all__."""
 
     def test_all_exports_importable(self) -> None:
         import akgentic.llm
@@ -540,6 +733,7 @@ class TestPublicApiExport:
         assert hasattr(akgentic.llm, "ModelUsage")
         assert hasattr(akgentic.llm, "RunUsageSummary")
         assert hasattr(akgentic.llm, "aggregate_usage")
+        assert hasattr(akgentic.llm, "estimate_cost")
 
     def test_pricing_removed(self) -> None:
         import akgentic.llm
@@ -547,9 +741,18 @@ class TestPublicApiExport:
         assert not hasattr(akgentic.llm, "PRICING")
         assert "PRICING" not in akgentic.llm.__all__
 
+    def test_private_pricer_has_no_alias(self) -> None:
+        assert not hasattr(akgentic.llm.pricing, "_compute_cost")
+
     def test_all_in_dunder_all(self) -> None:
         import akgentic.llm
 
-        names = ["AgentUsageSummary", "ModelUsage", "RunUsageSummary", "aggregate_usage"]
+        names = [
+            "AgentUsageSummary",
+            "ModelUsage",
+            "RunUsageSummary",
+            "aggregate_usage",
+            "estimate_cost",
+        ]
         for name in names:
             assert name in akgentic.llm.__all__, f"{name} missing from __all__"

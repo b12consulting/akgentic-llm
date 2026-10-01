@@ -22,6 +22,7 @@ from akgentic.llm.event import (
     ToolCallEvent,
     ToolReturnEvent,
 )
+from akgentic.llm.pricing import estimate_cost
 
 # Every `part.part_kind` value reachable via `message.parts` on pydantic-ai==1.107.0,
 # verified directly against `pydantic_ai/messages.py` (ADR-014 Phase 1, FR2). A rename
@@ -269,16 +270,28 @@ class ContextManager:
         # Last usage-bearing response wins; the final multi-step request already
         # reflects the whole history, so this is the size that re-enters next turn.
         self._last_input_tokens = usage.input_tokens
+        # Priced once, here, with this response's own provider and token counts:
+        # the stamp and the event fields must come from the same values.
+        model_name = getattr(message, "model_name", None) or ""
+        provider_name = getattr(message, "provider_name", None) or ""
         self._notify(
             LlmUsageEvent(
                 run_id=str(getattr(message, "run_id", None) or ""),
-                model_name=getattr(message, "model_name", None) or "",
-                provider_name=getattr(message, "provider_name", None) or "",
+                model_name=model_name,
+                provider_name=provider_name,
                 input_tokens=usage.input_tokens,
                 output_tokens=usage.output_tokens,
                 cache_read_tokens=usage.cache_read_tokens,
                 cache_write_tokens=usage.cache_write_tokens,
                 requests=usage.requests,
+                estimated_cost_usd=estimate_cost(
+                    model_name,
+                    provider_name,
+                    usage.input_tokens,
+                    usage.output_tokens,
+                    usage.cache_read_tokens,
+                    usage.cache_write_tokens,
+                ),
             )
         )
 
