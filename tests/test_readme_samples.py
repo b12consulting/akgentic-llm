@@ -28,6 +28,7 @@ Zero egress: no sample issues a model request. Provider credentials are faked in
 """
 
 import inspect
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -547,6 +548,32 @@ def test_openrouter_provider_samples() -> None:
     assert _supports_native_output(native) is True
 
 
+def test_claude_code_provider_samples(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """§Providers — a Claude Code model builds from an alias once the CLI is found."""
+    from pydantic_ai.exceptions import UserError
+
+    from akgentic.llm.claude_code import ClaudeCodeModel
+    from akgentic.llm.providers import create_model
+
+    cli = tmp_path / "claude"
+    cli.write_text("#!/bin/sh\n")
+    cli.chmod(0o755)
+    monkeypatch.setenv("CLAUDE_CODE_CLI", str(cli))
+
+    subscription = create_model(ModelConfig(provider="claude-code", model="sonnet"))
+    assert isinstance(subscription, ClaudeCodeModel)
+
+    reasoning = ModelConfig(provider="claude-code", model="opus", reasoning_effort="high")
+    assert isinstance(create_model(reasoning), ClaudeCodeModel)
+
+    # "fails at construction with pydantic-ai's UserError"
+    monkeypatch.setenv("CLAUDE_CODE_CLI", str(tmp_path / "missing"))
+    with pytest.raises(UserError):
+        create_model(ModelConfig(provider="claude-code", model="sonnet"))
+
+
 def test_provider_table_native_output_column() -> None:
     """§Providers — the ✅/❌ column, verified per row against the predicate."""
     from akgentic.llm.config import _supports_native_output
@@ -560,6 +587,7 @@ def test_provider_table_native_output_column() -> None:
     )
     assert not _supports_native_output(ModelConfig(provider="google-gla", model="gemini-2.0"))
     assert not _supports_native_output(ModelConfig(provider="mistral", model="mistral-large"))
+    assert not _supports_native_output(ModelConfig(provider="claude-code", model="sonnet"))
 
 
 async def test_google_provider_requires_an_api_key(monkeypatch: pytest.MonkeyPatch) -> None:

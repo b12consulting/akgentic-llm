@@ -66,6 +66,7 @@ class TestModelConfig:
         """Every provider named by the literal constructs; the list is derived, not copied."""
         providers = get_args(ModelConfig.model_fields["provider"].annotation)
         assert "openrouter" in providers
+        assert "claude-code" in providers
         for provider in providers:
             config = ModelConfig(provider=provider, model="test-model")  # type: ignore
             assert config.provider == provider

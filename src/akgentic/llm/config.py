@@ -56,6 +56,11 @@ class ModelConfig(BaseModel):
     - OpenRouter: OPENROUTER_API_KEY. ``model`` must be an OpenRouter ``vendor/model``
       id (e.g. ``deepseek/deepseek-chat``); the shared default ``gpt-5.2`` has no
       vendor prefix and is rejected at ``create_model()`` time, not at construction.
+    - Claude Code: none of its own. The Claude Code CLI authenticates itself, with a
+      Claude subscription (``claude login``, or CLAUDE_CODE_OAUTH_TOKEN from
+      ``claude setup-token``) or with ANTHROPIC_API_KEY. The executable is taken from
+      CLAUDE_CODE_CLI, which defaults to ``claude`` on the PATH. ``model`` is a CLI
+      alias (``sonnet``, ``opus``, ``haiku``) or a full model id.
 
     Attributes:
         provider: LLM provider name
@@ -125,6 +130,7 @@ class ModelConfig(BaseModel):
         "mistral",
         "anthropic",
         "openrouter",
+        "claude-code",
     ] = Field(default="openai", description="Model provider")
 
     model: str = Field(
@@ -230,6 +236,8 @@ def _supports_native_output(config: ModelConfig) -> bool:
     - nvidia: Non-OpenAI models (e.g., "meta/llama-3.1-70b-instruct")
     - openrouter: Every other route, including ``deepseek/``, ``anthropic/``, ``qwen/``,
       ``openrouter/*`` meta-routes and unknown vendors
+    - claude-code: The Claude Code CLI returns one answer per run, so function calls and
+      structured output both travel as emulated tool calls
 
     OpenRouter is a switchboard, so support is decided per route from the vendor
     prefix, not per provider. The prefix is read after stripping a leading ``~`` alias
