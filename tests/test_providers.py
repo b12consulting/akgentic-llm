@@ -111,8 +111,24 @@ class TestSupportsNativeOutput:
 
     def test_openrouter_tag_suffix_is_ignored(self) -> None:
         """A :tag suffix never affects the decision."""
-        config = ModelConfig(provider="openrouter", model="openai/gpt-oss-120b:free")
+        config = ModelConfig(provider="openrouter", model="openai/gpt-4o:nitro")
         assert _supports_native_output(config) is True
+
+    @pytest.mark.parametrize(
+        "model", ["openai/gpt-3.5-turbo", "openai/gpt-5.6-luna", "openai/gpt-oss-120b:free"]
+    )
+    def test_openrouter_gpt_route_supports_native_output(self, model: str) -> None:
+        """Every GPT route is native, including future generations."""
+        config = ModelConfig(provider="openrouter", model=model)
+        assert _supports_native_output(config) is True
+
+    @pytest.mark.parametrize(
+        "model", ["google/gemma-4-31b-it", "~google/gemma-4-latest"]
+    )
+    def test_openrouter_open_weights_family_no_native_output(self, model: str) -> None:
+        """An open-weights family under a native vendor stays prompt-based."""
+        config = ModelConfig(provider="openrouter", model=model)
+        assert _supports_native_output(config) is False
 
     def test_openrouter_aliased_deepseek_route_no_native_output(self) -> None:
         """An aliased non-listed vendor classifies like its vendor."""
@@ -812,6 +828,20 @@ class TestCreateModel:
 
         mock_provider_cls.assert_called_once_with(http_client=mock_client)
 
+    @patch("pydantic_ai.providers.anthropic.AnthropicProvider")
+    @patch("pydantic_ai.models.anthropic.AnthropicModel")
+    def test_anthropic_reasoning_effort(self, mock_model_cls, mock_provider_cls) -> None:
+        """reasoning_effort maps to anthropic_effort alongside the core settings."""
+        mock_client = MagicMock(spec=httpx2.AsyncClient)
+        config = ModelConfig(
+            provider="anthropic", model="claude-opus-5-5", max_tokens=1000, reasoning_effort="max"
+        )
+
+        create_model(config, http_client=mock_client)
+
+        settings = mock_model_cls.call_args.kwargs["settings"]
+        assert settings == {"max_tokens": 1000, "anthropic_effort": "max"}
+
     # ------------------------------------------------------------------
     # Google
     # ------------------------------------------------------------------
@@ -1007,16 +1037,41 @@ class TestCreateModel:
 
     @patch("pydantic_ai.providers.openrouter.OpenRouterProvider")
     @patch("pydantic_ai.models.openrouter.OpenRouterModel")
-    def test_openrouter_reasoning_effort_ignored(self, mock_model_cls, mock_provider_cls) -> None:
-        """reasoning_effort is not mapped for OpenRouter, so settings stay None."""
+    def test_openrouter_reasoning_effort_mapped(self, mock_model_cls, mock_provider_cls) -> None:
+        """reasoning_effort maps to openrouter_reasoning, max included."""
         mock_client = MagicMock(spec=httpx2.AsyncClient)
         config = ModelConfig(
-            provider="openrouter", model="deepseek/deepseek-chat", reasoning_effort="high"
+            provider="openrouter", model="openai/gpt-6-luna", reasoning_effort="max"
         )
 
         create_model(config, http_client=mock_client)
 
-        assert mock_model_cls.call_args.kwargs["settings"] is None
+        settings = mock_model_cls.call_args.kwargs["settings"]
+        assert settings == {"openrouter_reasoning": {"effort": "max"}}
+
+    async def test_openrouter_reasoning_effort_reaches_request_body(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The effort is sent as the request's reasoning object, alongside routing."""
+        monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+        bodies: list[dict[str, object]] = []
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            bodies.append(json.loads(request.content))
+            return httpx2.Response(200, json=_chat_completion_body())
+
+        config = ModelConfig(
+            provider="openrouter",
+            model="openai/gpt-6-luna",
+            reasoning_effort="xhigh",
+            openrouter_provider=OpenRouterRouting(only=["openai"]),
+        )
+        http_client = httpx2.AsyncClient(transport=httpx2.MockTransport(handler))
+
+        await Agent(create_model(config, http_client=http_client)).run("hi")
+
+        assert bodies[0]["reasoning"] == {"effort": "xhigh"}
+        assert bodies[0]["provider"] == {"only": ["openai"]}
 
     @patch.dict("os.environ", {}, clear=False)
     def test_openrouter_missing_api_key_raises(self) -> None:

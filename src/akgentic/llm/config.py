@@ -204,8 +204,8 @@ class ModelConfig(BaseModel):
         description="Model context window in tokens; the budget that auto-triggers compaction. None = off.",  # noqa: E501
     )
 
-    reasoning_effort: Literal["low", "medium", "high"] | None = Field(
-        default=None, description="Reasoning effort for o1/o3 models"
+    reasoning_effort: Literal["low", "medium", "high", "xhigh", "max"] | None = Field(
+        default=None, description="Reasoning effort for OpenAI reasoning models"
     )
 
     fallback_models: list["ModelConfig"] = Field(
@@ -280,13 +280,15 @@ class ModelConfig(BaseModel):
         return self
 
 
-# OpenRouter vendor prefixes whose pydantic-ai route profile has
-# supports_json_schema_output=True. This set MUST stay a subset of that profile table:
-# pydantic-ai raises UserError at request time when native output is requested on a
-# route it does not support, whereas a vendor missing here only falls back to
-# prompt-based extraction. Re-verify against OpenRouterModel(name).profile whenever
-# pydantic-ai is bumped.
-_OPENROUTER_NATIVE_VENDORS: frozenset[str] = frozenset({"openai", "google", "x-ai"})
+# OpenRouter model-family prefixes known to support native structured output. An
+# allowlist of first-party families, not of vendors: a vendor prefix names the model's
+# author, not its host, so an open-weights family (``google/gemma``) is
+# served by third-party hosts whose JSON-schema constraint suppresses tool calls.
+# Every entry MUST also be supported by pydantic-ai's route profile
+# (supports_json_schema_output=True): a family listed here that pydantic-ai marks
+# unsupported raises UserError at request time, whereas a family missing here only
+# falls back to prompt-based extraction. Re-verify whenever pydantic-ai is bumped.
+_OPENROUTER_NATIVE_FAMILIES: tuple[str, ...] = ("openai/gpt-", "google/gemini", "x-ai/grok")
 
 
 def _supports_native_output(config: ModelConfig) -> bool:
@@ -299,25 +301,22 @@ def _supports_native_output(config: ModelConfig) -> bool:
     - azure-chat: Azure OpenAI Service via the legacy Chat Completions API
     - anthropic: Claude 3.5 Sonnet, etc.
     - nvidia: Only for models with "openai" prefix (e.g., "openai/gpt-oss-120b")
-    - openrouter: Only for routes whose vendor prefix is ``openai/``, ``google/`` or
-      ``x-ai/`` (e.g., "openai/gpt-4o")
+    - openrouter: Only for allowlisted first-party families: every numbered
+      ``openai/gpt-*``, ``google/gemini*`` and ``x-ai/grok*``
 
     Providers without native support (use prompt-based extraction):
     - google-gla: Google Gemini models
     - mistral: Mistral AI models
     - nvidia: Non-OpenAI models (e.g., "meta/llama-3.1-70b-instruct")
-    - openrouter: Every other route, including ``deepseek/``, ``anthropic/``, ``qwen/``,
-      ``openrouter/*`` meta-routes and unknown vendors
+    - openrouter: Every other route, including ``google/gemma*``, ``openai/o*``,
+      ``deepseek/``, ``anthropic/``, ``qwen/``, ``openrouter/*`` meta-routes and unknown
+      vendors
 
-    OpenRouter is a switchboard, so support is decided per route from the vendor
-    prefix, not per provider. The prefix is read after stripping a leading ``~`` alias
-    marker (``~openai/gpt-4o-latest``) and before any ``:tag`` suffix (``:free``,
-    ``:nitro``), so aliases and tags classify like their vendor. The allowlist is
-    deliberately a subset of pydantic-ai's own route profiles: a vendor listed here that
-    pydantic-ai marks unsupported fails every structured request at run time, while a
-    vendor omitted here only degrades to prompt-based extraction. A model with no ``/``
-    yields no known vendor and returns False; pydantic-ai rejects such a name when the
-    model is constructed.
+    OpenRouter is a switchboard, so support is decided per route from the model family,
+    not per provider or vendor. The family prefix is matched after stripping a leading
+    ``~`` alias marker (``~openai/gpt-4o-latest``); a ``:tag`` suffix (``:free``,
+    ``:nitro``) never affects a prefix match. Anything not allowlisted degrades to
+    prompt-based extraction, which is always safe.
 
     Defined here rather than in providers.py so ModelConfig's fallback-chain validator can
     call it: providers.py already imports ModelConfig from this module, so importing the
@@ -351,8 +350,8 @@ def _supports_native_output(config: ModelConfig) -> bool:
     if config.provider == "nvidia":
         return config.model.startswith("openai")
     if config.provider == "openrouter":
-        vendor = config.model.removeprefix("~").split("/", 1)[0]
-        return vendor in _OPENROUTER_NATIVE_VENDORS
+        route = config.model.removeprefix("~")
+        return route.startswith(_OPENROUTER_NATIVE_FAMILIES)
     return False
 
 

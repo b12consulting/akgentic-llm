@@ -78,7 +78,7 @@ class TestModelConfig:
 
     def test_reasoning_effort_values(self):
         """Test reasoning effort valid values."""
-        for effort in ["low", "medium", "high"]:
+        for effort in ["low", "medium", "high", "xhigh", "max"]:
             config = ModelConfig(provider="openai", model="gpt-4o", reasoning_effort=effort)  # type: ignore
             assert config.reasoning_effort == effort
 

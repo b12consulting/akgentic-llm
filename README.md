@@ -212,7 +212,7 @@ print(result.title, result.points)
 | `seed` | `int \| None` | `None` | Reproducible outputs (not all providers) |
 | `max_tokens` | `int \| None` | `None` | Max response tokens; `None` = provider max |
 | `context_length` | `int \| None` | `None` | Model context window; the budget that auto-triggers compaction. `None` = compaction off. Distinct from `max_tokens`, which caps output |
-| `reasoning_effort` | `Literal["low","medium","high"] \| None` | `None` | For o1/o3-style models only |
+| `reasoning_effort` | `Literal["low","medium","high","xhigh","max"] \| None` | `None` | Reasoning models on `openai`, `openai-chat`, `azure`, `azure-chat`, `nvidia`, `openrouter` and `anthropic`; ignored by `google-gla` and `mistral` |
 | `fallback_models` | `list[ModelConfig]` | `[]` | Models tried in declaration order after this one on API failure — see [Fallback chain](#fallback-chain) |
 | `openrouter_provider` | `OpenRouterRouting \| None` | `None` | OpenRouter host routing (only/order/ignore, allow_fallbacks, require_parameters, …); `provider="openrouter"` only — see [Providers](#providers) |
 
@@ -746,8 +746,8 @@ a scenario bound to `model_cfg.model` at construction and builds no model at all
 | Anthropic | `"anthropic"` | `ANTHROPIC_API_KEY` | ✅ |
 | NVIDIA NIM (openai/* models) | `"nvidia"` | `OPENAI_API_KEY` | ✅ |
 | NVIDIA NIM (other models) | `"nvidia"` | `OPENAI_API_KEY` | ❌ |
-| OpenRouter (openai/*, google/*, x-ai/* routes) | `"openrouter"` | `OPENROUTER_API_KEY` | ✅ |
-| OpenRouter (other routes) | `"openrouter"` | `OPENROUTER_API_KEY` | ❌ |
+| OpenRouter (`openai/gpt-*`, `google/gemini*`, `x-ai/grok*`) | `"openrouter"` | `OPENROUTER_API_KEY` | ✅ |
+| OpenRouter (other routes, incl. `google/gemma*`) | `"openrouter"` | `OPENROUTER_API_KEY` | ❌ |
 | Google Gemini | `"google-gla"` | `GOOGLE_API_KEY` **or** `GEMINI_API_KEY` (one is mandatory) | ❌ |
 | Mistral AI | `"mistral"` | `MISTRAL_API_KEY` | ❌ |
 
@@ -764,10 +764,13 @@ Providers without native structured output use pydantic-ai's prompt-based extrac
 > **OpenRouter is a switchboard, so native output follows the route, not the provider.** Model ids
 > are OpenRouter `vendor/model` routes (`deepseek/deepseek-chat`), optionally an alias
 > (`~vendor/model-latest`) or tagged (`vendor/model:free`); the alias marker is stripped and the tag
-> ignored, so both classify like their vendor. Only `openai/`, `google/` and `x-ai/` routes get
-> native structured output. That allowlist is deliberately a subset of pydantic-ai's own route
-> profiles: a vendor listed here that pydantic-ai marks unsupported would fail every structured
-> request at request time, while a vendor omitted only degrades to prompt-based extraction. The
+> ignored. Only allowlisted first-party families get native structured output:
+> `openai/gpt-*`, `google/gemini*` and `x-ai/grok*`. The allowlist is by family,
+> not vendor, because a vendor prefix names the author, not the host: an open-weights family such as
+> `google/gemma*` runs on third-party hosts whose JSON-schema constraint
+> suppresses tool calls, so they stay prompt-based. Every family listed must also be supported by
+> pydantic-ai's route profile, or every structured request fails at request time; a family omitted
+> only degrades to prompt-based extraction. The
 > shared default model `gpt-5.2` has no vendor prefix and is rejected by pydantic-ai when the
 > model is built. A missing `OPENROUTER_API_KEY` fails at construction with pydantic-ai's
 > `UserError`, not at request time. genai-prices prices routes under the `openrouter` provider,
