@@ -25,7 +25,7 @@ Examples:
 import warnings
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 # Removal schedule for the pre-split usage-limits shim, interpolated into every
 # deprecation warning below so the schedule is stated in exactly one place.
@@ -37,6 +37,56 @@ from pydantic import BaseModel, Field, model_validator
 # any future release here would recreate that same defect at the next forced major,
 # so the schedule stays open until someone actually schedules it.
 _SHIM_REMOVAL_NOTICE = "no removal release is scheduled"
+
+
+class OpenRouterRouting(BaseModel):
+    """OpenRouter host routing: which hosts may serve an OpenRouter route.
+
+    An OpenRouter model id names the model's author (``google/gemma-4-31b-it``), not the
+    company that runs it; OpenRouter load-balances across every host serving the route
+    unless told otherwise. This block mirrors pydantic-ai's ``OpenRouterProviderConfig``
+    and is sent as the request body's ``provider`` object.
+
+    Host slugs (``order``, ``only``, ``ignore``) are free strings such as
+    ``deepinfra/turbo`` — the set is open-ended, so they are not a ``Literal``.
+    ``max_price`` is intentionally omitted (add it when a user asks); like any unknown
+    key it is rejected. Conflicts between ``only``/``order``/``ignore`` are not validated
+    here — the OpenRouter API is the authority.
+
+    Attributes:
+        order: Host slugs to try, in order.
+        only: Host slugs allowed to serve the request; every other host is refused.
+        ignore: Host slugs never to use.
+        allow_fallbacks: Whether OpenRouter may use hosts outside ``order``/``only``.
+        require_parameters: Only use hosts that support every request parameter
+            (e.g. ``response_format``).
+        zdr: Restrict to zero-data-retention endpoints.
+        data_collection: ``"deny"`` refuses hosts that store or train on data.
+        quantizations: Allowed quantization levels.
+        sort: Sort hosts by price, throughput or latency.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    order: list[str] | None = Field(default=None, description="Host slugs to try, in order")
+    only: list[str] | None = Field(default=None, description="Only these host slugs may serve")
+    ignore: list[str] | None = Field(default=None, description="Host slugs never to use")
+    allow_fallbacks: bool | None = Field(
+        default=None, description="Allow hosts outside order/only when they fail"
+    )
+    require_parameters: bool | None = Field(
+        default=None, description="Only hosts that support every request parameter"
+    )
+    zdr: bool | None = Field(default=None, description="Zero-data-retention endpoints only")
+    data_collection: Literal["allow", "deny"] | None = Field(
+        default=None, description="'deny' refuses hosts that store or train on data"
+    )
+    quantizations: (
+        list[Literal["int4", "int8", "fp4", "fp6", "fp8", "fp16", "bf16", "fp32", "unknown"]] | None
+    ) = Field(default=None, description="Allowed quantization levels")
+    sort: Literal["price", "throughput", "latency"] | None = Field(
+        default=None, description="Sort hosts by price, throughput or latency"
+    )
 
 
 class ModelConfig(BaseModel):
@@ -56,6 +106,8 @@ class ModelConfig(BaseModel):
     - OpenRouter: OPENROUTER_API_KEY. ``model`` must be an OpenRouter ``vendor/model``
       id (e.g. ``deepseek/deepseek-chat``); the shared default ``gpt-5.2`` has no
       vendor prefix and is rejected at ``create_model()`` time, not at construction.
+      The id names the model's author, not its host; ``openrouter_provider`` chooses
+      which hosts may serve it.
 
     Attributes:
         provider: LLM provider name
@@ -70,6 +122,10 @@ class ModelConfig(BaseModel):
             flat (an entry may not declare its own fallbacks) and homogeneous (every entry
             must agree with this config on native structured-output support), both enforced
             at construction. Only this config's context_length governs the compaction budget.
+        openrouter_provider: OpenRouter host routing (``provider="openrouter"`` only). A
+            model id names the author, not the host; this block pins, orders, excludes or
+            filters the hosts that serve the route. It applies to this entry only — a
+            fallback entry carries its own and never inherits the primary's.
 
     Example:
         >>> # OpenAI GPT-4o with moderate creativity
@@ -159,6 +215,28 @@ class ModelConfig(BaseModel):
             "auth errors, timeouts). Empty = no fallback (default)."
         ),
     )
+
+    openrouter_provider: OpenRouterRouting | None = Field(
+        default=None,
+        description=(
+            "OpenRouter host routing (only/order/ignore, allow_fallbacks, "
+            "require_parameters, ...). Valid only with provider='openrouter'; "
+            "per-entry, never inherited by fallbacks."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _reject_openrouter_provider_off_openrouter(self) -> "ModelConfig":
+        """Routing is OpenRouter-only: reject it on any other provider.
+
+        Every fallback entry is itself a ModelConfig, so this applies per entry.
+        """
+        if self.openrouter_provider is not None and self.provider != "openrouter":
+            raise ValueError(
+                "openrouter_provider is only valid with provider='openrouter'; "
+                f"got provider='{self.provider}'"
+            )
+        return self
 
     @model_validator(mode="after")
     def _reject_nested_fallback_models(self) -> "ModelConfig":

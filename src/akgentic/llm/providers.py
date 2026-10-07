@@ -54,7 +54,7 @@ if TYPE_CHECKING:
         OpenAIResponsesModel,
         OpenAIResponsesModelSettings,
     )
-    from pydantic_ai.models.openrouter import OpenRouterModel
+    from pydantic_ai.models.openrouter import OpenRouterModel, OpenRouterModelSettings
 
 logger = logging.getLogger(__name__)
 
@@ -329,6 +329,37 @@ def _build_openai_chat_settings(config: ModelConfig) -> "OpenAIChatModelSettings
     return cast(OpenAIChatModelSettings, kwargs) if kwargs else None
 
 
+def _build_openrouter_settings(config: ModelConfig) -> "OpenRouterModelSettings | None":
+    """Build OpenRouterModelSettings from ModelConfig, including host routing.
+
+    Delegates shared parameters (temperature, max_tokens, seed) to
+    ``_build_core_settings`` and adds ``openrouter_provider`` from
+    ``config.openrouter_provider``. With no routing — or an empty routing block, which
+    pydantic-ai would drop anyway — the result is exactly ``_build_core_settings(config)``.
+
+    Routing lives here, in the per-model factory, and never in ``create_model_settings``:
+    run-level settings apply to every model of a fallback chain, which would pin every
+    fallback to the primary's host.
+
+    Args:
+        config: LLM model configuration.
+
+    Returns:
+        OpenRouterModelSettings instance if any parameters are set, else None.
+    """
+    core = _build_core_settings(config)
+    routing = (
+        config.openrouter_provider.model_dump(exclude_none=True)
+        if config.openrouter_provider is not None
+        else {}
+    )
+    if not routing:
+        return cast("OpenRouterModelSettings | None", core)
+    kwargs: dict[str, Any] = dict(cast(dict[str, Any], core or {}))
+    kwargs["openrouter_provider"] = routing
+    return cast("OpenRouterModelSettings", kwargs)
+
+
 def _create_openai_model(
     config: ModelConfig,
     http_client: httpx2.AsyncClient,
@@ -568,7 +599,9 @@ def _create_openrouter_model(
     """Create OpenRouter model.
 
     Routes ``config.model`` (an OpenRouter ``vendor/model`` id) through the
-    OpenRouter gateway. The API key comes from ``OPENROUTER_API_KEY``.
+    OpenRouter gateway. The API key comes from ``OPENROUTER_API_KEY``. Host routing
+    comes from ``config.openrouter_provider`` and is per-model: each fallback entry is
+    built here from its own config, so it routes independently of the primary.
 
     Args:
         config: LLM model configuration.
@@ -584,7 +617,7 @@ def _create_openrouter_model(
     from pydantic_ai.models.openrouter import OpenRouterModel  # noqa: PLC0415
     from pydantic_ai.providers.openrouter import OpenRouterProvider  # noqa: PLC0415
 
-    settings = _build_core_settings(config)
+    settings = _build_openrouter_settings(config)
     return OpenRouterModel(
         model_name=config.model,
         provider=OpenRouterProvider(http_client=http_client),

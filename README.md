@@ -214,6 +214,7 @@ print(result.title, result.points)
 | `context_length` | `int \| None` | `None` | Model context window; the budget that auto-triggers compaction. `None` = compaction off. Distinct from `max_tokens`, which caps output |
 | `reasoning_effort` | `Literal["low","medium","high"] \| None` | `None` | For o1/o3-style models only |
 | `fallback_models` | `list[ModelConfig]` | `[]` | Models tried in declaration order after this one on API failure — see [Fallback chain](#fallback-chain) |
+| `openrouter_provider` | `OpenRouterRouting \| None` | `None` | OpenRouter host routing (only/order/ignore, allow_fallbacks, require_parameters, …); `provider="openrouter"` only — see [Providers](#providers) |
 
 ```python
 from akgentic.llm import ModelConfig
@@ -774,6 +775,18 @@ Providers without native structured output use pydantic-ai's prompt-based extrac
 > snapshot is **stamped** `0.0`, and an all-zero bucket is recomputed at aggregation from the
 > installed snapshot, so totals self-heal once the library ships the route (the dependency is
 > uncapped) while the events themselves keep their `0.0`.
+>
+> **A model id names the author, not the host.** `google/gemma-4-31b-it` says who made the model;
+> OpenRouter load-balances each request across every host serving that route, which can differ in
+> price, quantization and uptime. `openrouter_provider` (an `OpenRouterRouting`) constrains that
+> choice — pin hosts with `only`, rank them with `order`, exclude them with `ignore`, and filter on
+> `allow_fallbacks`, `require_parameters`, `data_collection`, `zdr`, `quantizations` or `sort`.
+> It is sent as the request's `provider` object, is valid only with `provider="openrouter"`, and is
+> per entry: each `fallback_models` entry carries its own routing and never inherits the
+> primary's. `require_parameters: true` makes OpenRouter refuse hosts that ignore a request
+> parameter (e.g. `response_format`), but it does **not** change native-output classification —
+> the vendor-prefix allowlist above stays the sole classifier. Cost is still priced at
+> genai-prices' `openrouter` rate, not the pinned host's.
 
 > **Google is API-key only.** The provider factory reads `GOOGLE_API_KEY`, falling back to
 > `GEMINI_API_KEY`, and raises `ValueError` when neither is set. Application Default
@@ -791,6 +804,18 @@ ModelConfig(provider="openrouter", model="deepseek/deepseek-v4-flash-0731")
 
 # OpenRouter — Google route (native output)
 ModelConfig(provider="openrouter", model="google/gemini-2.5-flash")
+
+# OpenRouter — pin the host that serves the route, and refuse hosts that
+# would ignore a request parameter such as response_format
+from akgentic.llm import OpenRouterRouting
+
+ModelConfig(
+    provider="openrouter",
+    model="google/gemma-4-31b-it",
+    openrouter_provider=OpenRouterRouting(
+        only=["deepinfra/turbo"], allow_fallbacks=False, require_parameters=True
+    ),
+)
 ```
 
 ### Fallback chain
