@@ -1,11 +1,12 @@
 """Tests for HTTP client with retry logic and LLM provider factory (providers.py)."""
 
+import json
 from unittest.mock import MagicMock, patch
 
 import httpx2
 import pytest
 from pydantic import BaseModel
-from pydantic_ai import NativeOutput
+from pydantic_ai import Agent, NativeOutput
 from pydantic_ai.exceptions import UserError
 from pydantic_ai.models import Model
 from pydantic_ai.models.fallback import FallbackModel
@@ -13,7 +14,7 @@ from pydantic_ai.retries import AsyncHTTPX2TenacityTransport
 
 from akgentic.llm import config as config_module
 from akgentic.llm import providers
-from akgentic.llm.config import ModelConfig
+from akgentic.llm.config import ModelConfig, OpenRouterRouting
 from akgentic.llm.providers import (
     _is_retryable_http_error,
     _supports_native_output,
@@ -110,8 +111,24 @@ class TestSupportsNativeOutput:
 
     def test_openrouter_tag_suffix_is_ignored(self) -> None:
         """A :tag suffix never affects the decision."""
-        config = ModelConfig(provider="openrouter", model="openai/gpt-oss-120b:free")
+        config = ModelConfig(provider="openrouter", model="openai/gpt-4o:nitro")
         assert _supports_native_output(config) is True
+
+    @pytest.mark.parametrize(
+        "model", ["openai/gpt-3.5-turbo", "openai/gpt-5.6-luna", "openai/gpt-oss-120b:free"]
+    )
+    def test_openrouter_gpt_route_supports_native_output(self, model: str) -> None:
+        """Every GPT route is native, including future generations."""
+        config = ModelConfig(provider="openrouter", model=model)
+        assert _supports_native_output(config) is True
+
+    @pytest.mark.parametrize(
+        "model", ["google/gemma-4-31b-it", "~google/gemma-4-latest"]
+    )
+    def test_openrouter_open_weights_family_no_native_output(self, model: str) -> None:
+        """An open-weights family under a native vendor stays prompt-based."""
+        config = ModelConfig(provider="openrouter", model=model)
+        assert _supports_native_output(config) is False
 
     def test_openrouter_aliased_deepseek_route_no_native_output(self) -> None:
         """An aliased non-listed vendor classifies like its vendor."""
@@ -811,6 +828,53 @@ class TestCreateModel:
 
         mock_provider_cls.assert_called_once_with(http_client=mock_client)
 
+    @patch("pydantic_ai.providers.anthropic.AnthropicProvider")
+    @patch("pydantic_ai.models.anthropic.AnthropicModel")
+    def test_anthropic_reasoning_effort(self, mock_model_cls, mock_provider_cls) -> None:
+        """reasoning_effort maps to anthropic_effort alongside the core settings."""
+        mock_client = MagicMock(spec=httpx2.AsyncClient)
+        config = ModelConfig(
+            provider="anthropic", model="claude-opus-5-5", max_tokens=1000, reasoning_effort="max"
+        )
+
+        create_model(config, http_client=mock_client)
+
+        settings = mock_model_cls.call_args.kwargs["settings"]
+        assert settings == {"max_tokens": 1000, "anthropic_effort": "max"}
+
+    @patch("pydantic_ai.providers.anthropic.AnthropicProvider")
+    @patch("pydantic_ai.models.anthropic.AnthropicModel")
+    def test_anthropic_no_params_produce_no_settings(
+        self, mock_model_cls, mock_provider_cls
+    ) -> None:
+        """With no core setting and no effort, settings=None is passed, not an empty dict."""
+        mock_client = MagicMock(spec=httpx2.AsyncClient)
+        config = ModelConfig(provider="anthropic", model="claude-opus-5-5")
+
+        create_model(config, http_client=mock_client)
+
+        assert mock_model_cls.call_args.kwargs["settings"] is None
+
+    async def test_anthropic_reasoning_effort_reaches_request_body(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The effort is sent as the request's output_config.effort."""
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+        bodies: list[dict[str, object]] = []
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            bodies.append(json.loads(request.content))
+            return httpx2.Response(200, json=_anthropic_message_body())
+
+        config = ModelConfig(
+            provider="anthropic", model="claude-opus-5-5", max_tokens=64, reasoning_effort="xhigh"
+        )
+        http_client = httpx2.AsyncClient(transport=httpx2.MockTransport(handler))
+
+        await Agent(create_model(config, http_client=http_client)).run("hi")
+
+        assert bodies[0]["output_config"] == {"effort": "xhigh"}
+
     # ------------------------------------------------------------------
     # Google
     # ------------------------------------------------------------------
@@ -1006,16 +1070,41 @@ class TestCreateModel:
 
     @patch("pydantic_ai.providers.openrouter.OpenRouterProvider")
     @patch("pydantic_ai.models.openrouter.OpenRouterModel")
-    def test_openrouter_reasoning_effort_ignored(self, mock_model_cls, mock_provider_cls) -> None:
-        """reasoning_effort is not mapped for OpenRouter, so settings stay None."""
+    def test_openrouter_reasoning_effort_mapped(self, mock_model_cls, mock_provider_cls) -> None:
+        """reasoning_effort maps to openrouter_reasoning, max included."""
         mock_client = MagicMock(spec=httpx2.AsyncClient)
         config = ModelConfig(
-            provider="openrouter", model="deepseek/deepseek-chat", reasoning_effort="high"
+            provider="openrouter", model="openai/gpt-6-luna", reasoning_effort="max"
         )
 
         create_model(config, http_client=mock_client)
 
-        assert mock_model_cls.call_args.kwargs["settings"] is None
+        settings = mock_model_cls.call_args.kwargs["settings"]
+        assert settings == {"openrouter_reasoning": {"effort": "max"}}
+
+    async def test_openrouter_reasoning_effort_reaches_request_body(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The effort is sent as the request's reasoning object, alongside routing."""
+        monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+        bodies: list[dict[str, object]] = []
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            bodies.append(json.loads(request.content))
+            return httpx2.Response(200, json=_chat_completion_body())
+
+        config = ModelConfig(
+            provider="openrouter",
+            model="openai/gpt-6-luna",
+            reasoning_effort="xhigh",
+            openrouter_provider=OpenRouterRouting(only=["openai"]),
+        )
+        http_client = httpx2.AsyncClient(transport=httpx2.MockTransport(handler))
+
+        await Agent(create_model(config, http_client=http_client)).run("hi")
+
+        assert bodies[0]["reasoning"] == {"effort": "xhigh"}
+        assert bodies[0]["provider"] == {"only": ["openai"]}
 
     @patch.dict("os.environ", {}, clear=False)
     def test_openrouter_missing_api_key_raises(self) -> None:
@@ -1408,3 +1497,223 @@ class TestCreateModelFallbackChain:
                 create_model(with_fallback, http_client=mock_client)
 
         assert str(fallback_exc.value) == str(primary_exc.value)
+
+
+# ---------------------------------------------------------------------------
+# OpenRouter host routing (openrouter_provider)
+# ---------------------------------------------------------------------------
+
+
+def _chat_completion_body() -> dict[str, object]:
+    """A minimal valid OpenAI chat-completion response."""
+    return {
+        "id": "gen-1",
+        "object": "chat.completion",
+        "created": 1700000000,
+        "model": "google/gemma-4-31b-it",
+        "provider": "DeepInfra",
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4},
+    }
+
+
+def _anthropic_message_body() -> dict[str, object]:
+    """A minimal valid Anthropic messages response."""
+    return {
+        "id": "msg-1",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-opus-5-5",
+        "content": [{"type": "text", "text": "ok"}],
+        "stop_reason": "end_turn",
+        "stop_sequence": None,
+        "usage": {"input_tokens": 3, "output_tokens": 1},
+    }
+
+
+class TestOpenRouterRouting:
+    """openrouter_provider reaches each OpenRouterModel, and only there."""
+
+    @patch("pydantic_ai.providers.openrouter.OpenRouterProvider")
+    @patch("pydantic_ai.models.openrouter.OpenRouterModel")
+    def test_routing_merged_with_core_settings(
+        self, mock_model_cls: MagicMock, mock_provider_cls: MagicMock
+    ) -> None:
+        """Settings carry every core setting plus the exclude_none routing dump."""
+        config = ModelConfig(
+            provider="openrouter",
+            model="google/gemma-4-31b-it",
+            temperature=0.2,
+            max_tokens=500,
+            openrouter_provider=OpenRouterRouting(
+                only=["deepinfra/turbo"], allow_fallbacks=False, require_parameters=True
+            ),
+        )
+
+        create_model(config, http_client=MagicMock(spec=httpx2.AsyncClient))
+
+        assert mock_model_cls.call_args.kwargs["settings"] == {
+            "temperature": 0.2,
+            "max_tokens": 500,
+            "openrouter_provider": {
+                "only": ["deepinfra/turbo"],
+                "allow_fallbacks": False,
+                "require_parameters": True,
+            },
+        }
+
+    @patch("pydantic_ai.providers.openrouter.OpenRouterProvider")
+    @patch("pydantic_ai.models.openrouter.OpenRouterModel")
+    def test_routing_alone_without_core_settings(
+        self, mock_model_cls: MagicMock, mock_provider_cls: MagicMock
+    ) -> None:
+        """Routing with no core setting still yields settings carrying the routing."""
+        config = ModelConfig(
+            provider="openrouter",
+            model="google/gemma-4-31b-it",
+            openrouter_provider=OpenRouterRouting(sort="price"),
+        )
+
+        create_model(config, http_client=MagicMock(spec=httpx2.AsyncClient))
+
+        assert mock_model_cls.call_args.kwargs["settings"] == {
+            "openrouter_provider": {"sort": "price"}
+        }
+
+    @pytest.mark.parametrize(
+        "core",
+        [{}, {"temperature": 0.3, "seed": 1}],
+        ids=["no-core", "with-core"],
+    )
+    @pytest.mark.parametrize("routing", [None, OpenRouterRouting()], ids=["unset", "empty"])
+    def test_unset_or_empty_routing_equals_core_settings(
+        self, core: dict[str, object], routing: OpenRouterRouting | None
+    ) -> None:
+        """No routing (or an empty block) passes exactly _build_core_settings(config)."""
+        config = ModelConfig(
+            provider="openrouter",
+            model="deepseek/deepseek-chat",
+            openrouter_provider=routing,
+            **core,
+        )
+        with (
+            patch("pydantic_ai.providers.openrouter.OpenRouterProvider"),
+            patch("pydantic_ai.models.openrouter.OpenRouterModel") as mock_model_cls,
+        ):
+            create_model(config, http_client=MagicMock(spec=httpx2.AsyncClient))
+
+        settings = mock_model_cls.call_args.kwargs["settings"]
+        assert settings == providers._build_core_settings(config)
+        assert settings == (core or None)
+
+    def test_fallback_entries_route_independently(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Each built model carries only its own routing; none inherits the primary's."""
+        monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+        config = ModelConfig(
+            provider="openrouter",
+            model="google/gemini-2.5-pro",
+            openrouter_provider=OpenRouterRouting(only=["host-a"]),
+            fallback_models=[
+                ModelConfig(
+                    provider="openrouter",
+                    model="google/gemini-2.5-flash",
+                    openrouter_provider=OpenRouterRouting(only=["host-b"]),
+                ),
+                ModelConfig(provider="openrouter", model="openai/gpt-4o"),
+            ],
+        )
+
+        model = create_model(config, http_client=httpx2.AsyncClient())
+
+        assert isinstance(model, FallbackModel)
+        primary, routed_fallback, bare_fallback = model.models
+        assert primary.settings is not None
+        assert primary.settings["openrouter_provider"]["only"] == ["host-a"]
+        assert routed_fallback.settings is not None
+        assert routed_fallback.settings["openrouter_provider"]["only"] == ["host-b"]
+        assert "openrouter_provider" not in (bare_fallback.settings or {})
+
+    def test_routing_stays_out_of_run_level_settings(self) -> None:
+        """create_model_settings never carries openrouter_provider (it applies chain-wide)."""
+        config = ModelConfig(
+            provider="openrouter",
+            model="deepseek/deepseek-chat",
+            max_tokens=100,
+            openrouter_provider=OpenRouterRouting(only=["deepinfra/turbo"]),
+        )
+
+        settings = create_model_settings(config)
+
+        assert settings is not None
+        assert "openrouter_provider" not in settings
+
+    def test_native_output_classification_ignores_routing(self) -> None:
+        """require_parameters does not change the vendor-prefix classifier."""
+        routing = OpenRouterRouting(require_parameters=True)
+        deepseek = ModelConfig(
+            provider="openrouter", model="deepseek/deepseek-chat", openrouter_provider=routing
+        )
+        google = ModelConfig(
+            provider="openrouter", model="google/gemini-2.5-flash", openrouter_provider=routing
+        )
+        google_unrouted = ModelConfig(provider="openrouter", model="google/gemini-2.5-flash")
+
+        assert _supports_native_output(deepseek) is False
+        assert _supports_native_output(google) is True
+        assert _supports_native_output(google_unrouted) is True
+
+    async def test_routing_reaches_the_outgoing_request_body(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Wire-level guard: the HTTP body's provider object carries the routing."""
+        monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+        bodies: list[dict[str, object]] = []
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            bodies.append(json.loads(request.content))
+            return httpx2.Response(200, json=_chat_completion_body())
+
+        config = ModelConfig(
+            provider="openrouter",
+            model="google/gemma-4-31b-it",
+            openrouter_provider=OpenRouterRouting(
+                only=["deepinfra/turbo"], allow_fallbacks=False, require_parameters=True
+            ),
+        )
+        http_client = httpx2.AsyncClient(transport=httpx2.MockTransport(handler))
+        model = create_model(config, http_client=http_client)
+
+        result = await Agent(model).run("hi")
+
+        assert result.output == "ok"
+        assert len(bodies) == 1
+        provider_obj = bodies[0]["provider"]
+        assert isinstance(provider_obj, dict)
+        assert provider_obj["only"] == ["deepinfra/turbo"]
+        assert provider_obj["allow_fallbacks"] is False
+        assert provider_obj["require_parameters"] is True
+
+    async def test_no_routing_sends_no_provider_object(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Without routing the request body has no provider object."""
+        monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+        bodies: list[dict[str, object]] = []
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            bodies.append(json.loads(request.content))
+            return httpx2.Response(200, json=_chat_completion_body())
+
+        config = ModelConfig(provider="openrouter", model="google/gemma-4-31b-it")
+        http_client = httpx2.AsyncClient(transport=httpx2.MockTransport(handler))
+
+        await Agent(create_model(config, http_client=http_client)).run("hi")
+
+        assert len(bodies) == 1
+        assert "provider" not in bodies[0]

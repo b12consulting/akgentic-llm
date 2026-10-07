@@ -63,6 +63,7 @@ from .config import (
     CompactionConfig,
     HttpClientConfig,
     ModelConfig,
+    OpenRouterRouting,
     ReactAgentConfig,
     RuntimeConfig,
     RunUsageLimits,
@@ -100,6 +101,7 @@ from .providers import create_http_client, create_model, create_model_settings, 
 __all__ = [
     # Configuration
     "ModelConfig",
+    "OpenRouterRouting",
     "RunUsageLimits",
     "AgentUsageLimits",
     "UsageLimits",  # DEPRECATED alias of RunUsageLimits — removal not yet scheduled

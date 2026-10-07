@@ -12,6 +12,7 @@ from akgentic.llm.config import (
     AgentUsageLimits,
     CompactionConfig,
     ModelConfig,
+    OpenRouterRouting,
     ReactAgentConfig,
     RuntimeConfig,
     RunUsageLimits,
@@ -77,7 +78,7 @@ class TestModelConfig:
 
     def test_reasoning_effort_values(self):
         """Test reasoning effort valid values."""
-        for effort in ["low", "medium", "high"]:
+        for effort in ["low", "medium", "high", "xhigh", "max"]:
             config = ModelConfig(provider="openai", model="gpt-4o", reasoning_effort=effort)  # type: ignore
             assert config.reasoning_effort == effort
 
@@ -351,6 +352,118 @@ class TestModelConfigFallbackModels:
         monkeypatch.setattr(config_module, "_supports_native_output", _boom)
         assert ModelConfig().fallback_models == []
         assert ModelConfig(provider="openai", model="gpt-4o").fallback_models == []
+
+
+_TARGET_ROUTING_PAYLOAD = {
+    "provider": "openrouter",
+    "model": "google/gemma-4-31b-it",
+    "openrouter_provider": {
+        "only": ["deepinfra/turbo"],
+        "allow_fallbacks": False,
+        "require_parameters": True,
+    },
+}
+
+
+class TestOpenRouterRouting:
+    """OpenRouterRouting schema and the ModelConfig.openrouter_provider field."""
+
+    def test_every_field_defaults_to_none(self) -> None:
+        """An empty block is valid and every field is None."""
+        assert all(value is None for value in OpenRouterRouting().model_dump().values())
+
+    def test_all_fields_accepted(self) -> None:
+        """Every documented field validates with in-vocabulary values."""
+        routing = OpenRouterRouting(
+            order=["deepinfra/turbo", "together"],
+            only=["deepinfra/turbo"],
+            ignore=["some-host"],
+            allow_fallbacks=False,
+            require_parameters=True,
+            zdr=True,
+            data_collection="deny",
+            quantizations=["fp8", "bf16"],
+            sort="throughput",
+        )
+        assert routing.quantizations == ["fp8", "bf16"]
+        assert routing.data_collection == "deny"
+
+    def test_host_slugs_are_free_strings(self) -> None:
+        """Host slugs are open-ended: any string is accepted."""
+        assert OpenRouterRouting(only=["a-host-nobody-has-heard-of/v9"]).only == [
+            "a-host-nobody-has-heard-of/v9"
+        ]
+
+    @pytest.mark.parametrize("key", ["onlyy", "max_price"])
+    def test_unknown_key_rejected(self, key: str) -> None:
+        """Unknown keys — including the deliberately omitted max_price — are rejected."""
+        with pytest.raises(ValidationError):
+            ModelConfig.model_validate(
+                {
+                    "provider": "openrouter",
+                    "model": "google/gemma-4-31b-it",
+                    "openrouter_provider": {key: ["x"]},
+                }
+            )
+
+    @pytest.mark.parametrize(
+        "block",
+        [{"sort": "cheapest"}, {"quantizations": ["fp3"]}, {"data_collection": "maybe"}],
+    )
+    def test_out_of_vocabulary_literal_rejected(self, block: dict[str, object]) -> None:
+        """Literal fields reject values outside their vocabulary."""
+        with pytest.raises(ValidationError):
+            OpenRouterRouting.model_validate(block)
+
+    def test_field_defaults_to_none(self) -> None:
+        """ModelConfig.openrouter_provider is optional and defaults to None."""
+        assert ModelConfig().openrouter_provider is None
+
+    @pytest.mark.parametrize("provider", ["openai", "anthropic", "nvidia"])
+    def test_rejected_off_openrouter(self, provider: str) -> None:
+        """Routing on a non-openrouter provider raises, naming field and provider."""
+        with pytest.raises(ValidationError) as exc_info:
+            ModelConfig(
+                provider=provider,
+                model="gpt-4o",
+                openrouter_provider=OpenRouterRouting(only=["deepinfra/turbo"]),
+            )
+        message = str(exc_info.value)
+        assert "openrouter_provider" in message
+        assert f"'{provider}'" in message
+
+    def test_rejected_on_non_openrouter_fallback_entry(self) -> None:
+        """The guard applies per entry: a non-openrouter fallback carrying routing fails."""
+        with pytest.raises(ValidationError, match="openrouter_provider"):
+            ModelConfig.model_validate(
+                {
+                    "provider": "openrouter",
+                    "model": "openai/gpt-4o",
+                    "fallback_models": [
+                        {
+                            "provider": "openai",
+                            "model": "gpt-4o",
+                            "openrouter_provider": {"only": ["deepinfra/turbo"]},
+                        }
+                    ],
+                }
+            )
+
+    def test_target_catalog_shape_round_trips(self) -> None:
+        """The catalog payload validates, round-trips, and keeps its routing block."""
+        cfg = ModelConfig.model_validate(copy.deepcopy(_TARGET_ROUTING_PAYLOAD))
+
+        assert ModelConfig.model_validate(cfg.model_dump()) == cfg
+        assert cfg.openrouter_provider is not None
+        assert cfg.openrouter_provider.model_dump(exclude_none=True) == {
+            "only": ["deepinfra/turbo"],
+            "allow_fallbacks": False,
+            "require_parameters": True,
+        }
+
+    def test_exported_from_package(self) -> None:
+        """OpenRouterRouting is importable from akgentic.llm."""
+        assert akgentic.llm.OpenRouterRouting is OpenRouterRouting
 
 
 class TestRunUsageLimits:

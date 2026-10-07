@@ -46,7 +46,7 @@ from tenacity import retry_if_exception, stop_after_attempt, wait_random_exponen
 from .config import ModelConfig, _supports_native_output
 
 if TYPE_CHECKING:
-    from pydantic_ai.models.anthropic import AnthropicModel
+    from pydantic_ai.models.anthropic import AnthropicModel, AnthropicModelSettings
     from pydantic_ai.models.mistral import MistralModel
     from pydantic_ai.models.openai import (
         OpenAIChatModel,
@@ -54,7 +54,7 @@ if TYPE_CHECKING:
         OpenAIResponsesModel,
         OpenAIResponsesModelSettings,
     )
-    from pydantic_ai.models.openrouter import OpenRouterModel
+    from pydantic_ai.models.openrouter import OpenRouterModel, OpenRouterModelSettings
 
 logger = logging.getLogger(__name__)
 
@@ -96,8 +96,8 @@ def get_output_type[T](
     """Get the appropriate output type wrapper for structured output based on provider.
 
     For providers with native structured output support (OpenAI, Azure, Anthropic,
-    NVIDIA OpenAI models, and OpenRouter ``openai/``, ``google/`` and ``x-ai/``
-    routes), returns ``NativeOutput[T]`` to leverage the provider's native function
+    NVIDIA OpenAI models, and OpenRouter ``openai/gpt-``, ``google/gemini`` and
+    ``x-ai/grok`` routes), returns ``NativeOutput[T]`` to leverage the provider's native function
     calling or tool use APIs for schema enforcement.
 
     For other providers (Google Gemini, Mistral, non-OpenAI NVIDIA models, and every
@@ -178,7 +178,7 @@ def create_model_settings(config: ModelConfig) -> ModelSettings | None:
         The parallel_tool_calls parameter is automatically set to False for
         providers that don't support native structured output (google-gla,
         mistral, non-OpenAI NVIDIA models, and OpenRouter routes outside the
-        ``openai/``, ``google/`` and ``x-ai/`` vendors). This ensures correct
+        ``openai/gpt-``, ``google/gemini`` and ``x-ai/grok`` families). This ensures correct
         behavior when using structured output via prompt-based extraction.
     """
     kwargs: dict[str, Any] = dict(cast(dict[str, Any], _build_core_settings(config) or {}))
@@ -329,6 +329,44 @@ def _build_openai_chat_settings(config: ModelConfig) -> "OpenAIChatModelSettings
     return cast(OpenAIChatModelSettings, kwargs) if kwargs else None
 
 
+def _build_openrouter_settings(config: ModelConfig) -> "OpenRouterModelSettings | None":
+    """Build OpenRouterModelSettings from ModelConfig, including host routing and reasoning.
+
+    Delegates shared parameters (temperature, max_tokens, seed) to
+    ``_build_core_settings``, adds ``openrouter_provider`` from
+    ``config.openrouter_provider`` and ``openrouter_reasoning`` from
+    ``config.reasoning_effort``. With neither — or an empty routing block, which
+    pydantic-ai would drop anyway — the result is exactly ``_build_core_settings(config)``.
+
+    pydantic-ai types ``OpenRouterReasoning.effort`` without ``max``, but OpenRouter
+    accepts it and pydantic-ai forwards the dict verbatim as the request's ``reasoning``.
+
+    Routing lives here, in the per-model factory, and never in ``create_model_settings``:
+    run-level settings apply to every model of a fallback chain, which would pin every
+    fallback to the primary's host.
+
+    Args:
+        config: LLM model configuration.
+
+    Returns:
+        OpenRouterModelSettings instance if any parameters are set, else None.
+    """
+    core = _build_core_settings(config)
+    routing = (
+        config.openrouter_provider.model_dump(exclude_none=True)
+        if config.openrouter_provider is not None
+        else {}
+    )
+    if not routing and config.reasoning_effort is None:
+        return cast("OpenRouterModelSettings | None", core)
+    kwargs: dict[str, Any] = dict(cast(dict[str, Any], core or {}))
+    if routing:
+        kwargs["openrouter_provider"] = routing
+    if config.reasoning_effort is not None:
+        kwargs["openrouter_reasoning"] = {"effort": config.reasoning_effort}
+    return cast("OpenRouterModelSettings", kwargs)
+
+
 def _create_openai_model(
     config: ModelConfig,
     http_client: httpx2.AsyncClient,
@@ -451,6 +489,9 @@ def _create_anthropic_model(
 ) -> "AnthropicModel":
     """Create Anthropic model.
 
+    ``config.reasoning_effort`` maps to ``anthropic_effort``; the two share the same five
+    levels. Models without effort support reject it at request time.
+
     Args:
         config: LLM model configuration.
         http_client: Async HTTP client with retry logic.
@@ -461,11 +502,13 @@ def _create_anthropic_model(
     from pydantic_ai.models.anthropic import AnthropicModel  # noqa: PLC0415
     from pydantic_ai.providers.anthropic import AnthropicProvider  # noqa: PLC0415
 
-    settings = _build_core_settings(config)
+    settings = cast("AnthropicModelSettings", dict(_build_core_settings(config) or {}))
+    if config.reasoning_effort is not None:
+        settings["anthropic_effort"] = config.reasoning_effort
     return AnthropicModel(
         model_name=config.model,
         provider=AnthropicProvider(http_client=http_client),
-        settings=settings,
+        settings=settings or None,
     )
 
 
@@ -568,7 +611,9 @@ def _create_openrouter_model(
     """Create OpenRouter model.
 
     Routes ``config.model`` (an OpenRouter ``vendor/model`` id) through the
-    OpenRouter gateway. The API key comes from ``OPENROUTER_API_KEY``.
+    OpenRouter gateway. The API key comes from ``OPENROUTER_API_KEY``. Host routing
+    comes from ``config.openrouter_provider`` and is per-model: each fallback entry is
+    built here from its own config, so it routes independently of the primary.
 
     Args:
         config: LLM model configuration.
@@ -584,7 +629,7 @@ def _create_openrouter_model(
     from pydantic_ai.models.openrouter import OpenRouterModel  # noqa: PLC0415
     from pydantic_ai.providers.openrouter import OpenRouterProvider  # noqa: PLC0415
 
-    settings = _build_core_settings(config)
+    settings = _build_openrouter_settings(config)
     return OpenRouterModel(
         model_name=config.model,
         provider=OpenRouterProvider(http_client=http_client),
@@ -706,9 +751,10 @@ def create_model(
         >>> result = await agent.run("Hello!")
 
     Note:
-        The reasoning_effort parameter is only supported by OpenAI models
-        (e.g., o1 series). It is mapped to ``openai_reasoning_effort`` in
-        model settings and ignored for other providers.
+        The reasoning_effort parameter is mapped to ``openai_reasoning_effort`` for
+        OpenAI-compatible providers (openai, openai-chat, azure, azure-chat, nvidia), to
+        ``openrouter_reasoning`` for OpenRouter and to ``anthropic_effort`` for Anthropic;
+        other providers ignore it.
     """
     if http_client is None:
         http_client = create_http_client()

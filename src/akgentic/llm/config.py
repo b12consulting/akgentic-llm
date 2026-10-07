@@ -25,7 +25,7 @@ Examples:
 import warnings
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 # Removal schedule for the pre-split usage-limits shim, interpolated into every
 # deprecation warning below so the schedule is stated in exactly one place.
@@ -37,6 +37,56 @@ from pydantic import BaseModel, Field, model_validator
 # any future release here would recreate that same defect at the next forced major,
 # so the schedule stays open until someone actually schedules it.
 _SHIM_REMOVAL_NOTICE = "no removal release is scheduled"
+
+
+class OpenRouterRouting(BaseModel):
+    """OpenRouter host routing: which hosts may serve an OpenRouter route.
+
+    An OpenRouter model id names the model's author (``google/gemma-4-31b-it``), not the
+    company that runs it; OpenRouter load-balances across every host serving the route
+    unless told otherwise. This block mirrors pydantic-ai's ``OpenRouterProviderConfig``
+    and is sent as the request body's ``provider`` object.
+
+    Host slugs (``order``, ``only``, ``ignore``) are free strings such as
+    ``deepinfra/turbo`` — the set is open-ended, so they are not a ``Literal``.
+    ``max_price`` is intentionally omitted (add it when a user asks); like any unknown
+    key it is rejected. Conflicts between ``only``/``order``/``ignore`` are not validated
+    here — the OpenRouter API is the authority.
+
+    Attributes:
+        order: Host slugs to try, in order.
+        only: Host slugs allowed to serve the request; every other host is refused.
+        ignore: Host slugs never to use.
+        allow_fallbacks: Whether OpenRouter may use hosts outside ``order``/``only``.
+        require_parameters: Only use hosts that support every request parameter
+            (e.g. ``response_format``).
+        zdr: Restrict to zero-data-retention endpoints.
+        data_collection: ``"deny"`` refuses hosts that store or train on data.
+        quantizations: Allowed quantization levels.
+        sort: Sort hosts by price, throughput or latency.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    order: list[str] | None = Field(default=None, description="Host slugs to try, in order")
+    only: list[str] | None = Field(default=None, description="Only these host slugs may serve")
+    ignore: list[str] | None = Field(default=None, description="Host slugs never to use")
+    allow_fallbacks: bool | None = Field(
+        default=None, description="Allow hosts outside order/only when they fail"
+    )
+    require_parameters: bool | None = Field(
+        default=None, description="Only hosts that support every request parameter"
+    )
+    zdr: bool | None = Field(default=None, description="Zero-data-retention endpoints only")
+    data_collection: Literal["allow", "deny"] | None = Field(
+        default=None, description="'deny' refuses hosts that store or train on data"
+    )
+    quantizations: (
+        list[Literal["int4", "int8", "fp4", "fp6", "fp8", "fp16", "bf16", "fp32", "unknown"]] | None
+    ) = Field(default=None, description="Allowed quantization levels")
+    sort: Literal["price", "throughput", "latency"] | None = Field(
+        default=None, description="Sort hosts by price, throughput or latency"
+    )
 
 
 class ModelConfig(BaseModel):
@@ -56,6 +106,8 @@ class ModelConfig(BaseModel):
     - OpenRouter: OPENROUTER_API_KEY. ``model`` must be an OpenRouter ``vendor/model``
       id (e.g. ``deepseek/deepseek-chat``); the shared default ``gpt-5.2`` has no
       vendor prefix and is rejected at ``create_model()`` time, not at construction.
+      The id names the model's author, not its host; ``openrouter_provider`` chooses
+      which hosts may serve it.
 
     Attributes:
         provider: LLM provider name
@@ -65,11 +117,17 @@ class ModelConfig(BaseModel):
         max_tokens: Maximum tokens in model response (None = provider default/maximum)
         context_length: Model context window in tokens; the budget that auto-triggers
             compaction. None = compaction off. Distinct from max_tokens (the output cap).
-        reasoning_effort: Reasoning effort for o1/o3-style models ('low', 'medium', 'high')
+        reasoning_effort: Reasoning effort ('low' to 'max') for reasoning models on the
+            OpenAI-compatible providers, OpenRouter and Anthropic; ignored by google-gla and
+            mistral.
         fallback_models: Models tried in order after this one on API failure. The chain is
             flat (an entry may not declare its own fallbacks) and homogeneous (every entry
             must agree with this config on native structured-output support), both enforced
             at construction. Only this config's context_length governs the compaction budget.
+        openrouter_provider: OpenRouter host routing (``provider="openrouter"`` only). A
+            model id names the author, not the host; this block pins, orders, excludes or
+            filters the hosts that serve the route. It applies to this entry only — a
+            fallback entry carries its own and never inherits the primary's.
 
     Example:
         >>> # OpenAI GPT-4o with moderate creativity
@@ -148,8 +206,9 @@ class ModelConfig(BaseModel):
         description="Model context window in tokens; the budget that auto-triggers compaction. None = off.",  # noqa: E501
     )
 
-    reasoning_effort: Literal["low", "medium", "high"] | None = Field(
-        default=None, description="Reasoning effort for o1/o3 models"
+    reasoning_effort: Literal["low", "medium", "high", "xhigh", "max"] | None = Field(
+        default=None,
+        description="Reasoning effort; ignored by google-gla and mistral",
     )
 
     fallback_models: list["ModelConfig"] = Field(
@@ -159,6 +218,28 @@ class ModelConfig(BaseModel):
             "auth errors, timeouts). Empty = no fallback (default)."
         ),
     )
+
+    openrouter_provider: OpenRouterRouting | None = Field(
+        default=None,
+        description=(
+            "OpenRouter host routing (only/order/ignore, allow_fallbacks, "
+            "require_parameters, ...). Valid only with provider='openrouter'; "
+            "per-entry, never inherited by fallbacks."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _reject_openrouter_provider_off_openrouter(self) -> "ModelConfig":
+        """Routing is OpenRouter-only: reject it on any other provider.
+
+        Every fallback entry is itself a ModelConfig, so this applies per entry.
+        """
+        if self.openrouter_provider is not None and self.provider != "openrouter":
+            raise ValueError(
+                "openrouter_provider is only valid with provider='openrouter'; "
+                f"got provider='{self.provider}'"
+            )
+        return self
 
     @model_validator(mode="after")
     def _reject_nested_fallback_models(self) -> "ModelConfig":
@@ -202,13 +283,15 @@ class ModelConfig(BaseModel):
         return self
 
 
-# OpenRouter vendor prefixes whose pydantic-ai route profile has
-# supports_json_schema_output=True. This set MUST stay a subset of that profile table:
-# pydantic-ai raises UserError at request time when native output is requested on a
-# route it does not support, whereas a vendor missing here only falls back to
-# prompt-based extraction. Re-verify against OpenRouterModel(name).profile whenever
-# pydantic-ai is bumped.
-_OPENROUTER_NATIVE_VENDORS: frozenset[str] = frozenset({"openai", "google", "x-ai"})
+# OpenRouter model-family prefixes known to support native structured output. An
+# allowlist of first-party families, not of vendors: a vendor prefix names the model's
+# author, not its host, so an open-weights family (``google/gemma``) is
+# served by third-party hosts whose JSON-schema constraint suppresses tool calls.
+# Every entry MUST also be supported by pydantic-ai's route profile
+# (supports_json_schema_output=True): a family listed here that pydantic-ai marks
+# unsupported raises UserError at request time, whereas a family missing here only
+# falls back to prompt-based extraction. Re-verify whenever pydantic-ai is bumped.
+_OPENROUTER_NATIVE_FAMILIES: tuple[str, ...] = ("openai/gpt-", "google/gemini", "x-ai/grok")
 
 
 def _supports_native_output(config: ModelConfig) -> bool:
@@ -221,25 +304,22 @@ def _supports_native_output(config: ModelConfig) -> bool:
     - azure-chat: Azure OpenAI Service via the legacy Chat Completions API
     - anthropic: Claude 3.5 Sonnet, etc.
     - nvidia: Only for models with "openai" prefix (e.g., "openai/gpt-oss-120b")
-    - openrouter: Only for routes whose vendor prefix is ``openai/``, ``google/`` or
-      ``x-ai/`` (e.g., "openai/gpt-4o")
+    - openrouter: Only for allowlisted first-party families: every numbered
+      ``openai/gpt-*``, ``google/gemini*`` and ``x-ai/grok*``
 
     Providers without native support (use prompt-based extraction):
     - google-gla: Google Gemini models
     - mistral: Mistral AI models
     - nvidia: Non-OpenAI models (e.g., "meta/llama-3.1-70b-instruct")
-    - openrouter: Every other route, including ``deepseek/``, ``anthropic/``, ``qwen/``,
-      ``openrouter/*`` meta-routes and unknown vendors
+    - openrouter: Every other route, including ``google/gemma*``, ``openai/o*``,
+      ``deepseek/``, ``anthropic/``, ``qwen/``, ``openrouter/*`` meta-routes and unknown
+      vendors
 
-    OpenRouter is a switchboard, so support is decided per route from the vendor
-    prefix, not per provider. The prefix is read after stripping a leading ``~`` alias
-    marker (``~openai/gpt-4o-latest``) and before any ``:tag`` suffix (``:free``,
-    ``:nitro``), so aliases and tags classify like their vendor. The allowlist is
-    deliberately a subset of pydantic-ai's own route profiles: a vendor listed here that
-    pydantic-ai marks unsupported fails every structured request at run time, while a
-    vendor omitted here only degrades to prompt-based extraction. A model with no ``/``
-    yields no known vendor and returns False; pydantic-ai rejects such a name when the
-    model is constructed.
+    OpenRouter is a switchboard, so support is decided per route from the model family,
+    not per provider or vendor. The family prefix is matched after stripping a leading
+    ``~`` alias marker (``~openai/gpt-4o-latest``); a ``:tag`` suffix (``:free``,
+    ``:nitro``) never affects a prefix match. Anything not allowlisted degrades to
+    prompt-based extraction, which is always safe.
 
     Defined here rather than in providers.py so ModelConfig's fallback-chain validator can
     call it: providers.py already imports ModelConfig from this module, so importing the
@@ -273,8 +353,8 @@ def _supports_native_output(config: ModelConfig) -> bool:
     if config.provider == "nvidia":
         return config.model.startswith("openai")
     if config.provider == "openrouter":
-        vendor = config.model.removeprefix("~").split("/", 1)[0]
-        return vendor in _OPENROUTER_NATIVE_VENDORS
+        route = config.model.removeprefix("~")
+        return route.startswith(_OPENROUTER_NATIVE_FAMILIES)
     return False
 
 

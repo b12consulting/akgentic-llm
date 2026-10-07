@@ -29,10 +29,13 @@ dependencies = [
     # google-genai and mistralai are still on encode's httpx internally and accept an httpx2 client
     # through duck typing, which is why pydantic-ai's AsyncHTTPClient union covers both.
     # See decisions/adr-020. No ceiling on pydantic-ai, anthropic or openai: the ceilings that once
-    # blocked the migrated majors were removed with the migration itself. The floor is 2.38 because
-    # that release appends an interrupted marker when a tool-call turn fails and repairs the
-    # dangling call on the next run; this package relies on it instead of healing the call itself
-    # (issue #155). The transport floor of 2.32 (AsyncHTTPX2TenacityTransport) is subsumed.
+    # blocked the migrated majors were removed with the migration itself. The floor is 2.54: 2.38
+    # started appending an interrupted marker when a tool-call turn fails and repairing the
+    # dangling call on the next run, which this package relies on instead of healing the call
+    # itself (issue #155), and 2.54 moved on_run_error inside wrap_run, before the event-sourcing
+    # closing sweep: LimitRecoveryCapability documents, and its guard pins, the durable history
+    # its hook sees under that order (issue #169). The transport floor of 2.32
+    # (AsyncHTTPX2TenacityTransport) is subsumed.
     # This is pydantic-ai-SLIM, not the pydantic-ai metapackage, with exactly the extras this
     # package imports. The metapackage is a convenience bundle for application authors: it adds
     # cli, evals, logfire and web on top of slim, so a library that depends on it drags a CLI, an
@@ -41,7 +44,7 @@ dependencies = [
     # providers.py; openai covers OpenAI, Azure AND NVIDIA, since all three ride the OpenAI SDK,
     # and retries is what makes pydantic_ai.retries importable (that is not the tenacity line
     # below, which is a direct import of ours).
-    "pydantic-ai-slim[anthropic,google,mistral,openai,retries]>=2.38,<3",
+    "pydantic-ai-slim[anthropic,google,mistral,openai,retries]>=2.54,<3",
     # NEVER cap this: genai-prices ships the price table itself, so an upper bound
     # freezes prices and the framework reports stale costs. The floor is the
     # first table that prices the gpt-6 line (0.1.9); a ceiling here also

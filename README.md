@@ -212,8 +212,9 @@ print(result.title, result.points)
 | `seed` | `int \| None` | `None` | Reproducible outputs (not all providers) |
 | `max_tokens` | `int \| None` | `None` | Max response tokens; `None` = provider max |
 | `context_length` | `int \| None` | `None` | Model context window; the budget that auto-triggers compaction. `None` = compaction off. Distinct from `max_tokens`, which caps output |
-| `reasoning_effort` | `Literal["low","medium","high"] \| None` | `None` | For o1/o3-style models only |
+| `reasoning_effort` | `Literal["low","medium","high","xhigh","max"] \| None` | `None` | Reasoning models on `openai`, `openai-chat`, `azure`, `azure-chat`, `nvidia`, `openrouter` and `anthropic`; ignored by `google-gla` and `mistral` |
 | `fallback_models` | `list[ModelConfig]` | `[]` | Models tried in declaration order after this one on API failure — see [Fallback chain](#fallback-chain) |
+| `openrouter_provider` | `OpenRouterRouting \| None` | `None` | OpenRouter host routing (only/order/ignore, allow_fallbacks, require_parameters, …); `provider="openrouter"` only — see [Providers](#providers) |
 
 ```python
 from akgentic.llm import ModelConfig
@@ -745,8 +746,8 @@ a scenario bound to `model_cfg.model` at construction and builds no model at all
 | Anthropic | `"anthropic"` | `ANTHROPIC_API_KEY` | ✅ |
 | NVIDIA NIM (openai/* models) | `"nvidia"` | `OPENAI_API_KEY` | ✅ |
 | NVIDIA NIM (other models) | `"nvidia"` | `OPENAI_API_KEY` | ❌ |
-| OpenRouter (openai/*, google/*, x-ai/* routes) | `"openrouter"` | `OPENROUTER_API_KEY` | ✅ |
-| OpenRouter (other routes) | `"openrouter"` | `OPENROUTER_API_KEY` | ❌ |
+| OpenRouter (`openai/gpt-*`, `google/gemini*`, `x-ai/grok*`) | `"openrouter"` | `OPENROUTER_API_KEY` | ✅ |
+| OpenRouter (other routes, incl. `google/gemma*`) | `"openrouter"` | `OPENROUTER_API_KEY` | ❌ |
 | Google Gemini | `"google-gla"` | `GOOGLE_API_KEY` **or** `GEMINI_API_KEY` (one is mandatory) | ❌ |
 | Mistral AI | `"mistral"` | `MISTRAL_API_KEY` | ❌ |
 
@@ -763,10 +764,13 @@ Providers without native structured output use pydantic-ai's prompt-based extrac
 > **OpenRouter is a switchboard, so native output follows the route, not the provider.** Model ids
 > are OpenRouter `vendor/model` routes (`deepseek/deepseek-chat`), optionally an alias
 > (`~vendor/model-latest`) or tagged (`vendor/model:free`); the alias marker is stripped and the tag
-> ignored, so both classify like their vendor. Only `openai/`, `google/` and `x-ai/` routes get
-> native structured output. That allowlist is deliberately a subset of pydantic-ai's own route
-> profiles: a vendor listed here that pydantic-ai marks unsupported would fail every structured
-> request at request time, while a vendor omitted only degrades to prompt-based extraction. The
+> ignored. Only allowlisted first-party families get native structured output:
+> `openai/gpt-*`, `google/gemini*` and `x-ai/grok*`. The allowlist is by family,
+> not vendor, because a vendor prefix names the author, not the host: an open-weights family such as
+> `google/gemma*` runs on third-party hosts whose JSON-schema constraint
+> suppresses tool calls, so they stay prompt-based. Every family listed must also be supported by
+> pydantic-ai's route profile, or every structured request fails at request time; a family omitted
+> only degrades to prompt-based extraction. The
 > shared default model `gpt-5.2` has no vendor prefix and is rejected by pydantic-ai when the
 > model is built. A missing `OPENROUTER_API_KEY` fails at construction with pydantic-ai's
 > `UserError`, not at request time. genai-prices prices routes under the `openrouter` provider,
@@ -774,6 +778,18 @@ Providers without native structured output use pydantic-ai's prompt-based extrac
 > snapshot is **stamped** `0.0`, and an all-zero bucket is recomputed at aggregation from the
 > installed snapshot, so totals self-heal once the library ships the route (the dependency is
 > uncapped) while the events themselves keep their `0.0`.
+>
+> **A model id names the author, not the host.** `google/gemma-4-31b-it` says who made the model;
+> OpenRouter load-balances each request across every host serving that route, which can differ in
+> price, quantization and uptime. `openrouter_provider` (an `OpenRouterRouting`) constrains that
+> choice — pin hosts with `only`, rank them with `order`, exclude them with `ignore`, and filter on
+> `allow_fallbacks`, `require_parameters`, `data_collection`, `zdr`, `quantizations` or `sort`.
+> It is sent as the request's `provider` object, is valid only with `provider="openrouter"`, and is
+> per entry: each `fallback_models` entry carries its own routing and never inherits the
+> primary's. `require_parameters: true` makes OpenRouter refuse hosts that ignore a request
+> parameter (e.g. `response_format`), but it does **not** change native-output classification —
+> the model-family allowlist above stays the sole classifier. Cost is still priced at
+> genai-prices' `openrouter` rate, not the pinned host's.
 
 > **Google is API-key only.** The provider factory reads `GOOGLE_API_KEY`, falling back to
 > `GEMINI_API_KEY`, and raises `ValueError` when neither is set. Application Default
@@ -791,6 +807,18 @@ ModelConfig(provider="openrouter", model="deepseek/deepseek-v4-flash-0731")
 
 # OpenRouter — Google route (native output)
 ModelConfig(provider="openrouter", model="google/gemini-2.5-flash")
+
+# OpenRouter — pin the host that serves the route, and refuse hosts that
+# would ignore a request parameter such as response_format
+from akgentic.llm import OpenRouterRouting
+
+ModelConfig(
+    provider="openrouter",
+    model="google/gemma-4-31b-it",
+    openrouter_provider=OpenRouterRouting(
+        only=["deepinfra/turbo"], allow_fallbacks=False, require_parameters=True
+    ),
+)
 ```
 
 ### Fallback chain
@@ -1290,9 +1318,12 @@ One run of `ReactAgent`, with two model requests and a tool call in between. Rea
 
  on the error path instead:              │
    ▲ on_run_error  (innermost first)     │  LimitRecovery: record the seam's decision, re-raise.
-                                         │    pydantic-ai has already appended its interrupted
-                                         │    marker; the dangling call is closed out on the
-                                         │    NEXT run's first request
+                                         │    Fires INSIDE wrap_run, before its tail, so the
+                                         │    durable history still ends at the dangling
+                                         │    ModelResponse
+   ▲ wrap_run — TAIL / finally           │  EventSourcing: closing sweep persists pydantic-ai's
+                                         │    interrupted marker; the dangling call is closed
+                                         │    out on the NEXT run's first request
 ```
 
 **Two consequences worth stating outright, because both have already cost a bug:**

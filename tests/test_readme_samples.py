@@ -56,6 +56,7 @@ from akgentic.llm import (
     LlmUsageEvent,
     ModelConfig,
     ModelSwitchError,
+    OpenRouterRouting,
     PromptTemplate,
     ReactAgent,
     ReactAgentConfig,
@@ -263,6 +264,7 @@ def test_model_config_table_fields_exist() -> None:
     assert defaults.context_length is None
     assert defaults.reasoning_effort is None
     assert defaults.fallback_models == []
+    assert defaults.openrouter_provider is None
 
 
 # ---------------------------------------------------------------------------
@@ -545,6 +547,21 @@ def test_openrouter_provider_samples() -> None:
 
     native = ModelConfig(provider="openrouter", model="google/gemini-2.5-flash")
     assert _supports_native_output(native) is True
+
+
+def test_openrouter_host_routing_sample() -> None:
+    """§Providers — the host-pinning sample builds and carries its routing block."""
+    cfg = ModelConfig(
+        provider="openrouter",
+        model="google/gemma-4-31b-it",
+        openrouter_provider=OpenRouterRouting(
+            only=["deepinfra/turbo"], allow_fallbacks=False, require_parameters=True
+        ),
+    )
+    assert cfg.openrouter_provider is not None
+    assert cfg.openrouter_provider.only == ["deepinfra/turbo"]
+    assert cfg.openrouter_provider.allow_fallbacks is False
+    assert cfg.openrouter_provider.require_parameters is True
 
 
 def test_provider_table_native_output_column() -> None:

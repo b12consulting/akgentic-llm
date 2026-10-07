@@ -2168,11 +2168,16 @@ class TestReactAgentLimitRecovery:
     async def test_the_seam_sees_the_dangling_response_and_the_interrupted_marker(self):
         """What a policy reading the context finds when consulted (AC #6b).
 
-        Pins the shape ``LimitRecoveryCapability``'s docstring states: by the time
-        ``on_run_error`` fires, pydantic-ai has appended its empty interrupted-request marker
-        after the dangling ``ModelResponse``, and nothing has closed the call out yet. A
-        pydantic-ai release that appended the marker later, or a persistence change that
-        dropped empty requests, would make that docstring false — this is what would see it.
+        Pins the shape ``LimitRecoveryCapability``'s docstring states. ``on_run_error`` fires
+        inside ``wrap_run``, before ``EventSourcingCapability``'s closing sweep, so the durable
+        ``ContextManager.messages`` ends with the dangling ``ModelResponse``; the sweep then
+        persists pydantic-ai's empty interrupted-request marker right after it, before the
+        conclusion run. A pydantic-ai release that moved the hook or the marker, or a
+        persistence change, would make that docstring false — this is what would see it.
+
+        The marker is asserted after ``run()`` because the hook's own ``ctx.messages`` is empty.
+        "Before the conclusion run" needs no separate assertion: without a durable marker the
+        conclusion's history holds an unrepaired tool call and pydantic-ai refuses to start it.
         """
         offered: list[list[str]] = []
         seam = _RecordingSeam()
@@ -2189,10 +2194,11 @@ class TestReactAgentLimitRecovery:
         assert result == "concluded"
         assert len(seam.consulted) == 1, "the recovery hook ran exactly once"
         seen = seam.context_seen[0]
-        marker, dangling = seen[-1], seen[-2]
-        assert isinstance(marker, ModelRequest) and marker.state == "interrupted"
-        assert marker.parts == []
+        dangling = seen[-1]
         assert isinstance(dangling, ModelResponse) and dangling.tool_calls
+        history = agent.context.messages
+        marker = history[history.index(dangling) + 1]
+        assert isinstance(marker, ModelRequest) and marker.state == "interrupted"
 
     async def test_the_conclusion_keeps_the_runs_output_type_and_deps(self):
         """Both are threaded verbatim from the breached call (AC #9).
