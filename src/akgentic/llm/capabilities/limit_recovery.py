@@ -58,11 +58,13 @@ class LimitRecoveryCapability(AbstractCapability[Any]):
     error; this one never does. Suppressing it here would make the run tier unobservable and
     would hand the mounter a result it never asked for, when what it needs is the *decision*.
 
-    **What the seam sees.** By the time ``on_run_error`` fires, pydantic-ai has already appended
-    its interrupted-request marker to the run's history, so a policy that reads
-    ``ContextManager.messages`` finds the dangling ``ModelResponse`` followed by that empty
-    request, not a tool return. The dangling call is closed out with a synthesized tool return
-    only when the next run builds its first request.
+    **What the seam sees.** pydantic-ai (since 2.54) fires ``on_run_error`` inside
+    ``wrap_run``, before ``EventSourcingCapability``'s closing sweep. So a policy that reads
+    ``ContextManager.messages`` finds the dangling ``ModelResponse`` as the last durable
+    message, not a tool return. The sweep persists pydantic-ai's interrupted-request marker
+    right after it as the run unwinds, so the marker is durable before any conclusion run
+    starts. The dangling call is closed
+    out with a synthesized tool return only when the next run builds its first request.
 
     **No ``for_run`` override, deliberately.** pydantic-ai's default hands back ``self``, so
     the object whose hook records the decision **is** the object the mounter holds and reads
