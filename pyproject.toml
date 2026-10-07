@@ -43,10 +43,10 @@ dependencies = [
     # below, which is a direct import of ours).
     "pydantic-ai-slim[anthropic,google,mistral,openai,retries]>=2.38,<3",
     # NEVER cap this: genai-prices ships the price table itself, so an upper bound
-    # freezes prices and the framework reports stale costs. The floor is the v2
-    # pricing-data line; a ceiling here also transitively caps pydantic-ai, since
-    # pydantic-ai-slim>=2.22.0 requires genai-prices>=0.1.0.
-    "genai-prices>=0.1.0",
+    # freezes prices and the framework reports stale costs. The floor is the
+    # first table that prices the gpt-6 line (0.1.9); a ceiling here also
+    # transitively caps pydantic-ai, since pydantic-ai-slim>=2.22.0 requires
+    "genai-prices>=0.1.9",
     "pydantic>=2.0.0",
     "httpx2>=2.7",
     "tenacity>=8.0.0",
