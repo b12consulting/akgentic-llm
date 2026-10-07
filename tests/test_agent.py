@@ -2174,6 +2174,10 @@ class TestReactAgentLimitRecovery:
         persists pydantic-ai's empty interrupted-request marker right after it, before the
         conclusion run. A pydantic-ai release that moved the hook or the marker, or a
         persistence change, would make that docstring false — this is what would see it.
+
+        The marker is asserted after ``run()`` because the hook's own ``ctx.messages`` is empty.
+        "Before the conclusion run" needs no separate assertion: without a durable marker the
+        conclusion's history holds an unrepaired tool call and pydantic-ai refuses to start it.
         """
         offered: list[list[str]] = []
         seam = _RecordingSeam()

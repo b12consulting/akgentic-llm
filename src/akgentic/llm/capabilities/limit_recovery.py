@@ -63,8 +63,8 @@ class LimitRecoveryCapability(AbstractCapability[Any]):
     ``ContextManager.messages`` finds the dangling ``ModelResponse`` as the last durable
     message, not a tool return. The sweep persists pydantic-ai's interrupted-request marker
     right after it as the run unwinds, so the marker is durable before any conclusion run
-    starts. The dangling call is closed
-    out with a synthesized tool return only when the next run builds its first request.
+    starts. The dangling call is closed out with a synthesized tool return only when the next
+    run builds its first request.
 
     **No ``for_run`` override, deliberately.** pydantic-ai's default hands back ``self``, so
     the object whose hook records the decision **is** the object the mounter holds and reads

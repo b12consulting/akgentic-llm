@@ -32,8 +32,9 @@ dependencies = [
     # blocked the migrated majors were removed with the migration itself. The floor is 2.54: 2.38
     # started appending an interrupted marker when a tool-call turn fails and repairing the
     # dangling call on the next run, which this package relies on instead of healing the call
-    # itself (issue #155), and 2.54 moved on_run_error inside wrap_run, which fixes what
-    # LimitRecoveryCapability's hook sees in the durable history. The transport floor of 2.32
+    # itself (issue #155), and 2.54 moved on_run_error inside wrap_run, before the event-sourcing
+    # closing sweep: LimitRecoveryCapability documents, and its guard pins, the durable history
+    # its hook sees under that order (issue #169). The transport floor of 2.32
     # (AsyncHTTPX2TenacityTransport) is subsumed.
     # This is pydantic-ai-SLIM, not the pydantic-ai metapackage, with exactly the extras this
     # package imports. The metapackage is a convenience bundle for application authors: it adds

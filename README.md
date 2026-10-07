@@ -1318,9 +1318,12 @@ One run of `ReactAgent`, with two model requests and a tool call in between. Rea
 
  on the error path instead:              │
    ▲ on_run_error  (innermost first)     │  LimitRecovery: record the seam's decision, re-raise.
-                                         │    pydantic-ai has already appended its interrupted
-                                         │    marker; the dangling call is closed out on the
-                                         │    NEXT run's first request
+                                         │    Fires INSIDE wrap_run, before its tail, so the
+                                         │    durable history still ends at the dangling
+                                         │    ModelResponse
+   ▲ wrap_run — TAIL / finally           │  EventSourcing: closing sweep persists pydantic-ai's
+                                         │    interrupted marker; the dangling call is closed
+                                         │    out on the NEXT run's first request
 ```
 
 **Two consequences worth stating outright, because both have already cost a bug:**
