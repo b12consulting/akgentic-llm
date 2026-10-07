@@ -117,7 +117,9 @@ class ModelConfig(BaseModel):
         max_tokens: Maximum tokens in model response (None = provider default/maximum)
         context_length: Model context window in tokens; the budget that auto-triggers
             compaction. None = compaction off. Distinct from max_tokens (the output cap).
-        reasoning_effort: Reasoning effort for o1/o3-style models ('low', 'medium', 'high')
+        reasoning_effort: Reasoning effort ('low' to 'max') for reasoning models on the
+            OpenAI-compatible providers, OpenRouter and Anthropic; ignored by google-gla and
+            mistral.
         fallback_models: Models tried in order after this one on API failure. The chain is
             flat (an entry may not declare its own fallbacks) and homogeneous (every entry
             must agree with this config on native structured-output support), both enforced
@@ -205,7 +207,8 @@ class ModelConfig(BaseModel):
     )
 
     reasoning_effort: Literal["low", "medium", "high", "xhigh", "max"] | None = Field(
-        default=None, description="Reasoning effort for OpenAI reasoning models"
+        default=None,
+        description="Reasoning effort; ignored by google-gla and mistral",
     )
 
     fallback_models: list["ModelConfig"] = Field(

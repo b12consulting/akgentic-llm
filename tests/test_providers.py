@@ -842,6 +842,39 @@ class TestCreateModel:
         settings = mock_model_cls.call_args.kwargs["settings"]
         assert settings == {"max_tokens": 1000, "anthropic_effort": "max"}
 
+    @patch("pydantic_ai.providers.anthropic.AnthropicProvider")
+    @patch("pydantic_ai.models.anthropic.AnthropicModel")
+    def test_anthropic_no_params_produce_no_settings(
+        self, mock_model_cls, mock_provider_cls
+    ) -> None:
+        """With no core setting and no effort, settings=None is passed, not an empty dict."""
+        mock_client = MagicMock(spec=httpx2.AsyncClient)
+        config = ModelConfig(provider="anthropic", model="claude-opus-5-5")
+
+        create_model(config, http_client=mock_client)
+
+        assert mock_model_cls.call_args.kwargs["settings"] is None
+
+    async def test_anthropic_reasoning_effort_reaches_request_body(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The effort is sent as the request's output_config.effort."""
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+        bodies: list[dict[str, object]] = []
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            bodies.append(json.loads(request.content))
+            return httpx2.Response(200, json=_anthropic_message_body())
+
+        config = ModelConfig(
+            provider="anthropic", model="claude-opus-5-5", max_tokens=64, reasoning_effort="xhigh"
+        )
+        http_client = httpx2.AsyncClient(transport=httpx2.MockTransport(handler))
+
+        await Agent(create_model(config, http_client=http_client)).run("hi")
+
+        assert bodies[0]["output_config"] == {"effort": "xhigh"}
+
     # ------------------------------------------------------------------
     # Google
     # ------------------------------------------------------------------
@@ -1487,6 +1520,20 @@ def _chat_completion_body() -> dict[str, object]:
             }
         ],
         "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4},
+    }
+
+
+def _anthropic_message_body() -> dict[str, object]:
+    """A minimal valid Anthropic messages response."""
+    return {
+        "id": "msg-1",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-opus-5-5",
+        "content": [{"type": "text", "text": "ok"}],
+        "stop_reason": "end_turn",
+        "stop_sequence": None,
+        "usage": {"input_tokens": 3, "output_tokens": 1},
     }
 
 

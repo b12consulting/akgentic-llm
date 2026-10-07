@@ -788,7 +788,7 @@ Providers without native structured output use pydantic-ai's prompt-based extrac
 > per entry: each `fallback_models` entry carries its own routing and never inherits the
 > primary's. `require_parameters: true` makes OpenRouter refuse hosts that ignore a request
 > parameter (e.g. `response_format`), but it does **not** change native-output classification —
-> the vendor-prefix allowlist above stays the sole classifier. Cost is still priced at
+> the model-family allowlist above stays the sole classifier. Cost is still priced at
 > genai-prices' `openrouter` rate, not the pinned host's.
 
 > **Google is API-key only.** The provider factory reads `GOOGLE_API_KEY`, falling back to
