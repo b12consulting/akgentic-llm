@@ -94,9 +94,8 @@ class EventSourcingCapability(AbstractCapability[Any]):
         the graph actually appends to as soon as a node hook hands that list over
         (``_anchor``); this seeding covers the case where no node ever runs.
 
-        The ``finally`` sweeps first and records the system prompt second — in that order,
-        because ``record_system_prompt`` scans the first ``ModelRequest`` in the
-        ``ContextManager``, and on a first run the sweep is what puts one there.
+        The ``finally`` sweeps first and records the system prompt second, so the recorded
+        rendering is never ahead of the messages persisted for the run it belongs to.
         """
         self._rebound = False
         self._history = ctx.messages
@@ -218,6 +217,10 @@ class EventSourcingCapability(AbstractCapability[Any]):
         nothing to correlate. Dedup by rendering hash lives in ``ContextManager`` and is
         untouched: an unchanged rendering emits nothing on the second run.
 
+        The rendering is read off the run's live history, not the ``ContextManager``'s: a
+        later run re-renders dynamic system prompts into a copy of the first request in its
+        own list, and the stored first request keeps the rendering of the run that created it.
+
         Compared against ``_run_start``, not ``_cursor``: the closing sweep has already
         advanced the cursor to the end of the history.
         """
@@ -228,4 +231,4 @@ class EventSourcingCapability(AbstractCapability[Any]):
         run_id = getattr(self._history[-1], "run_id", None)
         if run_id is None:
             return
-        self.context.record_system_prompt(str(run_id))
+        self.context.record_system_prompt(str(run_id), self._history)

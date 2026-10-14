@@ -1,6 +1,7 @@
 """Context management for LLM conversation history."""
 
 import hashlib
+from collections.abc import Sequence
 from typing import Literal
 
 from pydantic_ai.messages import (
@@ -295,14 +296,22 @@ class ContextManager:
             )
         )
 
-    def record_system_prompt(self, run_id: str) -> None:
+    def record_system_prompt(
+        self, run_id: str, messages: Sequence[ModelMessage] | None = None
+    ) -> None:
         """Capture the effective system prompt for a run; emit if it changed.
 
-        Scans the first ``ModelRequest`` in context for ``SystemPromptPart``s
-        (pydantic-ai re-evaluates dynamic parts in place before each model call),
+        Scans the first ``ModelRequest`` of ``messages`` for ``SystemPromptPart``s,
         hashes the ordered ``(dynamic_ref, content)`` sequence, and emits an
         ``LlmSystemPromptEvent`` only when the hash differs from the last
         recorded one. Implements ADR-004 §2.
+
+        Pass the run's own history: pydantic-ai re-renders dynamic parts into a
+        **copy** of the first request in that list and never touches the
+        caller's ``message_history`` (since pydantic-ai 2.56), so this context's
+        stored first request keeps the rendering of the run that created it.
+        ``messages`` defaults to this context's history, which is only current
+        for the run that first stored the system prompt.
 
         No event is emitted when there is no first ``ModelRequest``, when it has
         no ``SystemPromptPart``s, or when the rendering is unchanged since the
@@ -310,8 +319,10 @@ class ContextManager:
 
         Args:
             run_id: The ReactAgent run ID this rendering belongs to.
+            messages: The history the run actually sent; defaults to this
+                context's own.
         """
-        snapshots = self._snapshot_system_parts()
+        snapshots = self._snapshot_system_parts(self._messages if messages is None else messages)
         if not snapshots:
             return
         content_hash = self._hash_parts(snapshots)
@@ -333,15 +344,21 @@ class ContextManager:
         """
         self._last_system_prompt_hash = content_hash
 
-    def _snapshot_system_parts(self) -> list[SystemPromptPartSnapshot]:
+    @staticmethod
+    def _snapshot_system_parts(
+        messages: Sequence[ModelMessage],
+    ) -> list[SystemPromptPartSnapshot]:
         """Snapshot the first ModelRequest's system parts, in model order.
+
+        Args:
+            messages: The history to scan.
 
         Returns:
             One snapshot per ``SystemPromptPart`` on the first ``ModelRequest``,
             in part order. Empty if there is no first ``ModelRequest`` or it has
             no system parts.
         """
-        first_request = next((m for m in self._messages if isinstance(m, ModelRequest)), None)
+        first_request = next((m for m in messages if isinstance(m, ModelRequest)), None)
         if first_request is None:
             return []
         return [

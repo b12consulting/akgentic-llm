@@ -111,12 +111,13 @@ class SystemPromptPartSnapshot:
 class LlmSystemPromptEvent:
     """Event emitted when the effective system prompt for a run changes.
 
-    pydantic-ai re-evaluates dynamic system prompts in place before each model
-    call, so the rendering can differ run-to-run without an ``LlmMessageEvent``
-    being emitted. ``ContextManager.record_system_prompt`` records the effective
-    rendering once per run and emits this event only when the rendering's hash
-    differs from the previous one (including the first run, where the hash
-    transitions from ``None``). See ADR-004 for the full rationale.
+    pydantic-ai re-renders dynamic system prompts at the start of every run, into
+    a copy of the run's first request, so the rendering can differ run-to-run
+    without an ``LlmMessageEvent`` being emitted.
+    ``ContextManager.record_system_prompt`` records the effective rendering once
+    per run and emits this event only when the rendering's hash differs from the
+    previous one (including the first run, where the hash transitions from
+    ``None``). See ADR-004 for the full rationale.
 
     Each event is self-contained: ``parts`` is the full rendering in model order,
     not a diff, so no reconstruction from prior events is required.

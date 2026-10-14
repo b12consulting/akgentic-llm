@@ -383,13 +383,11 @@ async def test_changed_rendering_emits_a_second_event() -> None:
     assert events[0].content_hash != events[1].content_hash
 
 
-async def test_the_sweep_runs_before_the_system_prompt_recording() -> None:
-    """The closing sweep must put the first ModelRequest in place first (AC #6, Trap 2).
+async def test_a_cancelled_run_still_persists_and_records_its_rendering() -> None:
+    """A run cancelled before any persisting node boundary still records both (AC #6).
 
-    ``record_system_prompt`` scans the first ``ModelRequest`` **in the ContextManager**. Here
-    the run is cancelled before any node boundary that would have persisted it, so the
-    ``finally``'s sweep is the only thing that puts one there. Record before sweep and the
-    scan finds an empty context, so the rendering is silently never recorded.
+    The ``finally``'s sweep is the only thing that persists this run's messages, and the
+    rendering is read off the run's live history, so both must survive the cancellation.
     """
     context, capture = _manager_with_capture()
     agent: Agent[None, str] = Agent(
