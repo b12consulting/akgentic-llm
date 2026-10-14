@@ -1553,11 +1553,11 @@ A consumer receiving `ToolCallEvent` can safely assume the full message is alrea
 
 ### System Prompt Rendering Events
 
-pydantic-ai re-evaluates dynamic system prompts (date, roster, role profiles, mailbox
-notices, …) **in place** before each model call, so the rendering actually sent to the
-model can change on runs 2+ without any `LlmMessageEvent` being emitted. `LlmSystemPromptEvent`
-records that effective rendering so observers (traces, frontends) can show exactly what the
-model saw on each run.
+pydantic-ai re-renders dynamic system prompts at the start of every run, into a **copy** of the
+first request in the run's own history — the `ContextManager`'s stored request keeps the
+rendering of the run that created it, and no `LlmMessageEvent` is emitted for the new one.
+`LlmSystemPromptEvent` records the effective rendering so observers (traces, frontends) can
+show exactly what the model saw on each run.
 
 **`LlmSystemPromptEvent` payload:**
 
@@ -1574,9 +1574,9 @@ model saw on each run.
 | `dynamic_ref` | `str \| None` | Function name for dynamic parts (registered via `@agent.system_prompt(dynamic=True)`); `None` for static parts |
 | `content` | `str` | Rendered text actually sent to the model for this part |
 
-**Emission semantics:** emitted by `ContextManager.record_system_prompt(run_id)`, which
-`ReactAgent` calls **once per completed run** after pydantic-ai's in-place re-evaluation has
-produced the rendering. It scans the first `ModelRequest`'s system parts, hashes the ordered
+**Emission semantics:** emitted by `ContextManager.record_system_prompt(run_id, messages)`,
+which `ReactAgent`'s event-sourcing capability calls **once per run**, however it ends, with the
+run's own history. It scans the first `ModelRequest`'s system parts, hashes the ordered
 `(dynamic_ref, content)` pairs, and emits **only when the content hash changed** since the
 previous run — run 1 emits via the `None → hash` transition; an unchanged rendering on later
 runs emits nothing, so the log does not grow with every run; a context with no system parts
