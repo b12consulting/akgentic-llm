@@ -86,8 +86,28 @@ def _is_retryable_http_error(exc: BaseException) -> bool:
         return True
     if not isinstance(exc, httpx2.HTTPStatusError):
         return False
-    status = exc.response.status_code
+    return _is_retryable_status(exc.response.status_code)
+
+
+def _is_retryable_status(status: int) -> bool:
+    """Return True for the HTTP statuses the retry policy retries: 429 and 5xx."""
     return status == 429 or 500 <= status < 600
+
+
+def _raise_for_retryable_status(response: httpx2.Response) -> None:
+    """Raise ``httpx2.HTTPStatusError`` for a retryable status, and only for one.
+
+    The transport's ``validate_response`` hook. Retrying needs an exception, so a
+    429 or 5xx is raised here for the retry policy to catch. Any other status is
+    returned to the caller untouched, with its body unread: the provider SDK then
+    reads it and raises its own typed error with the server's message (an Azure
+    content-filter refusal, a schema error, an over-long context). Raised here,
+    the transport would close the response first, and every one of them would
+    reach the caller as a bodiless ``HTTPStatusError``, which the OpenAI SDK
+    reports as a connection error.
+    """
+    if _is_retryable_status(response.status_code):
+        response.raise_for_status()
 
 
 def get_output_type[T](
@@ -219,7 +239,9 @@ def create_http_client(
     Error Handling:
         - 429 / 5xx → ``httpx2.HTTPStatusError`` raised internally, retried
           automatically until ``max_attempts`` is exhausted (then re-raised)
-        - 4xx (non-429) → ``httpx2.HTTPStatusError`` raised immediately
+        - Any other non-2xx status (4xx other than 429) → returned as the response,
+          not raised and not retried, so the provider SDK reads its body and raises
+          its own typed error with the server's message
         - Timeout → ``httpx2.TimeoutException`` raised immediately
 
     Args:
@@ -259,7 +281,7 @@ def create_http_client(
             stop=stop_after_attempt(max_attempts),
             reraise=True,
         ),
-        validate_response=lambda r: r.raise_for_status(),
+        validate_response=_raise_for_retryable_status,
     )
 
     return httpx2.AsyncClient(
