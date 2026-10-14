@@ -17,6 +17,8 @@ from akgentic.llm import providers
 from akgentic.llm.config import ModelConfig, OpenRouterRouting
 from akgentic.llm.providers import (
     _is_retryable_http_error,
+    _is_retryable_status,
+    _raise_for_retryable_status,
     _supports_native_output,
     create_http_client,
     create_model,
@@ -390,6 +392,26 @@ class TestIsRetryableHttpError:
         assert _is_retryable_http_error(httpx2.TimeoutException("timeout")) is False
 
 
+class TestRaiseForRetryableStatus:
+    """The transport's validator raises exactly what the retry policy retries."""
+
+    @pytest.mark.parametrize("status", [429, 500, 502, 503, 504])
+    def test_a_retryable_status_is_raised(self, status: int) -> None:
+        request = httpx2.Request("POST", "https://api.example.com/test")
+        with pytest.raises(httpx2.HTTPStatusError):
+            _raise_for_retryable_status(httpx2.Response(status, request=request))
+
+    @pytest.mark.parametrize("status", [200, 201, 400, 401, 403, 404, 409, 422])
+    def test_any_other_status_is_left_to_the_caller(self, status: int) -> None:
+        request = httpx2.Request("POST", "https://api.example.com/test")
+        _raise_for_retryable_status(httpx2.Response(status, request=request))
+
+    @pytest.mark.parametrize("status", [400, 401, 404, 429, 500, 503, 599, 600])
+    def test_it_agrees_with_the_retry_predicate(self, status: int) -> None:
+        """One definition of retryable: the validator and the predicate never drift."""
+        assert _is_retryable_status(status) is _is_retryable_http_error(_make_status_error(status))
+
+
 # ---------------------------------------------------------------------------
 # create_http_client tests
 # ---------------------------------------------------------------------------
@@ -502,28 +524,33 @@ class TestCreateHttpClient:
         assert call_count == 3
 
     @pytest.mark.asyncio
-    async def test_no_retry_on_400(self) -> None:
-        """Client raises immediately on 400 (no retry)."""
+    async def test_no_retry_on_400_and_the_body_is_readable(self) -> None:
+        """A 400 is returned once, not retried and not raised, with its body readable.
+
+        Raising it in the transport would close the response unread, and the SDK
+        would report a bodiless error as a connection error.
+        """
         call_count = 0
 
         async def always_400(req: httpx2.Request) -> httpx2.Response:
             nonlocal call_count
             call_count += 1
-            return httpx2.Response(400, request=req)
+            return httpx2.Response(400, json={"error": {"code": "bad"}}, request=req)
 
         client = create_http_client(max_attempts=5, exp_multiplier=0.01, exp_max_s=0.05)
         assert isinstance(client._transport, AsyncHTTPX2TenacityTransport)
         with patch.object(
             client._transport.wrapped, "handle_async_request", side_effect=always_400
         ):
-            with pytest.raises(httpx2.HTTPStatusError):
-                await client.get("https://api.example.com/test")
+            response = await client.get("https://api.example.com/test")
 
+        assert response.status_code == 400
+        assert response.json() == {"error": {"code": "bad"}}
         assert call_count == 1
 
     @pytest.mark.asyncio
     async def test_no_retry_on_404(self) -> None:
-        """Client raises immediately on 404 (no retry)."""
+        """A 404 is returned once, not retried and not raised."""
         call_count = 0
 
         async def always_404(req: httpx2.Request) -> httpx2.Response:
@@ -536,10 +563,45 @@ class TestCreateHttpClient:
         with patch.object(
             client._transport.wrapped, "handle_async_request", side_effect=always_404
         ):
-            with pytest.raises(httpx2.HTTPStatusError):
-                await client.get("https://api.example.com/test")
+            response = await client.get("https://api.example.com/test")
 
+        assert response.status_code == 404
         assert call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_a_content_filter_400_reaches_the_sdk_with_its_body(self) -> None:
+        """An Azure content-filter refusal arrives as the SDK's typed error, readable.
+
+        Before, the transport raised the 400 unread, and the OpenAI SDK reported a
+        connection error with no code and no categories.
+        """
+        import openai
+
+        body = {
+            "error": {
+                "code": "content_filter",
+                "message": "The response was filtered.",
+                "innererror": {
+                    "code": "ResponsibleAIPolicyViolation",
+                    "content_filter_result": {"jailbreak": {"detected": True, "filtered": True}},
+                },
+            }
+        }
+
+        async def refuse(req: httpx2.Request) -> httpx2.Response:
+            return httpx2.Response(400, json=body, request=req)
+
+        client = create_http_client(max_attempts=5, exp_multiplier=0.01, exp_max_s=0.05)
+        assert isinstance(client._transport, AsyncHTTPX2TenacityTransport)
+        sdk = openai.AsyncOpenAI(
+            api_key="test", base_url="https://api.example.com/v1", http_client=client, max_retries=0
+        )
+        with patch.object(client._transport.wrapped, "handle_async_request", side_effect=refuse):
+            with pytest.raises(openai.BadRequestError) as caught:
+                await sdk.responses.create(model="gpt-test", input="hi")
+
+        assert caught.value.status_code == 400
+        assert caught.value.code == "content_filter"
 
     @pytest.mark.asyncio
     async def test_success_without_retry(self) -> None:
