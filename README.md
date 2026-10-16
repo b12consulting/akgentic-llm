@@ -61,7 +61,11 @@ call any LLM without coupling to a specific vendor or framework primitive.
   output types with `NativeOutput` for providers that support structured output, falls back to
   prompt-based extraction for those that don't
 - **HTTP retry** — `create_http_client()` configures `AsyncHTTPX2TenacityTransport` with exponential
-  backoff, jitter, and `Retry-After` header support; fast-fails on 4xx (except 429)
+  backoff, jitter, and `Retry-After` header support; retries 429, 5xx and transient network
+  errors only. Any other non-2xx status is returned untouched to the provider SDK, which reads
+  its body and raises its typed error (pydantic-ai's `ModelHTTPError` with `status_code` and
+  `body`, or `ContentFilterError` for an Azure content-filter refusal) instead of a bodiless
+  connection error
 - **Context management** — `ContextManager` tracks message history across multiple `run()` calls,
   folds it into a summary on compaction or drops it outright on clear, and applies a sliding
   window (system messages always preserved) when a message cap is configured
@@ -830,6 +834,12 @@ Two rules are enforced when the config is constructed: the chain is flat (an ent
 its own `fallback_models`), and every entry must agree with the primary on native structured-output
 support, because that wrapper is chosen once from the primary's provider before any request is sent.
 `context_length` stays primary-only: a fallback firing mid-run does not change the compaction budget.
+
+A content-filter refusal is **not** an API failure and does not advance the chain: an Azure
+`content_filter` 400 comes back as a response with `finish_reason='content_filter'`, and the run
+raises pydantic-ai's `ContentFilterError` from the model that refused. Any other non-2xx status
+(400 schema error, 401, over-long context …) does advance it, as a `ModelHTTPError` carrying the
+server's status and body.
 
 Every entry is built eagerly, when the agent is constructed — not lazily, on the first failure. That
 is what makes a bad entry fail loudly and early, but it also means each entry's credentials and
