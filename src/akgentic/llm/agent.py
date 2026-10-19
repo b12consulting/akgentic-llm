@@ -138,21 +138,23 @@ class ReactAgent:
             result_type: Type for agent result validation (default: str)
             observer: Context observer to register automatically (optional)
             capabilities: Optional sequence of pydantic-ai AgentCapability instances.
-                They are NOT forwarded unchanged: four internal capabilities —
+                They are NOT forwarded unchanged: five internal capabilities —
                 LifetimeBudgetCapability, then CompactionCapability, then
-                EventSourcingCapability, then LimitRecoveryCapability — are mounted
-                ahead of them, because those four own the agent-lifetime budget,
-                auto-compaction, persistence, system-prompt recording and the run-tier
-                recovery decision (whether a breached turn concludes instead of raising
-                — see `limit_recovery` below) for every run this agent drives. The
-                budget is outermost so a run it refuses reaches none of the others —
+                EventSourcingCapability, then LimitRecoveryCapability, then
+                MergeableOutputCapability — are mounted ahead of them, because those
+                five own the agent-lifetime budget, auto-compaction, persistence,
+                system-prompt recording, the run-tier recovery decision (whether a
+                breached turn concludes instead of raising — see `limit_recovery`
+                below) and the merge of a split MergeableOutput for every run this
+                agent drives.
+                The budget is outermost so a run it refuses reaches none of the others —
                 including the summarizer LLM call.
                 That is the MOUNT order, and it is a default rather than a guarantee:
                 pydantic-ai's CombinedCapability topologically re-sorts the whole chain
                 as soon as ANY capability declares get_ordering(), so a caller declaring
-                position='outermost' — or wraps=[...] naming one of the four — lands
-                ahead of them. None of the four declares an ordering, so a caller that
-                declares nothing does sit inside all four, and the two consequences below
+                position='outermost' — or wraps=[...] naming one of the five — lands
+                ahead of them. None of the five declares an ordering, so a caller that
+                declares nothing does sit inside all five, and the two consequences below
                 hold for that caller. A caller that re-sorts itself gets neither.
                 First: a capability sees only the POST-compaction history, never what
                 compaction folded away — the fold happens in CompactionCapability's

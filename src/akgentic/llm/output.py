@@ -115,23 +115,27 @@ def merge_outputs(raw: str, output_type: type[MergeableOutput]) -> str | None:
 
     Returns:
         The merged output as JSON; ``None`` when ``raw`` is a single object, is not
-        entirely JSON objects, or holds one that does not validate — validation then
-        reports it as usual.
+        entirely JSON objects, holds one that does not validate, or the schema refuses
+        their merge — validation then reports it as usual.
     """
     decoder = json.JSONDecoder()
     outputs: list[MergeableOutput] = []
     index, end = 0, len(raw.rstrip(_JSON_WHITESPACE))
     while index < end:
         # raw_decode rejects leading space
-        index = len(raw) - len(raw[index:].lstrip(_JSON_WHITESPACE))
+        start = len(raw) - len(raw[index:].lstrip(_JSON_WHITESPACE))
         try:
-            value, index = decoder.raw_decode(raw, index)
-            outputs.append(output_type.model_validate(value))
+            _, index = decoder.raw_decode(raw, start)
+            # JSON mode, as pydantic-ai validates the text: strict fields differ in Python mode
+            outputs.append(output_type.model_validate_json(raw[start:index]))
         except (ValueError, RecursionError):  # ValidationError is a ValueError
             return None
     if len(outputs) < 2:
         return None
-    return output_type.merge(outputs).model_dump_json(by_alias=True)
+    try:
+        return output_type.merge(outputs).model_dump_json(by_alias=True)
+    except ValidationError:  # raised here, it would skip unreadable_output_error
+        return None
 
 
 def error_lines(error: ValidationError) -> list[str]:

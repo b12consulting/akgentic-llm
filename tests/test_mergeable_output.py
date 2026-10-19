@@ -2,12 +2,13 @@
 
 import asyncio
 from collections.abc import Sequence
+from datetime import datetime
 from types import SimpleNamespace
 from typing import Any, Self
 from unittest.mock import MagicMock
 
 import pytest
-from pydantic import ValidationError
+from pydantic import ConfigDict, Field, ValidationError
 from pydantic_ai import ModelRetry
 from pydantic_ai.messages import ModelMessage, ModelResponse, RetryPromptPart, TextPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
@@ -35,6 +36,27 @@ class _Told(_Notes):
     @classmethod
     def unreadable_output_error(cls, error: ValidationError) -> str:
         return "Nothing was kept."
+
+
+class _Stamped(MergeableOutput):
+    model_config = ConfigDict(strict=True)
+    at: list[datetime]
+
+    @classmethod
+    def merge(cls, outputs: Sequence[Self]) -> Self:
+        return cls(at=[at for output in outputs for at in output.at])
+
+
+class _Aliased(MergeableOutput):
+    notes: list[str] = Field(alias="Notes")
+
+    @classmethod
+    def merge(cls, outputs: Sequence[Self]) -> Self:
+        return cls.model_validate({"Notes": [note for output in outputs for note in output.notes]})
+
+
+class _Capped(_Notes):
+    notes: list[str] = Field(max_length=2)
 
 
 def _parse_error(raw: str = '{"notes": []}Done.') -> ValidationError:
@@ -72,6 +94,21 @@ class TestTheMerge:
     def test_the_text_is_kept_as_written(self) -> None:
         assert merge_outputs('{"notes": ["I’ve"]}{"notes": []}', _Notes) == '{"notes":["I’ve"]}'
 
+    def test_each_object_is_validated_as_json_like_pydantic_ai_does(self) -> None:
+        one = '{"at": ["2026-10-19T00:00:00"]}'
+
+        merged = merge_outputs(one + one, _Stamped)
+
+        assert merged == '{"at":["2026-10-19T00:00:00","2026-10-19T00:00:00"]}'
+
+    def test_the_merge_is_serialised_by_alias(self) -> None:
+        merged = merge_outputs('{"Notes": ["a"]}{"Notes": ["b"]}', _Aliased)
+
+        assert merged == '{"Notes":["a","b"]}'
+
+    def test_a_merge_the_schema_refuses_is_left_to_validation(self) -> None:
+        assert merge_outputs('{"notes": ["a", "b"]}{"notes": ["c"]}', _Capped) is None
+
     @pytest.mark.parametrize(
         "raw",
         [
@@ -80,6 +117,7 @@ class TestTheMerge:
             '{"notes": []}Done.',
             '{"notes": []}{"notes": [',
             '{"notes": []}{"other": []}',
+            '{"notes": ["a"]}{"other": []}{"notes": ["b"]}',
             '{"notes": []}[]',
             '{"notes": []} {"notes": []}',
             '{"notes": []}{"notes": [' + "9" * 5000 + "]}",
@@ -92,6 +130,7 @@ class TestTheMerge:
             "trailing prose",
             "truncated second object",
             "an object that does not validate",
+            "one that does not validate between two that do",
             "not an object",
             "not JSON whitespace between",
             "an int past the digit limit",
@@ -132,10 +171,10 @@ class TestAnUnreadableOutput:
         assert lines[2] == "Resend your whole reply as exactly ONE JSON object."
 
     def test_a_field_error_is_located_without_the_input(self) -> None:
-        text = _Notes.unreadable_output_error(_parse_error('{"notes": "x"}'))
+        text = _Notes.unreadable_output_error(_parse_error('{"notes": "rejected-input"}'))
 
         assert "- notes: Input should be a valid array" in text
-        assert '"x"' not in text  # the raw output is already in context
+        assert "rejected-input" not in text  # the raw output is already in context
 
     def test_the_schema_words_its_own_retry(self) -> None:
         with pytest.raises(ModelRetry) as raised:
