@@ -510,7 +510,11 @@ async def test_a_timeout_is_not_converted_into_a_response(monkeypatch: pytest.Mo
 async def test_every_provider_surfaces_an_exhausted_429_as_a_typed_error(
     provider: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """No provider lets a raw ``HTTPStatusError`` escape on an exhausted rate limit."""
+    """No provider lets a raw ``HTTPStatusError`` escape on an exhausted rate limit.
+
+    The message is asserted too: Anthropic's SDK raises a typed 429 even when the
+    body is lost, so type and status alone would not notice the buffer missing.
+    """
     model, env = {**_STAINLESS_CASES, **_OTHER_CASES}[provider]
     _set_env(monkeypatch, env)
     recorder = _Recorder(_always_json(429, _RATE_LIMIT_BODY))
@@ -520,6 +524,7 @@ async def test_every_provider_surfaces_an_exhausted_429_as_a_typed_error(
 
     assert len(recorder.requests) == _MAX_ATTEMPTS
     assert caught.value.status_code == 429
+    assert _RATE_LIMIT_MESSAGE in str(caught.value)
 
 
 async def test_aclose_reaches_the_base_transport() -> None:

@@ -67,7 +67,8 @@ call any LLM without coupling to a specific vendor or framework primitive.
   `body`, or `ContentFilterError` for an Azure content-filter refusal) instead of a bodiless
   connection error. An exhausted 429/5xx is likewise returned to the SDK with its body and
   surfaces as `ModelHTTPError`, so a fallback chain advances on it; a 429 whose body says
-  `insufficient_quota` is not retried. The provider SDKs are built with `max_retries = 0`, so
+  `insufficient_quota` is not retried. The OpenAI, Azure, Anthropic, NVIDIA and OpenRouter SDK
+  clients are built with `max_retries = 0` and the Google and Mistral clients do not retry, so
   this transport is the only retry layer
 - **Context management** — `ContextManager` tracks message history across multiple `run()` calls,
   folds it into a summary on compaction or drops it outright on clear, and applies a sliding

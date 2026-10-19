@@ -559,13 +559,17 @@ class TestCreateHttpClient:
         A deliberate change of contract: an exhausted 429/5xx used to escape as a
         bodiless ``httpx2.HTTPStatusError``. It is now a response, as a non-retryable
         4xx already was, so a provider SDK can read it and raise its typed error.
+
+        The body is sent unread (``stream=``): a ``json=`` response reads itself in
+        its constructor, so it would stay readable even with the body buffer gone.
         """
         call_count = 0
 
         async def always_500(req: httpx2.Request) -> httpx2.Response:
             nonlocal call_count
             call_count += 1
-            return httpx2.Response(500, json={"error": {"message": "down"}}, request=req)
+            body = httpx2.ByteStream(b'{"error": {"message": "down"}}')
+            return httpx2.Response(500, stream=body, request=req)
 
         client = create_http_client(max_attempts=3, exp_multiplier=0.01, exp_max_s=0.05)
         with patch.object(_base_transport(client), "handle_async_request", side_effect=always_500):
