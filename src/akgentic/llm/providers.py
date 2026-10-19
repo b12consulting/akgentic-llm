@@ -33,9 +33,11 @@ Example:
 
 import logging
 import os
-from typing import TYPE_CHECKING, Any, cast
+from types import TracebackType
+from typing import TYPE_CHECKING, Any, Self, cast
 
 import httpx2
+from pydantic import BaseModel, ValidationError
 from pydantic_ai import NativeOutput
 from pydantic_ai.models import Model
 from pydantic_ai.models.fallback import FallbackModel
@@ -67,6 +69,31 @@ _RETRYABLE_NETWORK_ERRORS = (
 )
 
 
+class _ProviderErrorDetail(BaseModel):
+    """The ``error`` object of a provider's JSON error body; only ``type`` is read."""
+
+    type: str | None = None
+
+
+class _ProviderErrorBody(BaseModel):
+    """A provider's JSON error body, in the ``{"error": {...}}`` shape OpenAI uses."""
+
+    error: _ProviderErrorDetail | None = None
+
+
+def _is_insufficient_quota(response: httpx2.Response) -> bool:
+    """Return True if the body says ``error.type == "insufficient_quota"`` (no credits left).
+
+    Never raises, because it runs inside the retry predicate: a body that was never
+    read, or is empty, not JSON, or shaped otherwise, is not a quota error.
+    """
+    try:
+        parsed = _ProviderErrorBody.model_validate_json(response.content)
+    except (httpx2.ResponseNotRead, ValidationError):
+        return False
+    return parsed.error is not None and parsed.error.type == "insufficient_quota"
+
+
 def _is_retryable_http_error(exc: BaseException) -> bool:
     """Return True if the exception represents a retryable failure.
 
@@ -74,7 +101,9 @@ def _is_retryable_http_error(exc: BaseException) -> bool:
     - HTTP 429 (rate limit) and 5xx (server errors)
     - Transient network errors: ConnectError, RemoteProtocolError, ReadError, WriteError
 
-    Does NOT retry on 4xx client errors (except 429) or timeouts.
+    Does NOT retry on 4xx client errors (except 429) or timeouts, nor on a 429 whose
+    body says ``error.type == "insufficient_quota"``: a billing failure, which no
+    amount of waiting fixes.
 
     Args:
         exc: The exception to evaluate.
@@ -86,7 +115,10 @@ def _is_retryable_http_error(exc: BaseException) -> bool:
         return True
     if not isinstance(exc, httpx2.HTTPStatusError):
         return False
-    return _is_retryable_status(exc.response.status_code)
+    status = exc.response.status_code
+    if status == 429 and _is_insufficient_quota(exc.response):
+        return False
+    return _is_retryable_status(status)
 
 
 def _is_retryable_status(status: int) -> bool:
@@ -108,6 +140,48 @@ def _raise_for_retryable_status(response: httpx2.Response) -> None:
     """
     if _is_retryable_status(response.status_code):
         response.raise_for_status()
+
+
+class _WrappingTransport(httpx2.AsyncBaseTransport):
+    """A transport over another one, to which it delegates its whole lifecycle."""
+
+    def __init__(self, wrapped: httpx2.AsyncBaseTransport) -> None:
+        self.wrapped = wrapped
+
+    async def __aenter__(self) -> Self:
+        await self.wrapped.__aenter__()
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None = None,
+        exc_value: BaseException | None = None,
+        traceback: TracebackType | None = None,
+    ) -> None:
+        await self.wrapped.__aexit__(exc_type, exc_value, traceback)
+
+    async def aclose(self) -> None:
+        await self.wrapped.aclose()
+
+
+class _BufferErrorBody(_WrappingTransport):
+    """Read the body of a retryable status, so it survives the retry layer closing it."""
+
+    async def handle_async_request(self, request: httpx2.Request) -> httpx2.Response:
+        response = await self.wrapped.handle_async_request(request)
+        if _is_retryable_status(response.status_code):
+            await response.aread()
+        return response
+
+
+class _ReturnFinalStatus(_WrappingTransport):
+    """Return the last retryable status once retries are exhausted, instead of raising it."""
+
+    async def handle_async_request(self, request: httpx2.Request) -> httpx2.Response:
+        try:
+            return await self.wrapped.handle_async_request(request)
+        except httpx2.HTTPStatusError as exc:
+            return exc.response
 
 
 def get_output_type[T](
@@ -230,6 +304,7 @@ def create_http_client(
         - ``Retry-After`` header parsed and honoured (capped at ``retry_after_cap_s``)
         - Fallback: randomised exponential backoff with jitter
         - Fast-fail on 4xx errors other than 429 and on timeouts
+        - A 429 whose body is ``error.type == "insufficient_quota"`` is not retried
 
     Timeout Behavior:
         All requests use ``timeout_s`` as a total per-request timeout.
@@ -237,12 +312,18 @@ def create_http_client(
         raises ``httpx2.TimeoutException``.
 
     Error Handling:
-        - 429 / 5xx → ``httpx2.HTTPStatusError`` raised internally, retried
-          automatically until ``max_attempts`` is exhausted (then re-raised)
+        - 429 / 5xx → retried until ``max_attempts`` is exhausted, then the **last
+          response is returned**, its body already read, so the provider SDK raises
+          its own typed error with the server's message (pydantic-ai's
+          ``ModelHTTPError``, on which a ``FallbackModel`` advances)
         - Any other non-2xx status (4xx other than 429) → returned as the response,
           not raised and not retried, so the provider SDK reads its body and raises
           its own typed error with the server's message
         - Timeout → ``httpx2.TimeoutException`` raised immediately
+
+    A direct caller therefore receives an exhausted 429/5xx as a response, not an
+    exception: the same contract a non-retryable 4xx already has. Within akgentic
+    the client is only handed to provider SDKs.
 
     Args:
         timeout_s: Per-request timeout in seconds. Default: 120.0.
@@ -281,11 +362,12 @@ def create_http_client(
             stop=stop_after_attempt(max_attempts),
             reraise=True,
         ),
+        wrapped=_BufferErrorBody(httpx2.AsyncHTTPTransport()),
         validate_response=_raise_for_retryable_status,
     )
 
     return httpx2.AsyncClient(
-        transport=transport,
+        transport=_ReturnFinalStatus(transport),
         timeout=timeout_s,
     )
 

@@ -32,13 +32,30 @@ from akgentic.llm.providers import (
 
 
 def _make_status_error(
-    status_code: int, headers: dict[str, str] | None = None
+    status_code: int, headers: dict[str, str] | None = None, body: bytes | None = None
 ) -> httpx2.HTTPStatusError:
-    """Build an httpx2.HTTPStatusError for a given status code."""
+    """Build an httpx2.HTTPStatusError for a given status code, with an optional read body."""
     headers = headers or {}
     request = httpx2.Request("GET", "https://api.example.com/test")
-    response = httpx2.Response(status_code=status_code, headers=headers, request=request)
+    response = httpx2.Response(
+        status_code=status_code, headers=headers, content=body, request=request
+    )
     return httpx2.HTTPStatusError(f"HTTP {status_code}", request=request, response=response)
+
+
+def _base_transport(client: httpx2.AsyncClient) -> httpx2.AsyncBaseTransport:
+    """Return the transport at the bottom of ``create_http_client()``'s chain.
+
+    Patching it keeps every request passing through the body buffer and the retry
+    layer above it. Patching the buffer itself would take it out of the path.
+    """
+    outer = client._transport
+    assert isinstance(outer, providers._ReturnFinalStatus)
+    retrying = outer.wrapped
+    assert isinstance(retrying, AsyncHTTPX2TenacityTransport)
+    buffer = retrying.wrapped
+    assert isinstance(buffer, providers._BufferErrorBody)
+    return buffer.wrapped
 
 
 class _TestModel(BaseModel):
@@ -391,6 +408,40 @@ class TestIsRetryableHttpError:
     def test_timeout_not_retryable(self) -> None:
         assert _is_retryable_http_error(httpx2.TimeoutException("timeout")) is False
 
+    def test_insufficient_quota_429_not_retryable(self) -> None:
+        """A billing failure is not a rate limit: retrying it only delays the same answer."""
+        body = (
+            b'{"error": {"message": "You have no credits remaining", "type": "insufficient_quota"}}'
+        )
+        assert _is_retryable_http_error(_make_status_error(429, body=body)) is False
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            b'{"error": {"message": "Rate limit reached", "type": "rate_limit_exceeded"}}',
+            b"",
+            b"<html>Too Many Requests</html>",
+            b"[]",
+            b'{"error": "a string"}',
+            b'{"error": {"type": null}}',
+        ],
+        ids=["rate-limit", "empty", "non-json", "json-array", "error-string", "type-null"],
+    )
+    def test_any_other_429_body_stays_retryable(self, body: bytes) -> None:
+        assert _is_retryable_http_error(_make_status_error(429, body=body)) is True
+
+    def test_a_429_never_read_stays_retryable(self) -> None:
+        """The predicate runs inside tenacity, so an unread body must not make it raise."""
+        request = httpx2.Request("GET", "https://api.example.com/test")
+        response = httpx2.Response(429, stream=httpx2.AsyncByteStream(), request=request)
+        exc = httpx2.HTTPStatusError("HTTP 429", request=request, response=response)
+        assert _is_retryable_http_error(exc) is True
+
+    def test_insufficient_quota_on_a_5xx_stays_retryable(self) -> None:
+        """Only a 429 fails fast on the quota body; a server error is retried whatever it says."""
+        body = b'{"error": {"type": "insufficient_quota"}}'
+        assert _is_retryable_http_error(_make_status_error(503, body=body)) is True
+
 
 class TestRaiseForRetryableStatus:
     """The transport's validator raises exactly what the retry policy retries."""
@@ -429,10 +480,14 @@ class TestCreateHttpClient:
         """Client uses pydantic-ai's AsyncHTTPX2TenacityTransport, not the deprecated one.
 
         The name matters: ``AsyncTenacityTransport`` still exists upstream and still
-        imports cleanly, so the wrong one type-checks here and fails at runtime.
+        imports cleanly, so the wrong one type-checks here and fails at runtime. It sits
+        between the transport that returns the final status and the body buffer.
         """
         client = create_http_client()
-        assert isinstance(client._transport, AsyncHTTPX2TenacityTransport)
+        assert isinstance(client._transport, providers._ReturnFinalStatus)
+        retrying = client._transport.wrapped
+        assert isinstance(retrying, AsyncHTTPX2TenacityTransport)
+        assert isinstance(retrying.wrapped, providers._BufferErrorBody)
 
     def test_custom_timeout(self) -> None:
         """Client timeout reflects timeout_s parameter."""
@@ -468,10 +523,7 @@ class TestCreateHttpClient:
             return resp
 
         client = create_http_client(max_attempts=5, exp_multiplier=0.01, exp_max_s=0.05)
-        assert isinstance(client._transport, AsyncHTTPX2TenacityTransport)
-        with patch.object(
-            client._transport.wrapped, "handle_async_request", side_effect=fake_handle
-        ):
+        with patch.object(_base_transport(client), "handle_async_request", side_effect=fake_handle):
             response = await client.get("https://api.example.com/test")
 
         assert response.status_code == 200
@@ -494,10 +546,7 @@ class TestCreateHttpClient:
             return resp
 
         client = create_http_client(max_attempts=3, exp_multiplier=0.01, exp_max_s=0.05)
-        assert isinstance(client._transport, AsyncHTTPX2TenacityTransport)
-        with patch.object(
-            client._transport.wrapped, "handle_async_request", side_effect=fake_handle
-        ):
+        with patch.object(_base_transport(client), "handle_async_request", side_effect=fake_handle):
             response = await client.get("https://api.example.com/test")
 
         assert response.status_code == 200
@@ -505,22 +554,25 @@ class TestCreateHttpClient:
 
     @pytest.mark.asyncio
     async def test_max_retries_enforced(self) -> None:
-        """Client raises after max_attempts exhausted."""
+        """After max_attempts, the last 5xx is returned with its body, not raised.
+
+        A deliberate change of contract: an exhausted 429/5xx used to escape as a
+        bodiless ``httpx2.HTTPStatusError``. It is now a response, as a non-retryable
+        4xx already was, so a provider SDK can read it and raise its typed error.
+        """
         call_count = 0
 
         async def always_500(req: httpx2.Request) -> httpx2.Response:
             nonlocal call_count
             call_count += 1
-            return httpx2.Response(500, request=req)
+            return httpx2.Response(500, json={"error": {"message": "down"}}, request=req)
 
         client = create_http_client(max_attempts=3, exp_multiplier=0.01, exp_max_s=0.05)
-        assert isinstance(client._transport, AsyncHTTPX2TenacityTransport)
-        with patch.object(
-            client._transport.wrapped, "handle_async_request", side_effect=always_500
-        ):
-            with pytest.raises(httpx2.HTTPStatusError):
-                await client.get("https://api.example.com/test")
+        with patch.object(_base_transport(client), "handle_async_request", side_effect=always_500):
+            response = await client.get("https://api.example.com/test")
 
+        assert response.status_code == 500
+        assert response.json() == {"error": {"message": "down"}}
         assert call_count == 3
 
     @pytest.mark.asyncio
@@ -538,10 +590,7 @@ class TestCreateHttpClient:
             return httpx2.Response(400, json={"error": {"code": "bad"}}, request=req)
 
         client = create_http_client(max_attempts=5, exp_multiplier=0.01, exp_max_s=0.05)
-        assert isinstance(client._transport, AsyncHTTPX2TenacityTransport)
-        with patch.object(
-            client._transport.wrapped, "handle_async_request", side_effect=always_400
-        ):
+        with patch.object(_base_transport(client), "handle_async_request", side_effect=always_400):
             response = await client.get("https://api.example.com/test")
 
         assert response.status_code == 400
@@ -559,10 +608,7 @@ class TestCreateHttpClient:
             return httpx2.Response(404, request=req)
 
         client = create_http_client(max_attempts=5, exp_multiplier=0.01, exp_max_s=0.05)
-        assert isinstance(client._transport, AsyncHTTPX2TenacityTransport)
-        with patch.object(
-            client._transport.wrapped, "handle_async_request", side_effect=always_404
-        ):
+        with patch.object(_base_transport(client), "handle_async_request", side_effect=always_404):
             response = await client.get("https://api.example.com/test")
 
         assert response.status_code == 404
@@ -592,11 +638,10 @@ class TestCreateHttpClient:
             return httpx2.Response(400, json=body, request=req)
 
         client = create_http_client(max_attempts=5, exp_multiplier=0.01, exp_max_s=0.05)
-        assert isinstance(client._transport, AsyncHTTPX2TenacityTransport)
         sdk = openai.AsyncOpenAI(
             api_key="test", base_url="https://api.example.com/v1", http_client=client, max_retries=0
         )
-        with patch.object(client._transport.wrapped, "handle_async_request", side_effect=refuse):
+        with patch.object(_base_transport(client), "handle_async_request", side_effect=refuse):
             with pytest.raises(openai.BadRequestError) as caught:
                 await sdk.responses.create(model="gpt-test", input="hi")
 
@@ -614,8 +659,7 @@ class TestCreateHttpClient:
             return httpx2.Response(200, request=req)
 
         client = create_http_client(max_attempts=5)
-        assert isinstance(client._transport, AsyncHTTPX2TenacityTransport)
-        with patch.object(client._transport.wrapped, "handle_async_request", side_effect=success):
+        with patch.object(_base_transport(client), "handle_async_request", side_effect=success):
             response = await client.get("https://api.example.com/test")
 
         assert response.status_code == 200
