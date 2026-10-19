@@ -405,9 +405,11 @@ def _create_openai_model(
     from pydantic_ai.models.openai import OpenAIResponsesModel  # noqa: PLC0415
     from pydantic_ai.providers.openai import OpenAIProvider  # noqa: PLC0415
 
+    provider = OpenAIProvider(http_client=http_client)
+    provider.client.max_retries = 0
     return OpenAIResponsesModel(
         model_name=config.model,
-        provider=OpenAIProvider(http_client=http_client),
+        provider=provider,
         settings=_build_openai_settings(config),
     )
 
@@ -428,9 +430,11 @@ def _create_openai_chat_model(
     from pydantic_ai.models.openai import OpenAIChatModel  # noqa: PLC0415
     from pydantic_ai.providers.openai import OpenAIProvider  # noqa: PLC0415
 
+    provider = OpenAIProvider(http_client=http_client)
+    provider.client.max_retries = 0
     return OpenAIChatModel(
         model_name=config.model,
-        provider=OpenAIProvider(http_client=http_client),
+        provider=provider,
         settings=_build_openai_chat_settings(config),
     )
 
@@ -463,9 +467,11 @@ def _create_azure_model(
         raise ValueError(
             "AZURE_OPENAI_ENDPOINT environment variable is required for Azure provider"
         )
+    provider = AzureProvider(azure_endpoint=base_url, http_client=http_client)
+    provider.client.max_retries = 0
     return OpenAIResponsesModel(
         model_name=config.model,
-        provider=AzureProvider(azure_endpoint=base_url, http_client=http_client),
+        provider=provider,
         settings=_build_openai_settings(config),
     )
 
@@ -498,9 +504,11 @@ def _create_azure_chat_model(
         raise ValueError(
             "AZURE_OPENAI_ENDPOINT environment variable is required for Azure provider"
         )
+    provider = AzureProvider(azure_endpoint=base_url, http_client=http_client)
+    provider.client.max_retries = 0
     return OpenAIChatModel(
         model_name=config.model,
-        provider=AzureProvider(azure_endpoint=base_url, http_client=http_client),
+        provider=provider,
         settings=_build_openai_chat_settings(config),
     )
 
@@ -527,9 +535,11 @@ def _create_anthropic_model(
     settings = cast("AnthropicModelSettings", dict(_build_core_settings(config) or {}))
     if config.reasoning_effort is not None:
         settings["anthropic_effort"] = config.reasoning_effort
+    provider = AnthropicProvider(http_client=http_client)
+    provider.client.max_retries = 0
     return AnthropicModel(
         model_name=config.model,
-        provider=AnthropicProvider(http_client=http_client),
+        provider=provider,
         settings=settings or None,
     )
 
@@ -619,9 +629,11 @@ def _create_nvidia_model(
 
     settings = _build_openai_settings(config)
     base_url = os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
+    provider = OpenAIProvider(base_url=base_url, http_client=http_client)
+    provider.client.max_retries = 0
     return OpenAIChatModel(
         model_name=config.model,
-        provider=OpenAIProvider(base_url=base_url, http_client=http_client),
+        provider=provider,
         settings=settings,
     )
 
@@ -652,9 +664,11 @@ def _create_openrouter_model(
     from pydantic_ai.providers.openrouter import OpenRouterProvider  # noqa: PLC0415
 
     settings = _build_openrouter_settings(config)
+    provider = OpenRouterProvider(http_client=http_client)
+    provider.client.max_retries = 0
     return OpenRouterModel(
         model_name=config.model,
-        provider=OpenRouterProvider(http_client=http_client),
+        provider=provider,
         settings=settings,
     )
 
@@ -740,6 +754,11 @@ def create_model(
         that each entry's environment must already be satisfied: an ``azure`` entry
         needs ``AZURE_OPENAI_ENDPOINT`` even while the primary is healthy, and an
         ``openrouter`` entry needs ``OPENROUTER_API_KEY``.
+
+    Retries:
+        Every Stainless SDK client (openai, openai-chat, azure, azure-chat,
+        anthropic, nvidia, openrouter) gets ``max_retries = 0``, so the transport
+        from ``create_http_client()`` is the only retry layer.
 
     Args:
         config: LLM model configuration.
