@@ -22,6 +22,8 @@ from akgentic.llm.providers import create_http_client, create_model
 
 _Handler = Callable[[httpx2.Request], httpx2.Response]
 
+_MAX_ATTEMPTS = 3
+
 _ERROR_BODY = {"error": {"message": "request timed out upstream", "type": "timeout"}}
 
 # Every environment variable the providers below read; each case clears them all
@@ -86,7 +88,7 @@ def _counting_client(handler: _Handler) -> httpx2.AsyncClient:
     The single place the counting point is located: the mock replaces only the
     *wrapped* transport, so the retry transport above it stays in the path.
     """
-    client = create_http_client(max_attempts=3, exp_multiplier=0.01, exp_max_s=0.05)
+    client = create_http_client(max_attempts=_MAX_ATTEMPTS, exp_multiplier=0.01, exp_max_s=0.05)
     assert isinstance(client._transport, AsyncHTTPX2TenacityTransport)
     client._transport.wrapped = httpx2.MockTransport(handler)
     return client
@@ -105,6 +107,10 @@ def _status_408(request: httpx2.Request) -> httpx2.Response:
 
 def _read_timeout(request: httpx2.Request) -> httpx2.Response:
     raise httpx2.ReadTimeout("timed out", request=request)
+
+
+def _connect_error(request: httpx2.Request) -> httpx2.Response:
+    raise httpx2.ConnectError("connection refused", request=request)
 
 
 async def _run(provider: str, model: str, recorder: _Recorder) -> None:
@@ -145,6 +151,21 @@ async def test_stainless_sdk_sends_one_request_on_timeout(
         await _run(provider, model, recorder)
 
     assert len(recorder.requests) == 1
+
+
+@pytest.mark.parametrize("provider", list(_STAINLESS_CASES))
+async def test_stainless_sdk_does_not_multiply_transport_retries(
+    provider: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A network error our transport retries costs ``max_attempts`` requests, not 3x that."""
+    model, env = _STAINLESS_CASES[provider]
+    _set_env(monkeypatch, env)
+    recorder = _Recorder(_connect_error)
+
+    with pytest.raises(ModelAPIError):
+        await _run(provider, model, recorder)
+
+    assert len(recorder.requests) == _MAX_ATTEMPTS
 
 
 @pytest.mark.parametrize("provider", list(_OTHER_CASES))
