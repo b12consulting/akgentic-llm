@@ -39,6 +39,7 @@ from akgentic.llm import (
     EventSourcingCapability,
     LifetimeBudgetCapability,
     LimitRecoveryCapability,
+    MergeableOutputCapability,
     ModelConfig,
     ModelSwitchError,
     ReactAgent,
@@ -349,6 +350,7 @@ class TestReactAgentInit:
             CompactionCapability,
             EventSourcingCapability,
             LimitRecoveryCapability,
+            MergeableOutputCapability,
         ]
         start = types.index(LifetimeBudgetCapability)
         assert types[start : start + len(expected)] == expected

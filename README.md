@@ -27,6 +27,7 @@ call any LLM without coupling to a specific vendor or framework primitive.
   - [Run-loop capabilities](#run-loop-capabilities)
   - [Hook timeline](#hook-timeline)
   - [Run-tier recovery](#run-tier-recovery)
+  - [A reply split in two, or one that cannot be read](#a-reply-split-in-two-or-one-that-cannot-be-read)
 - [Multimodal Prompts](#multimodal-prompts)
 - [Context Management](#context-management)
   - [ContextManager](#contextmanager)
@@ -97,7 +98,8 @@ ReactAgent
   │     │     ├── CompactionCapability      # folds an over-long history before the run reads it
   │     │     ├── EventSourcingCapability, after each graph node:
   │     │     │     context.add_message()   # persists + notifies observers
-  │     │     └── LimitRecoveryCapability   # on a run-tier breach, decides: conclude, or raise
+  │     │     ├── LimitRecoveryCapability   # on a run-tier breach, decides: conclude, or raise
+  │     │     └── MergeableOutputCapability # merges a split MergeableOutput; words its retry
   │     │
   │     ├── on a run-tier breach the seam asked to conclude:
   │     │     conclude_without_tools(decision.reason)   # sibling run, no tools
@@ -971,20 +973,20 @@ mirroring `run_sync()`: closed-agent guard, then the agent's own loop.
 
 `capabilities` is an optional constructor argument on `ReactAgent` (accepted-and-ignored on
 `MockReactAgent`) — a sequence of pydantic-ai `AgentCapability` instances. They are **not**
-forwarded unchanged: `ReactAgent` mounts four internal capabilities of its own first and appends
+forwarded unchanged: `ReactAgent` mounts five internal capabilities of its own first and appends
 yours after them, so the wrapped `Agent(...)` always receives
 
 ```python
 [LifetimeBudgetCapability, CompactionCapability, EventSourcingCapability,
- LimitRecoveryCapability,
+ LimitRecoveryCapability, MergeableOutputCapability,
  *(capabilities or [])]
 ```
 
-The stack is never `[]`, even when the argument is omitted — those four are how every run
-enforces the agent-lifetime budget, folds an over-long history, persists its messages, and decides
-whether a run-tier breach degrades into an answer. See
-[Run-loop capabilities](#run-loop-capabilities) and [Run-tier recovery](#run-tier-recovery)
-below.
+The stack is never `[]`, even when the argument is omitted — those five are how every run
+enforces the agent-lifetime budget, folds an over-long history, persists its messages, decides
+whether a run-tier breach degrades into an answer, and merges a split `MergeableOutput`. See
+[Run-loop capabilities](#run-loop-capabilities), [Run-tier recovery](#run-tier-recovery) and
+[A reply split in two](#a-reply-split-in-two-or-one-that-cannot-be-read) below.
 
 `limit_recovery=` is a separate constructor keyword rather than an entry in this sequence, and
 that is deliberate — see [Run-tier recovery](#run-tier-recovery).
@@ -1057,7 +1059,7 @@ or does not end with a `ModelRequest`.
   This is pydantic-ai's internal pipeline behaviour, **not a documented public guarantee**, and
   it could change in a future release — a capability should still avoid orphaning tool calls on
   purpose.
-- Your capabilities sit **inside** the four internal ones — unless one of them declares its own
+- Your capabilities sit **inside** the five internal ones — unless one of them declares its own
   ordering constraints, see [Run-loop capabilities](#run-loop-capabilities) — so `before_*` hooks
   fire after theirs and `after_*` hooks before theirs. Your durable `after_*` edits are what gets
   persisted: `EventSourcingCapability`'s closing sweep lives in `wrap_run`'s `finally`, outside
@@ -1065,8 +1067,8 @@ or does not end with a `ModelRequest`.
 
 ### Run-loop capabilities
 
-`ReactAgent` does not implement the lifetime budget, compaction, persistence or the run-tier
-recovery decision in its run method. All four are standalone
+`ReactAgent` does not implement the lifetime budget, compaction, persistence, the run-tier
+recovery decision or the split-output merge in its run method. All five are standalone
 pydantic-ai capabilities, exported from `akgentic.llm`, and each is mountable on a bare `Agent`
 of your own:
 
@@ -1076,10 +1078,11 @@ of your own:
 | `CompactionCapability(strategy=…, context=…, threshold_fn=…, event_factory=…)` | Folds the conversation when provider-reported input tokens cross the armed threshold, applying the result to `ContextManager` **and** to the run's own history | `wrap_run`'s head — once per run by construction: it keeps no per-run state and overrides no `for_run` |
 | `EventSourcingCapability(context=…)` | Hands every message a run produces to `ContextManager.add_message()`, exactly once, in run order; records the run's system-prompt rendering | `after_node_run` (steady state, keeps emission incremental), `before_node_run` (re-anchors the live history), `wrap_run`'s `finally` (closing sweep + system-prompt recording) |
 | `LimitRecoveryCapability()` | The run-tier recovery **policy** — on a `UsageLimitExceeded`, whether the turn degrades into a tool-free conclusion and with what prompt. It only *decides* and records; the conclusion is a sibling run driven by whoever mounted it. Anything that is not a `UsageLimitExceeded` passes straight through without consulting the seam | `on_run_error` — always re-raises, never returns a result to suppress the error |
+| `MergeableOutputCapability()` | Merges a `MergeableOutput` reply split into several JSON objects, and words the retry when one cannot be read; a no-op for any other output type — see [A reply split in two](#a-reply-split-in-two-or-one-that-cannot-be-read) | `before_output_validate` (the merge), `on_output_validate_error` (the retry) |
 
 **Ordering.** The stack is
 `[LifetimeBudgetCapability, CompactionCapability, EventSourcingCapability,
-LimitRecoveryCapability, *yours]`, and the **first capability is the
+LimitRecoveryCapability, MergeableOutputCapability, *yours]`, and the **first capability is the
 outermost**: `before_*` hooks fire in list order,
 `after_*` in reverse, and `wrap_run`s nest with the first wrapping all the rest. Each position
 earns its place, and they are not equally load-bearing:
@@ -1099,16 +1102,20 @@ earns its place, and they are not equally load-bearing:
 - **Internal before caller.** Because the chain unwinds in reverse, a caller capability's
   `after_*` hooks run *before* the persistence sweep, so its durable edits are the ones
   persisted.
-- **Limit recovery last of the internals.** Its position carries no coupling of its own: it
+- **Limit recovery.** Its position carries no coupling of its own: it
   only records a decision in `on_run_error`, and what protects the conclusion from the breached
   run's dangling tool call is pydantic-ai's own repair on the next run, not any neighbour in the
   list; see [Run-tier recovery](#run-tier-recovery).
+- **Merging last of the internals, ahead of yours.** Its `before_output_validate` fires before
+  yours, so your hook reads the merged text. Its `on_output_validate_error` fires *after* yours —
+  pydantic-ai walks that hook innermost first — so a retry you word yourself passes through it
+  unchanged.
 
 **The order is a default, not a guarantee.** If **any** capability in the chain declares
 `get_ordering()` — a fixed `position`, or a `wraps=` / `wrapped_by=` constraint — pydantic-ai
 topologically re-sorts the whole chain to satisfy it, keeping the given order only as a
-tiebreaker. None of the four declares one, so the shipped stack is the list above; a caller
-capability that declares `position='outermost'` lands ahead of all four, whatever the list says.
+tiebreaker. None of the five declares one, so the shipped stack is the list above; a caller
+capability that declares `position='outermost'` lands ahead of all five, whatever the list says.
 What survives that and what does not:
 
 - **Persistence survives any ordering.** The closing sweep is in `wrap_run`'s `finally`, outside
@@ -1117,7 +1124,7 @@ What survives that and what does not:
   that hook from the innermost capability outwards, and this package states no contract about
   where a caller's recovering capability fires relative to `LimitRecoveryCapability`. Pinning the
   budget outermost by declaring an ordering would be a behavioural change owed its own decision,
-  so none of the four does it.
+  so none of the five does it.
 
 **Compaction writes twice, as one operation.** When the gate arms, `CompactionCapability` applies
 the fold to `ContextManager` *and* mirrors the result into the run's own history list, in one
@@ -1221,7 +1228,7 @@ Group a trace by `run_id`, which every event carries, rather than by arrival ord
 
 ### Hook timeline
 
-The four internal capabilities, `PendingMessageDrainCapability` (auto-injected by pydantic-ai)
+The five internal capabilities, `PendingMessageDrainCapability` (auto-injected by pydantic-ai)
 and any caller capability all hang off the **same** set of hooks. What separates them is *which*
 hook and *which direction the chain is walked* — and neither is guessable from a signature. This
 section is the map.
@@ -1251,8 +1258,12 @@ mounted `outermost` gets the first word on the way in and the *last* word on the
 | `after_model_request` | transform | each model response | `ModelResponse` | replaces the response; `ModelRetry` rejects it |
 | `before_tool_validate` / `after_tool_validate` | transform | per tool call, arg parsing | raw args / validated args | rewrites arguments |
 | `before_tool_execute` / `after_tool_execute` | transform | per tool call, execution | validated args / the tool's return | rewrites arguments or the result |
-| `before_output_validate` / `after_output_validate` | transform | **structured output only** | raw / parsed output | rewrites the parsed value |
+| `before_output_validate` | transform | **structured output only**, before parsing | the raw text (or the raw tool arguments) | rewrites the raw output; `ModelRetry` sends it back |
+| `on_output_validate_error` | error | parsing or validation failed | the raw output and the error | **raise** to propagate — a `ModelRetry` becomes the retry prompt — **return** a value to recover |
+| `after_output_validate` | transform | validation succeeded | the parsed value | replaces it; `ModelRetry` sends it back |
 | `before_output_process` / `after_output_process` | transform | **every** output type | the output | rewrites the final value |
+| `on_output_process_error` | error | processing raised | the error | **raise** to propagate, **return** a value to recover |
+| `wrap_output_validate` / `wrap_output_process` | wrap | around each output lifecycle | `handler(output)` | short-circuit it, or recover what its error hook did not |
 
 `wrap_*` hooks are the only ones that can decline to call the inner chain at all, and the only
 place a `try`/`finally` observes a cancellation. `after_*` hooks are **not** called for a node
@@ -1267,13 +1278,16 @@ One run of `ReactAgent`, with two model requests and a tool call in between. Rea
                                          │  who acts here, in the shipped stack
 ─────────────────────────────────────────┼──────────────────────────────────────────────────
  run starts                              │
-   ▼ before_run                          │  MailboxCapability: clear run-local announce-once
    ▼ wrap_run — HEAD                     │  LifetimeBudget: refuse a spent agent (costs nothing
      LifetimeBudget                      │    — every inner capability is downstream of here)
      └ Compaction                        │  Compaction: fold history if input tokens crossed the
        └ EventSourcing                   │    armed threshold; write to ContextManager AND to the
          └ LimitRecovery                 │    run's own list, as one operation
-           └ …yours                      │  EventSourcing: open the persistence cursor
+           └ MergeableOutput             │  EventSourcing: open the persistence cursor
+             └ …yours                    │
+   ▼ before_run                          │  MailboxCapability: clear run-local announce-once.
+                                         │    Called INSIDE wrap_run, so a run the budget
+                                         │    refuses never reaches it
                                          │
  ┌─ UserPromptNode ──────────────────────┤
  │   ▼ before_node_run                   │  EventSourcing: re-anchor the live history
@@ -1286,10 +1300,11 @@ One run of `ReactAgent`, with two model requests and a tool call in between. Rea
  │   │ ▼ before_model_request            │  PendingMessageDrain (outermost — FIRST): drain the
  │   │                                   │    'asap' queue into this request
  │   │                                   │  yours: inject/transform history (ProcessHistory)
- │   │                                   │  MailboxCapability (agent pkg): raise on a queued
- │   │                                   │    cancel, else ENQUEUE the arrival notice — which
- │   │                                   │    this step's drain has already been past, so it
- │   │                                   │    lands in request #2
+ │   │                                   │  MailboxCapability (akgentic-tool, mounted by
+ │   │                                   │    BaseAgent): raise on a queued cancel, else
+ │   │                                   │    ENQUEUE the arrival notice — which this step's
+ │   │                                   │    drain has already been past, so it lands in
+ │   │                                   │    request #2
  │   │ ▼ wrap_model_request → PROVIDER ▲ │
  │   │ ▲ after_model_request             │
  │   ▲ after_node_run                    │  EventSourcing: emit LlmMessageEvent + LlmUsageEvent
@@ -1315,10 +1330,20 @@ One run of `ReactAgent`, with two model requests and a tool call in between. Rea
  └───────────────────────────────────────┤
                                          │
  ┌─ CallToolsNode  (final output) ───────┤
- │   ▼ before_output_validate            │  structured output only — parsing the payload
- │   ▲ after_output_validate             │
+ │   ▼ before_output_validate            │  structured output only, on the RAW text.
+ │   │                                   │  MergeableOutput: two or more objects back to back,
+ │   │                                   │    each valid → output_type.merge(...)
+ │   │ core parse + validation           │
+ │   ▲ on_output_validate_error          │  on failure only. MergeableOutput: raise
+ │   │                                   │    ModelRetry(output_type.unreadable_output_error)
+ │   ▲ after_output_validate             │  on success only. RecipientCheckCapability
+ │   │                                   │    (akgentic-agent): ModelRetry while a recipient
+ │   │                                   │    is unreachable
  │   ▼ before_output_process             │  every output type
  │   ▲ after_output_process              │
+ │   a ModelRetry from any hook above ───┼─ no End: the node returns a ModelRequestNode
+ │                                       │    carrying a RetryPromptPart, and the run takes
+ │                                       │    one more request (output retries permitting)
  │   node returns End(FinalResult)       │
  │   ▲ after_node_run   ← WALKED BACKWARDS, so the drain is LAST
  │       …yours                          │
@@ -1326,9 +1351,12 @@ One run of `ReactAgent`, with two model requests and a tool call in between. Rea
  │       PendingMessageDrain             │  if the queue is non-empty it DISCARDS the End and
  └───────────────────────────────────────┤    redirects into one more request (see below)
                                          │
+   ▲ after_run                           │  called INSIDE wrap_run, before any tail; on the
+                                         │    error path only if on_run_error recovered
    ▲ wrap_run — TAIL / finally           │  EventSourcing: closing sweep + system-prompt record
-   ▲ after_run                           │  LifetimeBudget: fold what the run burned into the
- run ends                                │    lifetime total (in `finally`, so a FAILED run counts)
+                                         │  LifetimeBudget (outermost, so LAST): fold what the
+ run ends                                │    run burned into the lifetime total — in `finally`,
+                                         │    so a FAILED run counts
 
  on the error path instead:              │
    ▲ on_run_error  (innermost first)     │  LimitRecovery: record the seam's decision, re-raise.
@@ -1419,6 +1447,46 @@ against which output type all live here, where the breached run's history and th
 are; the consumer is left with a single `except UsageLimitError`. Two things the seam cannot
 currently express are ADR-021 §Q1 and §Q2 — see
 [What a consumer has to handle](#what-a-consumer-has-to-handle).
+
+### A reply split in two, or one that cannot be read
+
+A provider may return one reply as several text parts — OpenAI's Responses API sends a
+`commentary` part before the `final_answer` — and pydantic-ai joins them, so two valid objects
+become `{...}{...}`, which does not parse. Its own retry names only the parse error, which a model
+reads as a format fix rather than as "none of it was used".
+
+An output model opts in by subclassing `MergeableOutput`:
+
+```python
+from collections.abc import Sequence
+from typing import Self
+
+from pydantic import ValidationError
+from akgentic.llm import MergeableOutput
+
+class Notes(MergeableOutput):
+    notes: list[str]
+
+    @classmethod
+    def merge(cls, outputs: Sequence[Self]) -> Self:          # required
+        return cls(notes=[n for output in outputs for n in output.notes])
+
+    @classmethod
+    def unreadable_output_error(cls, error: ValidationError) -> str:   # optional
+        return "None of your notes were kept. ..."
+```
+
+`MergeableOutputCapability`, which every `ReactAgent` mounts, then:
+
+- **merges** — `before_output_validate`: text that is two or more JSON objects back to back, each
+  validating against the output type, becomes `merge(outputs)`. No retry is spent. Anything else —
+  one object, trailing prose, a truncated or invalid object, a merge that fails the schema's own
+  validation — is left to validation;
+- **words the retry** — `on_output_validate_error`: a `ValidationError` on the output type is
+  sent back as `unreadable_output_error(error)`. The default says *none of it was used*, lists
+  one `- loc: msg` line per error, and asks for exactly one object.
+
+Any other output type is left alone, and keeps pydantic-ai's retry.
 
 ## Multimodal Prompts
 
@@ -1990,6 +2058,7 @@ src/akgentic/llm/
                     #   ContextObserver and EventMessage protocols
     pricing.py      # estimate_cost() (genai-prices), ModelUsage, RunUsageSummary,
                     #   AgentUsageSummary, aggregate_usage()
+    output.py       # MergeableOutput, MergeableOutputCapability
     prompts.py      # PromptTemplate, current_datetime_prompt, json_output_reminder_prompt
     providers.py    # create_model(), create_http_client(), get_output_type(),
                     #   create_model_settings()

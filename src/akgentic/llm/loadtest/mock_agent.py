@@ -67,9 +67,11 @@ class MockReactAgent:
         Args:
             capabilities: Accepted and ignored — the mock never builds a
                 ``pydantic_ai.Agent``, so there is nothing to forward this to.
-                None of ``ReactAgent``'s four mounts has a client to be here —
+                None of ``ReactAgent``'s five mounts has a client to be here —
                 ``LimitRecoveryCapability`` for the reason given under
-                ``limit_recovery`` below, and for the other three:
+                ``limit_recovery`` below; ``MergeableOutputCapability`` because it
+                merges a reply split across JSON texts, and this class builds its
+                output object from the scenario, never from text; and for the other three:
                 what ``EventSourcingCapability`` does for a real run — hand every
                 message to ``ContextManager.add_message()`` — this class already
                 does directly from ``_emit_request`` / ``_emit_tool_call`` /

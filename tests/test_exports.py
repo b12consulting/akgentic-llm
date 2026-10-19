@@ -23,6 +23,7 @@ def test_no_unexpected_exports():
         "context",
         "event",
         "loadtest",
+        "output",
         "pricing",
         "prompts",
         "providers",
@@ -72,6 +73,8 @@ def test_key_exports_present():
     assert hasattr(akgentic.llm, "EventSourcingCapability")
     assert hasattr(akgentic.llm, "LimitRecoveryCapability")
     assert hasattr(akgentic.llm, "ConclusionDecision")
+    assert hasattr(akgentic.llm, "MergeableOutput")
+    assert hasattr(akgentic.llm, "MergeableOutputCapability")
     # Removed with #155 — pydantic-ai 2.38 repairs dangling tool calls itself; must not reappear.
     assert not hasattr(akgentic.llm, "HealingCapability")
 

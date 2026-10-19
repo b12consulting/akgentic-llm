@@ -84,6 +84,7 @@ from .event import (
     ToolCallEvent,
     ToolReturnEvent,
 )
+from .output import MergeableOutput, MergeableOutputCapability
 from .pricing import (
     AgentUsageSummary,
     ModelUsage,
@@ -138,6 +139,9 @@ __all__ = [
     "EventSourcingCapability",
     "LimitRecoveryCapability",
     "ConclusionDecision",
+    # An output model that merges a split reply, and the capability that does it
+    "MergeableOutput",
+    "MergeableOutputCapability",
     # Compaction
     "LlmContextCompactedEvent",
     "LlmContextClearedEvent",
