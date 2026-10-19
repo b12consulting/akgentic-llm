@@ -48,6 +48,7 @@ from .event import (
     LlmSystemPromptEvent,
     LlmUsageEvent,
 )
+from .output import MergeableOutputCapability
 from .pricing import aggregate_usage
 from .providers import create_http_client, create_model, get_output_type
 
@@ -276,6 +277,9 @@ class ReactAgent:
             self._compactor,
             EventSourcingCapability(context=self._context),
             self._limit_recovery,
+            # Ahead of the caller's: its before_output_validate merges a split output
+            # before any caller capability reads it.
+            MergeableOutputCapability(),
             *(capabilities or []),
         ]
 
