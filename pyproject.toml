@@ -20,7 +20,7 @@ authors = [
 keywords = ["llm", "agents", "ai", "pydantic-ai", "react"]
 
 dependencies = [
-    "pydantic-ai-slim[anthropic,google,mistral,openai,retries]>=2.54,<3",
+    "pydantic-ai-slim[anthropic,google,mistral,openai,retries]>=2.65,<3",
     "genai-prices>=0.1.13",
     "pydantic>=2.0.0",
     "httpx2>=2.7",

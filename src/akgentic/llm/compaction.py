@@ -23,6 +23,7 @@ from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
     ModelResponse,
+    RetryFeedbackPart,
     RetryPromptPart,
     SystemPromptPart,
     TextPart,
@@ -116,7 +117,8 @@ def _is_tool_result_part(part: Any) -> TypeGuard[ToolReturnPart | RetryPromptPar
     Both ``ToolReturnPart`` and ``RetryPromptPart`` (when ``tool_name`` is set — a
     tool-call validation retry rather than an output-validation retry) are emitted as
     ``role=tool`` messages, so either orphans at the OpenAI layer if its issuing
-    assistant message is not the immediately-preceding one.
+    assistant message is not the immediately-preceding one. A ``RetryFeedbackPart`` is
+    an output retry, never ``role=tool``, so it is not a tool result.
     """
     if isinstance(part, ToolReturnPart):
         return True
@@ -307,8 +309,19 @@ def _format_request_part(part: Any) -> str | None:
         content = part.content if isinstance(part.content, str) else str(part.content)
         if len(content) > 3000:
             content = content[:3000] + "... [truncated]"
-        return f"TOOL_RESULT ({part.tool_name}): {content}"
+        # A non-success outcome (failed, denied, interrupted, retried) is named so the
+        # summary keeps the fact — and, in the content, the reason — of the failure.
+        label = part.tool_name if part.outcome == "success" else f"{part.tool_name}, {part.outcome}"
+        return f"TOOL_RESULT ({label}): {content}"
+    if isinstance(part, RetryFeedbackPart):
+        # An output retry: never bound to a tool call since pydantic-ai 2.60. The
+        # content is `str | list[ErrorDetails]`; `model_response()` renders either.
+        content = part.model_response()
+        if len(content) > 3000:
+            content = content[:3000] + "... [truncated]"
+        return f"TOOL_RETRY (output): {content}"
     if isinstance(part, RetryPromptPart):
+        # Legacy shape (deprecated since pydantic-ai 2.60), kept for persisted histories.
         # ``tool_name`` set => tool-validation retry (role=tool); unset => output retry
         # (user message). Either way we keep the text so the agent can recover context.
         content = part.model_response() if hasattr(part, "model_response") else str(part.content)

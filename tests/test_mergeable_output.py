@@ -4,13 +4,21 @@ import asyncio
 from collections.abc import Sequence
 from datetime import datetime
 from types import SimpleNamespace
-from typing import Any, Self
+from typing import Any, NamedTuple, Self
 from unittest.mock import MagicMock
 
 import pytest
 from pydantic import ConfigDict, Field, ValidationError
 from pydantic_ai import ModelRetry
-from pydantic_ai.messages import ModelMessage, ModelResponse, RetryPromptPart, TextPart
+from pydantic_ai.messages import (
+    ModelMessage,
+    ModelRequest,
+    ModelResponse,
+    RetryFeedbackPart,
+    RetryPromptPart,
+    TextPart,
+    UserPromptPart,
+)
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 from akgentic.llm import (
@@ -199,7 +207,23 @@ class TestAnUnreadableOutput:
         assert raised.value is retry
 
 
-def _native_run(monkeypatch: pytest.MonkeyPatch, first: list[str]) -> tuple[_Notes, list[str]]:
+# Since pydantic-ai 2.60 an output retry is stored as a `RetryFeedbackPart`, but a model
+# never sees that part: `prepare_messages` sends a `'model_retry'` / `'validation_error'`
+# cause as a user prompt fenced in one of these tags.
+_RETRY_FENCES = ("<retry_feedback>", "<validation_errors>")
+
+
+class _NativeRun(NamedTuple):
+    output: _Notes
+    retry_prompts: list[str]
+    stored: list[ModelMessage]
+
+
+def _native_run(
+    monkeypatch: pytest.MonkeyPatch,
+    first: list[str],
+    history: list[ModelMessage] | None = None,
+) -> _NativeRun:
     """One ``ReactAgent`` run on the native text path: ``first`` as text parts, then a fix."""
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     config = ReactAgentConfig(
@@ -207,14 +231,19 @@ def _native_run(monkeypatch: pytest.MonkeyPatch, first: list[str]) -> tuple[_Not
         runtime_cfg=RuntimeConfig(retries=3),
     )
     react_agent = ReactAgent(config=config)
+    if history is not None:
+        react_agent.context.restore(history)
     retry_prompts: list[str] = []
 
     def model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        # Only this request: a restored history's own retry is sent fenced the same way.
         retry_prompts.extend(
-            part.model_response()
-            for message in messages
+            part.content
+            for message in messages[-1:]
             for part in message.parts
-            if isinstance(part, RetryPromptPart)
+            if isinstance(part, UserPromptPart)
+            and isinstance(part.content, str)
+            and any(fence in part.content for fence in _RETRY_FENCES)
         )
         texts = first if not retry_prompts else ['{"notes": ["fixed"]}']
         return ModelResponse(parts=[TextPart(content=text) for text in texts])
@@ -222,25 +251,54 @@ def _native_run(monkeypatch: pytest.MonkeyPatch, first: list[str]) -> tuple[_Not
     try:
         with react_agent.pydantic_agent.override(model=FunctionModel(model)):
             output = react_agent.run_sync("go", output_type=_Notes)
+        stored = react_agent.context.messages
     finally:
         react_agent.close()
-    return output, retry_prompts
+    return _NativeRun(output, retry_prompts, stored)
+
+
+def _parts_of(messages: list[ModelMessage], part_type: type[object]) -> list[object]:
+    return [part for message in messages for part in message.parts if isinstance(part, part_type)]
 
 
 class TestInARealRun:
     def test_a_reply_split_in_two_text_parts_is_merged_without_a_retry(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        output, retry_prompts = _native_run(monkeypatch, ['{"notes": ["a"]}', '{"notes": ["b"]}'])
+        run = _native_run(monkeypatch, ['{"notes": ["a"]}', '{"notes": ["b"]}'])
 
-        assert retry_prompts == []
-        assert output == _Notes(notes=["a", "b"])
+        assert run.retry_prompts == []
+        assert run.output == _Notes(notes=["a", "b"])
+        assert _parts_of(run.stored, RetryFeedbackPart) == []
 
     def test_an_unmergeable_reply_gets_the_schemas_retry(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        output, retry_prompts = _native_run(monkeypatch, ['{"notes": ["a"]}', "Done."])
+        run = _native_run(monkeypatch, ['{"notes": ["a"]}', "Done."])
 
-        assert len(retry_prompts) == 1
-        assert "Your reply could not be read, so none of it was used." in retry_prompts[0]
-        assert output == _Notes(notes=["fixed"])
+        assert run.output == _Notes(notes=["fixed"])
+        assert len(run.retry_prompts) == 1
+        assert "Your reply could not be read, so none of it was used." in run.retry_prompts[0]
+        feedback = _parts_of(run.stored, RetryFeedbackPart)
+        assert len(feedback) == 1
+        assert isinstance(feedback[0], RetryFeedbackPart)
+        assert "Your reply could not be read, so none of it was used." in (
+            feedback[0].model_response()
+        )
+
+    def test_a_history_holding_a_legacy_retry_prompt_still_runs(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A history persisted before pydantic-ai 2.60 can hold the deprecated part.
+        history: list[ModelMessage] = [
+            ModelRequest(parts=[UserPromptPart(content="earlier")]),
+            ModelResponse(parts=[TextPart(content="Done.")]),
+            ModelRequest(parts=[RetryPromptPart(content="Reply with the schema.")]),
+            ModelResponse(parts=[TextPart(content='{"notes": ["earlier"]}')]),
+        ]
+
+        run = _native_run(monkeypatch, ['{"notes": ["a"]}'], history=history)
+
+        assert run.output == _Notes(notes=["a"])
+        assert run.retry_prompts == []
+        assert len(_parts_of(run.stored, RetryPromptPart)) == 1

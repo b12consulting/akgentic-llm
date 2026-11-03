@@ -510,10 +510,11 @@ class TestReactAgentEndStrategyRetryWins:
     v2 moved tool-call processing into `pydantic_ai/_tool_execution.py`
     (`_ExhaustiveProcessor`, `_apply_retry_wins`, `_is_retry_wins_trigger`): when a
     function tool call in the same round as an already-successful output tool call
-    produces a `RetryPromptPart` (from `ModelRetry` or arg-validation failure), the
+    is retried (from `ModelRetry` or arg-validation failure — since pydantic-ai 2.60 a
+    `ToolReturnPart` with `outcome='retried'`, formerly a `RetryPromptPart`), the
     output is suppressed and the run stays open for a further model turn. The pinned
     v1.107.0 baseline (`pydantic_ai/_agent_graph.py::process_tool_calls`) has no code
-    path that reads a function tool's `RetryPromptPart` to affect an already-set
+    path that reads a function tool's retry to affect an already-set
     `final_result` -- the output would win immediately, ending the run on that turn.
     """
 
@@ -590,6 +591,74 @@ class TestReactAgentEndStrategyRetryWins:
         # `final_result`, and the graph loops for a second model turn.
         assert call_count == 2
         assert result == RouteDecision(target="billing")
+
+
+class TestReactAgentRetriedToolCall:
+    """Story 34-1: a retried tool call is a failed ``tool-return``; a legacy history still runs."""
+
+    @pytest.mark.asyncio
+    async def test_an_unknown_tool_is_answered_as_a_retried_tool_return(
+        self, minimal_config, monkeypatch
+    ):
+        """pydantic-ai >= 2.60 answers an unknown tool with ``outcome='retried'``.
+
+        The run completes, the stored history holds the retried return (no
+        ``RetryPromptPart``), and the observer sees ``ToolReturnEvent(success=False)``.
+        """
+        from pydantic_ai.messages import RetryPromptPart
+
+        from akgentic.llm.event import ToolReturnEvent
+
+        monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+        observer = MockObserver()
+        agent = ReactAgent(config=minimal_config, observer=observer)
+
+        def stub(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            if len(messages) == 1:
+                return ModelResponse(
+                    parts=[ToolCallPart(tool_name="no_such_tool", args={}, tool_call_id="c1")]
+                )
+            return ModelResponse(parts=[TextPart(content="done")])
+
+        with agent.pydantic_agent.override(model=FunctionModel(stub)):
+            result = await agent.run("go")
+
+        assert result == "done"
+        parts = [p for m in agent.context.messages for p in m.parts]
+        retried = [p for p in parts if isinstance(p, ToolReturnPart)]
+        assert [(p.tool_name, p.tool_call_id, p.outcome) for p in retried] == [
+            ("no_such_tool", "c1", "retried")
+        ]
+        assert not any(isinstance(p, RetryPromptPart) for p in parts)
+        returns = [e for e in observer.events if isinstance(e, ToolReturnEvent)]
+        assert [(e.tool_name, e.tool_call_id, e.success) for e in returns] == [
+            ("no_such_tool", "c1", False)
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_restored_history_holding_a_legacy_tool_retry_prompt_still_runs(
+        self, minimal_config, monkeypatch
+    ):
+        """A history persisted before pydantic-ai 2.60 can hold a tool-bound ``RetryPromptPart``."""
+        from pydantic_ai.messages import RetryPromptPart
+
+        monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+        agent = ReactAgent(config=minimal_config)
+        legacy = RetryPromptPart(content="bad args", tool_name="lookup", tool_call_id="c0")
+        agent.context.restore(
+            [
+                ModelRequest(parts=[UserPromptPart(content="earlier")]),
+                ModelResponse(parts=[ToolCallPart(tool_name="lookup", args={}, tool_call_id="c0")]),
+                ModelRequest(parts=[legacy]),
+                ModelResponse(parts=[TextPart(content="earlier answer")]),
+            ]
+        )
+
+        with agent.pydantic_agent.override(model=_text_model("done")):
+            result = await agent.run("go")
+
+        assert result == "done"
+        assert legacy in [p for m in agent.context.messages for p in m.parts]
 
 
 class TestReactAgentRun:
@@ -2031,7 +2100,7 @@ def _always_calling_model() -> FunctionModel:
     """Asks for the same tool on every request, tools or no tools.
 
     The conclusion therefore breaches too: with the toolset overridden away the call names a
-    tool that does not exist, pydantic-ai answers with a retry prompt, and the follow-up
+    tool that does not exist, pydantic-ai answers with a retried tool return, and the follow-up
     request exceeds the conclusion's own ``run_request_limit=1``. That is the recursion
     guard's scenario.
     """

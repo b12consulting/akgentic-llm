@@ -8,6 +8,7 @@ import inspect
 import sys
 import types
 from types import SimpleNamespace
+from typing import Literal
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -15,6 +16,8 @@ from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
     ModelResponse,
+    RetryFeedbackPart,
+    RetryInfo,
     RetryPromptPart,
     SystemPromptPart,
     TextPart,
@@ -73,6 +76,22 @@ def _returns(*specs: tuple[str, str]) -> ModelRequest:
     return ModelRequest(
         parts=[ToolReturnPart(tool_name=n, tool_call_id=cid, content="ok") for n, cid in specs]
     )
+
+
+def _retried_return(name: str, call_id: str, content: str = "bad") -> ToolReturnPart:
+    """A tool-validation retry as pydantic-ai >= 2.60 records it."""
+    return ToolReturnPart(
+        tool_name=name,
+        tool_call_id=call_id,
+        content=content,
+        outcome="retried",
+        retry=RetryInfo(cause="model_retry"),
+    )
+
+
+def _retry_feedback(content: str) -> RetryFeedbackPart:
+    """An output retry as pydantic-ai >= 2.60 records it."""
+    return RetryFeedbackPart(content=content, retry=RetryInfo(cause="model_retry"))
 
 
 class _StubSummarizer:
@@ -257,9 +276,9 @@ def test_split_parallel_tool_call_not_orphaned() -> None:
     assert needed.issubset(issued)
 
 
-def test_split_retry_prompt_with_tool_name_treated_as_tool_result() -> None:
+def test_split_retried_tool_return_treated_as_tool_result() -> None:
     call = _calls(("f", "c1"))
-    retry = ModelRequest(parts=[RetryPromptPart(content="bad", tool_name="f", tool_call_id="c1")])
+    retry = ModelRequest(parts=[_retried_return("f", "c1")])
     msgs = [_user("start"), call, retry, _user("next")]
     _system, middle, tail = _split_messages(msgs, 2)
     assert call in tail and retry in tail
@@ -304,28 +323,34 @@ def test_is_tool_result_part_tool_return_is_tool_result() -> None:
     assert comp._is_tool_result_part(part) is True
 
 
-def test_is_tool_result_part_retry_with_tool_name_is_tool_result() -> None:
-    # Tool-validation retry: tool_name set -> serialises as role=tool.
-    part = RetryPromptPart(content="bad", tool_name="f")
-    assert comp._is_tool_result_part(part) is True
+def test_is_tool_result_part_retried_tool_return_is_tool_result() -> None:
+    # Tool-validation retry: a tool-return answering its own call -> role=tool.
+    assert comp._is_tool_result_part(_retried_return("f", "c1")) is True
 
 
-def test_is_tool_result_part_retry_without_tool_name_is_not_tool_result() -> None:
-    # Output-validation retry: tool_name left None -> NOT a role=tool result.
-    part = RetryPromptPart(content="bad")
-    assert comp._is_tool_result_part(part) is False
+def test_is_tool_result_part_retry_feedback_is_not_tool_result() -> None:
+    # Output retry: never bound to a tool call -> NOT a role=tool result.
+    assert comp._is_tool_result_part(_retry_feedback("bad")) is False
 
 
 def test_tool_result_call_ids_includes_tool_validation_retry() -> None:
-    part = RetryPromptPart(content="bad", tool_name="f", tool_call_id="c1")
-    msg = ModelRequest(parts=[part])
+    msg = ModelRequest(parts=[_retried_return("f", "c1")])
     assert comp._tool_result_call_ids(msg) == {"c1"}
 
 
-def test_tool_result_call_ids_excludes_output_validation_retry() -> None:
-    part = RetryPromptPart(content="bad", tool_call_id="c1")
-    msg = ModelRequest(parts=[part])
+def test_tool_result_call_ids_excludes_output_retry() -> None:
+    msg = ModelRequest(parts=[_retry_feedback("bad")])
     assert comp._tool_result_call_ids(msg) == set()
+
+
+def test_legacy_retry_prompt_tool_result_classification() -> None:
+    # Legacy RetryPromptPart (persisted before pydantic-ai 2.60): tool_name decides.
+    tool_retry = RetryPromptPart(content="bad", tool_name="f", tool_call_id="c1")
+    output_retry = RetryPromptPart(content="bad", tool_call_id="c2")
+    assert comp._is_tool_result_part(tool_retry) is True
+    assert comp._is_tool_result_part(output_retry) is False
+    msg = ModelRequest(parts=[tool_retry, output_retry])
+    assert comp._tool_result_call_ids(msg) == {"c1"}
 
 
 # ---------------------------------------------------------------------------
@@ -342,8 +367,8 @@ def test_extract_text_from_part_branches() -> None:
     ).startswith("[tool_call:f]")
     ret = _extract_text_from_part(ToolReturnPart(tool_name="f", tool_call_id="c1", content=123))
     assert ret.startswith("[tool_return:f]") and "123" in ret
-    # RetryPromptPart is unhandled -> str(part) fallback
-    assert _extract_text_from_part(RetryPromptPart(content="x")) != ""
+    # RetryFeedbackPart is unhandled -> str(part) fallback
+    assert _extract_text_from_part(_retry_feedback("x")) != ""
 
 
 def test_format_request_part_branches() -> None:
@@ -357,6 +382,15 @@ def test_format_request_part_branches() -> None:
         and long_ret.startswith("TOOL_RESULT (f):")
         and "[truncated]" in long_ret
     )
+    retry_tool = _format_request_part(_retried_return("f", "c1"))
+    assert retry_tool == "TOOL_RESULT (f, retried): bad"
+    retry_out = _format_request_part(_retry_feedback("y" * 4000))
+    assert retry_out is not None and retry_out.startswith("TOOL_RETRY (output):")
+    assert retry_out.endswith("... [truncated]")
+
+
+def test_format_request_part_legacy_retry_prompt_unchanged() -> None:
+    # Legacy RetryPromptPart (persisted before pydantic-ai 2.60) keeps its format.
     retry_tool = _format_request_part(
         RetryPromptPart(content="bad", tool_name="f", tool_call_id="c1")
     )
@@ -988,3 +1022,59 @@ async def test_summarize_no_system_history_folds_to_summary_only() -> None:
     folded = ContextManager.fold_compaction(history, _summarize_event(result))
     assert len(folded) == 1
     assert folded[0].parts[0].content == "[Conversation summary] NS"  # type: ignore[union-attr]
+
+
+# ---------------------------------------------------------------------------
+# Story 34-1 — summary formatting of the pydantic-ai >= 2.60 retry shapes
+# ---------------------------------------------------------------------------
+
+
+def test_format_retry_feedback_str_content_is_the_model_response() -> None:
+    part = _retry_feedback("Please fix the format.")
+    assert _format_request_part(part) == f"TOOL_RETRY (output): {part.model_response()}"
+    assert "Please fix the format." in part.model_response()
+
+
+def test_format_retry_feedback_error_details_content() -> None:
+    part = RetryFeedbackPart(
+        content=[
+            {"type": "missing", "loc": ("notes",), "msg": "Field required", "input": {}},
+        ],
+        retry=RetryInfo(cause="validation_error"),
+    )
+    formatted = _format_request_part(part)
+    assert formatted == f"TOOL_RETRY (output): {part.model_response()}"
+    assert "Field required" in formatted
+
+
+def test_format_retry_feedback_truncates_at_3000_chars() -> None:
+    part = _retry_feedback("y" * 4000)
+    formatted = _format_request_part(part)
+    expected = part.model_response()[:3000] + "... [truncated]"
+    assert formatted == f"TOOL_RETRY (output): {expected}"
+
+
+@pytest.mark.parametrize("outcome", ["failed", "denied", "interrupted", "retried"])
+def test_format_non_success_tool_return_names_the_outcome(
+    outcome: Literal["failed", "denied", "interrupted", "retried"],
+) -> None:
+    part = ToolReturnPart(tool_name="f", tool_call_id="c1", content="bad", outcome=outcome)
+    assert _format_request_part(part) == f"TOOL_RESULT (f, {outcome}): bad"
+
+
+def test_format_non_success_tool_return_truncates_at_3000_chars() -> None:
+    formatted = _format_request_part(_retried_return("f", "c1", content="x" * 4000))
+    assert formatted == "TOOL_RESULT (f, retried): " + "x" * 3000 + "... [truncated]"
+
+
+def test_format_success_tool_return_unchanged() -> None:
+    part = ToolReturnPart(tool_name="f", tool_call_id="c1", content="ok", outcome="success")
+    assert _format_request_part(part) == "TOOL_RESULT (f): ok"
+
+
+def test_retry_feedback_survives_drop_orphan_tool_results() -> None:
+    feedback = _retry_feedback("bad")
+    request = ModelRequest(parts=[feedback])
+    cleaned = _drop_orphan_tool_results([_user("u"), _assistant("a"), request])
+    assert cleaned[-1] is request
+    assert cleaned[-1].parts == [feedback]

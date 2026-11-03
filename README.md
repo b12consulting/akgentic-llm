@@ -112,8 +112,8 @@ ReactAgent
   └── system_prompt(func)                   # register dynamic system prompt
 ```
 
-**Runtime dependencies:** `pydantic-ai-slim[anthropic,google,mistral,openai,retries]>=2.32,<3`,
-`genai-prices>=0.1.0`, `pydantic>=2.0.0`, `httpx2>=2.7`, `tenacity>=8.0.0`, `pyyaml>=6.0`. An
+**Runtime dependencies:** `pydantic-ai-slim[anthropic,google,mistral,openai,retries]>=2.65,<3`,
+`genai-prices>=0.1.13`, `pydantic>=2.0.0`, `httpx2>=2.7`, `tenacity>=8.0.0`, `pyyaml>=6.0`. An
 optional `loadtest` extra pulls in the token-free mock agent's own `pyyaml` requirement.
 
 **Module boundary:** `akgentic-llm` MUST NOT import from `akgentic-core`, `akgentic-tool`, or
@@ -1342,7 +1342,7 @@ One run of `ReactAgent`, with two model requests and a tool call in between. Rea
  │   ▼ before_output_process             │  every output type
  │   ▲ after_output_process              │
  │   a ModelRetry from any hook above ───┼─ no End: the node returns a ModelRequestNode
- │                                       │    carrying a RetryPromptPart, and the run takes
+ │                                       │    carrying a RetryFeedbackPart, and the run takes
  │                                       │    one more request (output retries permitting)
  │   node returns End(FinalResult)       │
  │   ▲ after_node_run   ← WALKED BACKWARDS, so the drain is LAST
@@ -1616,8 +1616,17 @@ for tool activity without requiring consumers to parse pydantic-ai message inter
 | `part_kind` in message | Event emitted | Condition |
 |---|---|---|
 | `tool-call` | `ToolCallEvent` | One event per part (parallel calls → N events) |
-| `tool-return` | `ToolReturnEvent(success=True)` | Always |
-| `retry-prompt` | `ToolReturnEvent(success=False)` | Only when tool raised an error |
+| `tool-return` | `ToolReturnEvent(success=part.outcome == "success")` | Always |
+| `retry-prompt` (legacy) | `ToolReturnEvent(success=False)` | Only when `tool_name` is set |
+| `retry-feedback` | — | Never: an output retry is not bound to a tool call |
+| any other known kind | — | Text, thinking, instructions, deltas, files, … emit no tool event |
+| unknown kind | — | Logged once per kind per `ContextManager` at `WARNING`, then skipped |
+
+Since pydantic-ai 2.60 a tool call that needs retrying answers its own call as a `tool-return`
+with `outcome='retried'`, and an output retry is a `retry-feedback` part. `retry-prompt` is
+deprecated upstream; it is still handled because a history persisted before the upgrade can
+hold one. A part kind this version does not know never fails a run — the test suite catches
+the drift against the installed pydantic-ai instead.
 
 **Field semantics:**
 
@@ -1626,9 +1635,10 @@ for tool activity without requiring consumers to parse pydantic-ai message inter
   corresponding `ToolReturnEvent` within the same message stream
 - `arguments` — raw JSON string from the provider. Use `json.loads(event.arguments)` for
   structured access. Stored as `str` to avoid coupling to tool-specific parameter schemas.
-- `success` — `True` for clean returns; `False` when the tool raised an error (pydantic-ai
-  emits a `retry-prompt` part in that case). The return content is not carried in
-  `ToolReturnEvent`; it is already in the accompanying `LlmMessageEvent`.
+- `success` — `True` only when the `tool-return` part's `outcome` is `'success'`; `False`
+  when the call was `retried`, `failed`, `denied` or `interrupted` (and for a legacy
+  tool-bound `retry-prompt`). The outcome itself and the return content are not carried in
+  `ToolReturnEvent`; both are in the accompanying `LlmMessageEvent`.
 
 **Emission ordering:** `LlmMessageEvent` always fires first. Tool events follow immediately.
 A consumer receiving `ToolCallEvent` can safely assume the full message is already in context.

@@ -1,6 +1,7 @@
 """Context management for LLM conversation history."""
 
 import hashlib
+import logging
 from collections.abc import Sequence
 from typing import Literal
 
@@ -25,24 +26,38 @@ from akgentic.llm.event import (
 )
 from akgentic.llm.pricing import estimate_cost
 
-# Every `part.part_kind` value reachable via `message.parts` on pydantic-ai==1.107.0,
-# verified directly against `pydantic_ai/messages.py` (ADR-014 Phase 1, FR2). A rename
-# or removal here must fail loudly via `_emit_tool_events`'s raise, not silently no-op.
+logger = logging.getLogger(__name__)
+
+# Every `part_kind` default declared in the installed pydantic-ai-slim 2.65
+# `pydantic_ai/messages.py`. Typed tool parts (tool search, capability load) subclass
+# `ToolCallPart` / `ToolReturnPart` and keep `tool-call` / `tool-return`; their union
+# discriminator tags are not part kinds. Drift is caught by the test suite, which
+# enumerates the installed library against this set — not by a raise inside a run:
+# `_emit_tool_events` logs an unknown kind once and skips it (ADR-026 D2).
 type PartKind = Literal[
     "system-prompt",
     "user-prompt",
     "tool-return",
-    "retry-prompt",
-    "text",
-    "tool-call",
-    "builtin-tool-call",
     "builtin-tool-return",
+    "retry-prompt",
+    "retry-feedback",
+    "instruction",
+    "instruction-delta",
+    "tool-availability-delta",
+    "capability-load-delta",
+    "model-settings-delta",
+    "instruction-digest",
+    "instruction-baseline",
+    "text",
     "thinking",
     "compaction",
     "file",
+    "speech",
+    "tool-call",
+    "builtin-tool-call",
 ]
 
-# The only two values `ModelRequest.kind` / `ModelResponse.kind` can hold in 1.107.0.
+# The only two values `ModelRequest.kind` / `ModelResponse.kind` can hold.
 type MessageKind = Literal["request", "response"]
 
 # Single source of truth for the "system-prompt" part_kind literal, shared by
@@ -51,19 +66,30 @@ type MessageKind = Literal["request", "response"]
 # the `_snapshot_system_parts` equality check below.
 _SYSTEM_PROMPT_PART_KIND: Literal["system-prompt"] = "system-prompt"
 
-# PartKind members that are legitimate but not tool-call/tool-return/retry-prompt
-# events — an explicit no-op in `_emit_tool_events`, never a silent fallthrough.
+# PartKind members that emit no tool event — an explicit no-op in `_emit_tool_events`,
+# never a silent fallthrough. `retry-feedback` is an output retry, never bound to a tool
+# call; `retry-prompt` lands here only when it carries no `tool_name` (an output retry
+# in a history persisted before pydantic-ai 2.60).
 _NON_TOOL_PART_KINDS: frozenset[PartKind] = frozenset(
     {
         _SYSTEM_PROMPT_PART_KIND,
         "user-prompt",
+        "builtin-tool-return",
+        "retry-prompt",
+        "retry-feedback",
+        "instruction",
+        "instruction-delta",
+        "tool-availability-delta",
+        "capability-load-delta",
+        "model-settings-delta",
+        "instruction-digest",
+        "instruction-baseline",
         "text",
         "thinking",
         "compaction",
         "file",
+        "speech",
         "builtin-tool-call",
-        "builtin-tool-return",
-        "retry-prompt",
     }
 )
 
@@ -110,6 +136,7 @@ class ContextManager:
         self._last_system_prompt_hash: str | None = None
         self._pending_user_prompts: list[str] = []
         self._last_input_tokens: int | None = None
+        self._warned_part_kinds: set[str] = set()
 
     @property
     def messages(self) -> list[ModelMessage]:
@@ -216,6 +243,16 @@ class ContextManager:
         Called after LlmMessageEvent is emitted. LlmMessageEvent ordering is guaranteed.
         Gracefully handles messages with no parts attribute.
 
+        - ``tool-call`` → ``ToolCallEvent``.
+        - ``tool-return`` → ``ToolReturnEvent`` with ``success`` true only when the
+          part's ``outcome`` is ``'success'`` (``failed``, ``denied``, ``interrupted``
+          and ``retried`` are failures).
+        - ``retry-prompt`` with a ``tool_name`` → ``ToolReturnEvent(success=False)``;
+          kept for histories persisted before pydantic-ai 2.60.
+        - ``retry-feedback`` and every other ``PartKind`` member → nothing.
+        - A kind outside ``PartKind`` is logged once per kind per ``ContextManager``
+          at ``WARNING`` and skipped; processing continues with the next part.
+
         Args:
             message: Message whose parts are inspected for tool activity
         """
@@ -239,9 +276,12 @@ class ContextManager:
                             run_id=run_id,
                             tool_name=part.tool_name,
                             tool_call_id=part.tool_call_id,
-                            success=True,
+                            success=part.outcome == "success",
                         )
                     )
+                # Deprecated since pydantic-ai 2.60, which records a tool retry as a
+                # `tool-return` with `outcome='retried'`. Kept for histories persisted
+                # before the upgrade: a hand-built legacy part still reaches here.
                 case "retry-prompt" if part.tool_name is not None:
                     self._notify(
                         ToolReturnEvent(
@@ -253,10 +293,19 @@ class ContextManager:
                     )
                 case k if k in _NON_TOOL_PART_KINDS:
                     pass
-                case _:
-                    raise ValueError(
-                        f"Unrecognized part_kind {part.part_kind!r}; not a member of PartKind"
-                    )
+                case unknown:
+                    self._warn_unknown_part_kind(unknown)
+
+    def _warn_unknown_part_kind(self, kind: str) -> None:
+        """Log a part kind outside ``PartKind`` once per kind for this context."""
+        if kind in self._warned_part_kinds:
+            return
+        self._warned_part_kinds.add(kind)
+        logger.warning(
+            "Skipping message part with unrecognized part_kind %r: not a member of PartKind; "
+            "no tool event emitted for it",
+            kind,
+        )
 
     def _emit_usage_event(self, message: ModelMessage) -> None:
         """Emit LlmUsageEvent for ModelResponse messages with usage data."""

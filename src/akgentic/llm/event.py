@@ -70,8 +70,14 @@ class ToolReturnEvent:
     """Event emitted when a tool call completes (successfully or with an error).
 
     Emitted after ``LlmMessageEvent`` for:
-    - ``tool-return`` parts in a ``ModelRequest`` → ``success=True``
-    - ``retry-prompt`` parts with a non-None ``tool_name`` → ``success=False``
+    - ``tool-return`` parts in a ``ModelRequest`` → ``success=True`` when the part's
+      ``outcome`` is ``'success'``, else ``False`` (``'retried'``, ``'failed'``,
+      ``'denied'``, ``'interrupted'``)
+    - legacy ``retry-prompt`` parts with a non-None ``tool_name`` → ``success=False``
+      (deprecated since pydantic-ai 2.60; kept for histories persisted before it)
+
+    A ``retry-feedback`` part (an output retry) is never bound to a tool call and
+    emits no ``ToolReturnEvent``.
 
     Attributes:
         run_id: String representation of the pydantic-ai ``run_id`` UUID stamped
@@ -79,8 +85,8 @@ class ToolReturnEvent:
             ``ToolCallEvent`` that initiated the corresponding tool call.
         tool_name: Name of the tool that was called.
         tool_call_id: Identifier matching the originating ``ToolCallEvent``.
-        success: ``True`` if the tool returned normally; ``False`` if the model
-            issued a retry prompt due to a tool error.
+        success: ``True`` if the tool returned normally; ``False`` if the call
+            was retried, failed, denied or interrupted.
     """
 
     run_id: str

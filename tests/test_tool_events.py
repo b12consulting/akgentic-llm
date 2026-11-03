@@ -2,39 +2,50 @@
 
 Covers FR-TCE-8: event emission logic for all tool-related message part kinds.
 Story 2.4: Adds run_id assertions to all tool event tests.
+Story 34.1: ``tool-return`` success from ``outcome``, ``retry-feedback`` emits no tool
+event, unknown part kinds warn once and are skipped, and the known part-kind set is
+checked against the installed pydantic-ai.
 
-Note: Uses the same importlib loading pattern as test_context.py to avoid
-pulling in the providers dependency (pydantic-ai providers require API keys
-at import time in some configurations). ToolCallEvent / ToolReturnEvent are
-imported directly from akgentic.llm because they have no providers transitive dep.
+``ContextManager`` is imported from the package (not loaded from its file path) so the
+module logger is ``akgentic.llm.context``, the name the warn-and-skip tests assert on.
 """
 
-import importlib.util
+import dataclasses
+import inspect
+import logging
+import typing
 import uuid
 from datetime import datetime
-from pathlib import Path
 from types import SimpleNamespace
+from typing import Literal
 
+import pydantic_ai.messages
+import pytest
 from pydantic_ai.messages import (
+    CapabilityLoadDeltaPart,
+    InstructionBaselinePart,
+    InstructionDeltaPart,
+    InstructionDigest,
+    InstructionPart,
     ModelRequest,
+    ModelRequestPart,
     ModelResponse,
+    ModelSettingsDeltaPart,
+    RetryFeedbackPart,
+    RetryInfo,
     RetryPromptPart,
+    SpeechPart,
     TextPart,
+    ToolAvailabilityDeltaPart,
     ToolCallPart,
     ToolReturnPart,
     UserPromptPart,
 )
 
-# Load context module via importlib to avoid providers transitive dependency
-_CONTEXT_PATH = Path(__file__).parent.parent / "src" / "akgentic" / "llm" / "context.py"
-_spec = importlib.util.spec_from_file_location("context", _CONTEXT_PATH)
-_context_module = importlib.util.module_from_spec(_spec)  # type: ignore[arg-type]
-_spec.loader.exec_module(_context_module)  # type: ignore[union-attr]
+from akgentic.llm.context import ContextManager, PartKind
+from akgentic.llm.event import LlmMessageEvent, LlmUsageEvent, ToolCallEvent, ToolReturnEvent
 
-ContextManager = _context_module.ContextManager
-
-# Import event classes directly — no providers dep in event.py
-from akgentic.llm.event import LlmMessageEvent, ToolCallEvent, ToolReturnEvent  # noqa: E402, I001
+_CONTEXT_LOGGER = "akgentic.llm.context"
 
 # Canonical run_id used throughout these tests (AC-5, AC-6)
 RUN_ID = uuid.UUID("cf92c35f-4ee9-4cff-8361-b8ce3827e021")
@@ -324,44 +335,81 @@ class TestToolReturn:
 
 
 # ---------------------------------------------------------------------------
-# AC-5: retry-prompt with tool_call_id → ToolReturnEvent(success=False)
+# tool-return success comes from the part's outcome
 # ---------------------------------------------------------------------------
 
 
-class TestRetryPromptWithId:
-    """AC-5: retry-prompt with tool_call_id → ToolReturnEvent(success=False) with run_id."""
+_ToolOutcome = Literal["success", "failed", "denied", "interrupted", "retried"]
 
-    def test_retry_prompt_with_id_emits_tool_return_event(self) -> None:
-        """ToolReturnEvent(success=False) emitted for retry-prompt with tool_call_id."""
+
+class TestToolReturnOutcome:
+    """``ToolReturnEvent.success`` is ``part.outcome == 'success'``, for all five outcomes."""
+
+    @pytest.mark.parametrize(
+        ("outcome", "success"),
+        [
+            ("success", True),
+            ("failed", False),
+            ("denied", False),
+            ("interrupted", False),
+            ("retried", False),
+        ],
+    )
+    def test_success_follows_outcome(self, outcome: _ToolOutcome, success: bool) -> None:
+        """Exactly one ToolReturnEvent, carrying run_id/tool_name/tool_call_id as today."""
         manager, capture = _make_manager_with_capture()
-        msg = _retry_with_id_msg(tool_name="my_tool", tool_call_id="call_xyz")
-        manager.add_message(msg)
+        part = ToolReturnPart(
+            tool_name="web_search_tool",
+            tool_call_id="call_abc123",
+            content="tool output",
+            outcome=outcome,
+            retry=RetryInfo(cause="model_retry") if outcome == "retried" else None,
+        )
+        manager.add_message(ModelRequest(parts=[part], run_id=RUN_ID))
 
-        assert len(capture.events) == 2
-        assert isinstance(capture.events[0], LlmMessageEvent)
-        assert isinstance(capture.events[1], ToolReturnEvent)
+        assert capture.events[1:] == [
+            ToolReturnEvent(
+                run_id=RUN_ID_STR,
+                tool_name="web_search_tool",
+                tool_call_id="call_abc123",
+                success=success,
+            )
+        ]
 
-    def test_retry_prompt_with_id_event_fields(self) -> None:
-        """ToolReturnEvent from retry-prompt has correct tool_call_id and success=False."""
+
+# ---------------------------------------------------------------------------
+# Legacy retry-prompt (deprecated since pydantic-ai 2.60, kept for old histories)
+# ---------------------------------------------------------------------------
+
+
+class TestLegacyRetryPrompt:
+    """A hand-built ``RetryPromptPart`` still routes as it did before the upgrade.
+
+    pydantic-ai auto-generates ``tool_call_id`` for every ``RetryPromptPart`` (never
+    None); the discriminator for a tool vs. an output retry is ``tool_name``.
+    """
+
+    def test_with_tool_name_emits_unsuccessful_tool_return(self) -> None:
+        """A tool-bound retry-prompt → ToolReturnEvent(success=False) with run_id."""
         manager, capture = _make_manager_with_capture()
-        msg = _retry_with_id_msg(tool_name="err_tool", tool_call_id="call_err")
-        manager.add_message(msg)
+        manager.add_message(_retry_with_id_msg(tool_name="err_tool", tool_call_id="call_err"))
 
-        event = capture.events[1]
-        assert isinstance(event, ToolReturnEvent)
-        assert event.tool_name == "err_tool"
-        assert event.tool_call_id == "call_err"
-        assert event.success is False
+        assert capture.events[1:] == [
+            ToolReturnEvent(
+                run_id=RUN_ID_STR, tool_name="err_tool", tool_call_id="call_err", success=False
+            )
+        ]
 
-    def test_retry_prompt_tool_return_event_run_id(self) -> None:
-        """ToolReturnEvent from retry-prompt carries the message's run_id."""
+    def test_without_tool_name_emits_nothing_and_does_not_warn(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """An output retry-prompt → only LlmMessageEvent, no warning."""
         manager, capture = _make_manager_with_capture()
-        msg = _retry_with_id_msg(run_id=RUN_ID)
-        manager.add_message(msg)
+        with caplog.at_level(logging.WARNING, logger=_CONTEXT_LOGGER):
+            manager.add_message(_retry_no_tool_name_msg())
 
-        event = capture.events[1]
-        assert isinstance(event, ToolReturnEvent)
-        assert event.run_id == RUN_ID_STR
+        assert [type(e) for e in capture.events] == [LlmMessageEvent]
+        assert caplog.records == []
 
 
 # ---------------------------------------------------------------------------
@@ -389,37 +437,6 @@ class TestRunIdNone:
         event = capture.events[1]
         assert isinstance(event, ToolCallEvent)
         assert event.run_id == str(None)  # "None"
-
-
-# ---------------------------------------------------------------------------
-# AC-6: retry-prompt without tool_call_id → no ToolReturnEvent
-# ---------------------------------------------------------------------------
-
-
-class TestRetryPromptWithoutToolName:
-    """AC-6: retry-prompt with tool_name=None emits only LlmMessageEvent.
-
-    Note: pydantic-ai auto-generates tool_call_id for all RetryPromptPart instances
-    (it is never None). The discriminator for tool vs. non-tool retry-prompts is
-    tool_name: None means a non-tool retry (e.g. output format validation failure).
-    """
-
-    def test_retry_prompt_no_tool_name_emits_only_llm_message_event(self) -> None:
-        """Only LlmMessageEvent emitted — no ToolReturnEvent for non-tool retry."""
-        manager, capture = _make_manager_with_capture()
-        msg = _retry_no_tool_name_msg()
-        manager.add_message(msg)
-
-        assert len(capture.events) == 1
-        assert isinstance(capture.events[0], LlmMessageEvent)
-
-    def test_retry_prompt_no_tool_name_no_tool_return_event(self) -> None:
-        """ToolReturnEvent must NOT appear in captured events."""
-        manager, capture = _make_manager_with_capture()
-        manager.add_message(_retry_no_tool_name_msg())
-
-        tool_return_events = [e for e in capture.events if isinstance(e, ToolReturnEvent)]
-        assert len(tool_return_events) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -532,27 +549,176 @@ class TestNonToolModelRequest:
 
 
 # ---------------------------------------------------------------------------
-# Story 16-2 AC7: unrecognized part_kind raises instead of silently no-op'ing
+# retry-feedback and the other non-tool kinds of pydantic-ai 2.65 → nothing, silently
 # ---------------------------------------------------------------------------
 
 
-class TestUnrecognizedPartKindRaises:
-    """AC7: a part_kind outside PartKind raises, proving the improved failure mode.
+def _new_non_tool_parts() -> list[object]:
+    """One instance of each non-tool part kind added since pydantic-ai 2.60."""
+    return [
+        RetryFeedbackPart(
+            content="Please retry in the correct format.",
+            retry=RetryInfo(cause="model_retry"),
+        ),
+        InstructionPart(content="Be brief."),
+        InstructionDeltaPart(id="block", content="Be briefer."),
+        ToolAvailabilityDeltaPart(tools_added=["web_search_tool"]),
+        CapabilityLoadDeltaPart(loaded=["search"]),
+        ModelSettingsDeltaPart(settings={}),
+        InstructionDigest(content_hash="0" * 64),
+        InstructionBaselinePart(instructions=[]),
+        SpeechPart(speaker="user", transcript="hello"),
+    ]
 
-    Real pydantic-ai parts cannot carry an invalid part_kind (it's a fixed Literal
-    field — construction itself would raise pydantic.ValidationError), so this uses
-    a duck-typed stand-in that only defines the attributes `_emit_tool_events`
-    actually reads before reaching the raise.
+
+class TestNonToolPartKindsAreSilent:
+    """A non-tool part emits exactly ``[LlmMessageEvent]``: no tool event, no warning."""
+
+    def test_retry_feedback_emits_only_the_message_event(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """An output retry is never bound to a tool call."""
+        manager, capture = _make_manager_with_capture()
+        part = RetryFeedbackPart(
+            content="Please retry in the correct format.",
+            retry=RetryInfo(cause="model_retry"),
+        )
+        with caplog.at_level(logging.WARNING, logger=_CONTEXT_LOGGER):
+            manager.add_message(ModelRequest(parts=[part], run_id=RUN_ID))
+
+        assert [type(e) for e in capture.events] == [LlmMessageEvent]
+        assert caplog.records == []
+
+    @pytest.mark.parametrize(
+        "part", _new_non_tool_parts(), ids=lambda p: getattr(p, "part_kind", "?")
+    )
+    def test_new_kind_emits_only_the_message_event(
+        self, part: ModelRequestPart, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Each new kind is a known no-op: no tool event, no warning, no exception."""
+        manager, capture = _make_manager_with_capture()
+        with caplog.at_level(logging.WARNING, logger=_CONTEXT_LOGGER):
+            manager.add_message(ModelRequest(parts=[part], run_id=RUN_ID))
+
+        assert [type(e) for e in capture.events] == [LlmMessageEvent]
+        assert caplog.records == []
+
+
+# ---------------------------------------------------------------------------
+# Unknown part_kind → one warning per kind per ContextManager, skipped, never raises
+# ---------------------------------------------------------------------------
+
+
+def _unknown_part(kind: str = "not-a-real-kind") -> SimpleNamespace:
+    """A duck-typed part with a ``part_kind`` outside ``PartKind``.
+
+    Real pydantic-ai parts cannot carry an invalid ``part_kind`` (a fixed Literal
+    field), so this stand-in defines only what ``_emit_tool_events`` reads.
+    """
+    return SimpleNamespace(part_kind=kind, tool_name=None)
+
+
+def _warnings_for(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if r.name == _CONTEXT_LOGGER and r.levelno == logging.WARNING]
+
+
+class TestUnrecognizedPartKindWarnsAndSkips:
+    """A part kind outside ``PartKind`` is logged once per kind and skipped — never raised."""
+
+    def test_unknown_kind_does_not_raise_and_warns_once_naming_it(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        manager, capture = _make_manager_with_capture()
+        message = SimpleNamespace(run_id=RUN_ID, parts=[_unknown_part()])
+
+        with caplog.at_level(logging.WARNING, logger=_CONTEXT_LOGGER):
+            manager._emit_tool_events(message)  # type: ignore[arg-type]
+
+        warnings = _warnings_for(caplog)
+        assert len(warnings) == 1
+        assert "not-a-real-kind" in warnings[0].getMessage()
+        assert capture.events == []
+
+    def test_same_kind_again_logs_nothing_more_a_different_kind_logs_once(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        manager, _ = _make_manager_with_capture()
+
+        with caplog.at_level(logging.WARNING, logger=_CONTEXT_LOGGER):
+            for kind in ("kind-a", "kind-a", "kind-b", "kind-a", "kind-b"):
+                message = SimpleNamespace(run_id=RUN_ID, parts=[_unknown_part(kind)])
+                manager._emit_tool_events(message)  # type: ignore[arg-type]
+
+        messages = [r.getMessage() for r in _warnings_for(caplog)]
+        assert len(messages) == 2
+        assert "kind-a" in messages[0]
+        assert "kind-b" in messages[1]
+
+    def test_dedup_is_per_context_manager(self, caplog: pytest.LogCaptureFixture) -> None:
+        """A second ContextManager warns about the same unknown kind again."""
+        first, _ = _make_manager_with_capture()
+        second, _ = _make_manager_with_capture()
+        message = SimpleNamespace(run_id=RUN_ID, parts=[_unknown_part()])
+
+        with caplog.at_level(logging.WARNING, logger=_CONTEXT_LOGGER):
+            first._emit_tool_events(message)  # type: ignore[arg-type]
+            second._emit_tool_events(message)  # type: ignore[arg-type]
+
+        assert len(_warnings_for(caplog)) == 2
+
+    def test_processing_continues_after_the_unknown_part(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A ToolCallPart after the unknown part still emits; message + usage events too."""
+        manager, capture = _make_manager_with_capture()
+        response = ModelResponse(
+            parts=[
+                _unknown_part(),  # type: ignore[list-item]
+                ToolCallPart(tool_name="my_tool", tool_call_id="call_xyz", args='{"q": 1}'),
+            ],
+            timestamp=datetime.now(),
+            run_id=RUN_ID,
+        )
+
+        with caplog.at_level(logging.WARNING, logger=_CONTEXT_LOGGER):
+            manager.add_message(response)
+
+        assert [type(e) for e in capture.events] == [LlmMessageEvent, ToolCallEvent, LlmUsageEvent]
+        tool_call = capture.events[1]
+        assert isinstance(tool_call, ToolCallEvent)
+        assert tool_call.tool_name == "my_tool"
+        assert tool_call.tool_call_id == "call_xyz"
+        assert len(_warnings_for(caplog)) == 1
+
+
+# ---------------------------------------------------------------------------
+# Drift: the known set covers every part_kind of the installed pydantic-ai
+# ---------------------------------------------------------------------------
+
+
+def _installed_part_kinds() -> set[str]:
+    """Every ``part_kind`` field default declared by a dataclass in ``pydantic_ai.messages``."""
+    kinds: set[str] = set()
+    for _, cls in inspect.getmembers(pydantic_ai.messages, inspect.isclass):
+        if not dataclasses.is_dataclass(cls):
+            continue
+        for field in dataclasses.fields(cls):
+            if field.name == "part_kind" and isinstance(field.default, str):
+                kinds.add(field.default)
+    return kinds
+
+
+class TestPartKindDrift:
+    """Fails when pydantic-ai ships a ``part_kind`` that ``PartKind`` does not list.
+
+    Drift detection lives here, in CI, rather than as a raise inside a run: an
+    unknown kind at runtime is only logged and skipped.
     """
 
-    def test_unknown_part_kind_raises_value_error(self) -> None:
-        """A duck-typed part with an out-of-PartKind part_kind raises ValueError."""
-        manager, capture = _make_manager_with_capture()
-        fake_part = SimpleNamespace(part_kind="not-a-real-kind", tool_name=None)
-        fake_message = SimpleNamespace(run_id=RUN_ID, parts=[fake_part])
+    def test_enumeration_is_not_vacuous(self) -> None:
+        assert len(_installed_part_kinds()) >= 11
 
-        with __import__("pytest").raises(ValueError, match="not-a-real-kind"):
-            manager._emit_tool_events(fake_message)  # type: ignore[arg-type]
-
-        # No event should have been emitted before the raise.
-        assert capture.events == []
+    def test_every_installed_part_kind_is_known(self) -> None:
+        known = set(typing.get_args(PartKind.__value__))
+        missing = sorted(_installed_part_kinds() - known)
+        assert not missing, f"PartKind is missing installed pydantic-ai part kinds: {missing}"
