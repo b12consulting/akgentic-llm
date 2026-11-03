@@ -1,6 +1,6 @@
 [project]
 name = "akgentic-llm"
-version = "2.5.0"
+version = "2.5.1"
 description = "LLM integration layer for Akgentic agent systems"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -20,7 +20,8 @@ authors = [
 keywords = ["llm", "agents", "ai", "pydantic-ai", "react"]
 
 dependencies = [
-    "pydantic-ai-slim[anthropic,google,mistral,openai,retries]>=2.54,<3",
+    "pydantic-ai-slim[anthropic,google,mistral,openai,retries]~=2.54.0",
+    "anthropic>=1.9,<2",
     "genai-prices>=0.1.13",
     "pydantic>=2.0.0",
     "httpx2>=2.7",
