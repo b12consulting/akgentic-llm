@@ -722,3 +722,26 @@ class TestPartKindDrift:
         known = set(typing.get_args(PartKind.__value__))
         missing = sorted(_installed_part_kinds() - known)
         assert not missing, f"PartKind is missing installed pydantic-ai part kinds: {missing}"
+
+    @pytest.mark.parametrize(
+        "kind",
+        sorted(set(typing.get_args(PartKind.__value__)) - {"tool-call", "tool-return"}),
+    )
+    def test_every_known_non_tool_kind_is_routed_silently(
+        self, kind: str, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A kind added to ``PartKind`` must also be routed, or it still warns at runtime.
+
+        Closes the gap the drift test leaves: listing a new kind in ``PartKind`` turns
+        that test green, but ``_emit_tool_events`` only stays silent for it once it is
+        routed as well.
+        """
+        manager, capture = _make_manager_with_capture()
+        # Same duck-typed shape as `_unknown_part`, carrying a known kind this time.
+        message = SimpleNamespace(run_id=RUN_ID, parts=[_unknown_part(kind)])
+
+        with caplog.at_level(logging.WARNING, logger=_CONTEXT_LOGGER):
+            manager._emit_tool_events(message)  # type: ignore[arg-type]
+
+        assert capture.events == []
+        assert _warnings_for(caplog) == []
